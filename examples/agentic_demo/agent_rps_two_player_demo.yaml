@@ -94,31 +94,7 @@ actor_infer:
       gpu_memory_utilization: 0.8
       block_size: 16
       load_format: auto
-  device_mapping: list(range(2,3))
-  infer_batch_size: 1
-
-# Opponent inference server — frozen base model, no LoRA, no weight updates
-opponent_infer:
-  model_args:
-    flash_attn: sdpa
-    disable_gradient_checkpointing: true
-    dtype: fp16
-  generating_args:
-    max_new_tokens: 256
-    top_p: 0.99
-    top_k: 100
-    num_beams: 1
-    temperature: 0.99
-    num_return_sequences: 1
-  data_args:
-    template: qwen2_5
-  strategy_args:
-    strategy_name: vllm
-    strategy_config:
-      gpu_memory_utilization: 0.8
-      block_size: 16
-      load_format: auto
-  device_mapping: list(range(3,4))
+  device_mapping: list(range(2,4))
   infer_batch_size: 1
 
 reward_normalization:

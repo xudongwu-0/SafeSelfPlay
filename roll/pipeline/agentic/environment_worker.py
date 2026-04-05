@@ -47,8 +47,7 @@ class EnvironmentWorker(Worker):
                    generate_scheduler,
                    output_queue,
                    collator: Optional[callable] = None,
-                   mode: str = "train",
-                   opponent_generate_scheduler=None):
+                   mode: str = "train"):
         super().initialize(pipeline_config)
 
         self.output_queue = output_queue
@@ -78,7 +77,6 @@ class EnvironmentWorker(Worker):
                 thread_lock=self.thread_lock,
                 mode=mode,
                 extra_data_provider=extra_data_provider,
-                opponent_generate_scheduler=opponent_generate_scheduler,
             )
         with ThreadPoolExecutor(max_workers=min(len(self.env_configs), 64)) as executor:
             futures = [

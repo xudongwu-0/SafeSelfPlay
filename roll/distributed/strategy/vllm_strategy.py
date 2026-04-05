@@ -148,6 +148,25 @@ class VllmStrategy(InferenceStrategy):
         """Check if beam search should be used based on generation_config."""
         return generation_config.get("num_beams", 1) > 1 or generation_config.get("use_beam_search", False)
 
+    async def _resolve_lora_request(self, batch: DataProto):
+        """Resolve LoRA request from batch meta_info.
+
+        If lora_name is explicitly set in meta_info:
+          - None → base model (no LoRA)
+          - str  → look up named LoRA adapter
+        If lora_name not in meta_info: default to first registered LoRA (backward compat).
+        """
+        if not self.is_lora:
+            return None
+        if "lora_name" in batch.meta_info:
+            if batch.meta_info["lora_name"] is None:
+                return None
+        lora_int_ids = list(await self.model.list_loras())
+        if len(lora_int_ids) > 0:
+            lora_int_id = lora_int_ids[0]
+            return LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="dummy_lora_path")
+        return None
+
     async def _generate_standard(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:
         """Standard generate method for non-beam search cases."""
         sampling_params = create_sampling_params_for_vllm(gen_kwargs=generation_config)
@@ -162,12 +181,7 @@ class VllmStrategy(InferenceStrategy):
                 for prompt in gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
             ]
 
-        lora_request = None
-        if self.is_lora:
-            lora_int_ids = list(await self.model.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
-                lora_request = LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="dummy_lora_path")
+        lora_request = await self._resolve_lora_request(batch)
 
         async def _generate(prompt):
             request_id = random_uuid()
@@ -283,12 +297,7 @@ class VllmStrategy(InferenceStrategy):
             prompt_token_ids = gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
             assert len(prompt_token_ids) == 1
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids[0])
-        lora_request = None
-        if self.is_lora:
-            lora_int_ids = list(await self.model.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
-                lora_request = LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="dummy_lora_path")
+        lora_request = await self._resolve_lora_request(data)
 
         result_generator = self.model.generate(
             prompt=prompt,

@@ -555,7 +555,7 @@ class RolloutScheduler(RolloutMockMixin):
             rollout()
         ray.get(train_rollout_scheduler.shutdown.remote())
     """
-    def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, collator=None, opponent_infer_cluster=None):
+    def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, collator=None):
         self.config = config
         self.env_manager_config = env_manager_config
         self.resource_manager = resource_manager
@@ -585,18 +585,6 @@ class RolloutScheduler(RolloutMockMixin):
                 max_concurrency = env_num + 1 # reserve extra one for suspend/resume
             ).remote(infer_cluster=self.infer_cluster, pipeline_config=config, resource_manager=self.resource_manager)
 
-        # Two-player: create opponent request scheduler if opponent cluster provided
-        self.opponent_generate_scheduler = None
-        if opponent_infer_cluster is not None:
-            self.opponent_generate_scheduler = RequestScheduler.options(
-                name=f"RequestScheduler-opponent-{self.env_manager_config.name}-{mode}",
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=ray.get_runtime_context().get_node_id(),
-                    soft=False,
-                ),
-                max_concurrency=env_num + 1,
-            ).remote(infer_cluster=opponent_infer_cluster, pipeline_config=config, resource_manager=self.resource_manager)
-
         self.es_manager: Any = Cluster(
             name=self.env_manager_config.name,
             worker_cls=self.env_manager_config.worker_cls,
@@ -609,7 +597,6 @@ class RolloutScheduler(RolloutMockMixin):
             output_queue=self.env_output_queue,
             collator=collator,
             mode=self.mode,
-            opponent_generate_scheduler=self.opponent_generate_scheduler,
         )
 
         self.rollout_task = None
@@ -626,15 +613,11 @@ class RolloutScheduler(RolloutMockMixin):
         await asyncio.gather(*self.es_manager.stop(blocking=False))
         await self.env_output_queue.shutdown.remote()
         await self.generate_scheduler.abort_request.remote()
-        if self.opponent_generate_scheduler is not None:
-            await self.opponent_generate_scheduler.abort_request.remote()
         await self.rollout_task
         self.rollout_task = None
 
     async def suspend(self):
         await self.generate_scheduler.suspend.remote()
-        if self.opponent_generate_scheduler is not None:
-            await self.opponent_generate_scheduler.suspend.remote()
 
     async def _run_rollout_loop(self, seed):
         await asyncio.gather(*self.es_manager.run_rollout_loop(seed, blocking=False))
@@ -657,8 +640,6 @@ class RolloutScheduler(RolloutMockMixin):
         await asyncio.gather(*self.es_manager.update_step(global_step, blocking=False))
         await self.env_output_queue.advance_step.remote(global_step)
         await self.generate_scheduler.resume.remote()
-        if self.opponent_generate_scheduler is not None:
-            await self.opponent_generate_scheduler.resume.remote()
 
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
         await asyncio.wait({get_task, self.rollout_task}, return_when=asyncio.FIRST_COMPLETED)

@@ -9,67 +9,37 @@ from threading import Lock
 from omegaconf import DictConfig
 from transformers import PreTrainedTokenizer
 
-from roll.pipeline.agentic.llm_proxy import create_llm_proxy, BaseLLMProxy
 from roll.pipeline.agentic.env_manager.traj_env_manager import TrajEnvManager
 from roll.pipeline.agentic.env_manager.base_env_manager import RolloutCache
 from roll.pipeline.agentic.env_manager.token_mask_utils import custom_apply_chat_template, compute_conversation_end_token_id
-from roll.distributed.scheduler.generate_scheduler import RequestScheduler
 from roll.distributed.scheduler.protocol import DataProto
-from roll.pipeline.agentic.agentic_config import EnvManagerConfig, AgenticConfig, LLMProxyConfig
+from roll.pipeline.agentic.agentic_config import EnvManagerConfig, AgenticConfig
 from roll.utils.constants import GenerateStopReason
 from roll.utils.logging import get_logger
+from roll.utils.str_utils import contains_renderable_field
 
 
 class TwoPlayerTrajEnvManager(TrajEnvManager):
     """Env manager for two-player zero-sum games.
 
-    Extends TrajEnvManager to query two LLM servers per round:
-    - Agent 0 (training agent): uses self.llm_proxy (same as parent)
-    - Agent 1 (opponent): uses self.opponent_llm_proxy (frozen model)
+    Extends TrajEnvManager to query the same vLLM server twice per round:
+    - Agent 0 (training agent): uses LoRA adapter (default lora_name)
+    - Agent 1 (opponent): uses base model (lora_name=None)
 
     Per round:
     1. Agent 0 sees observation, makes decision (parent's make_decision)
     2. env.step(agent_0_action) → observation for agent 1
-    3. Agent 1 sees its observation, makes decision via opponent proxy
+    3. Agent 1 sees its observation, makes decision via base model
     4. env.step(agent_1_action) → resolves round, returns obs + reward for agent 0
 
     Only agent 0's trajectory data goes to training.
     """
 
-    def __init__(self,
-                 worker_config: EnvManagerConfig,
-                 pipeline_config: AgenticConfig,
-                 env_config: DictConfig,
-                 tokenizer: PreTrainedTokenizer,
-                 generate_scheduler,
-                 output_queue,
-                 thread_lock: Lock,
-                 mode: str = 'train',
-                 opponent_generate_scheduler=None,
-                 *args, **kwargs):
-        super().__init__(
-            worker_config=worker_config,
-            pipeline_config=pipeline_config,
-            env_config=env_config,
-            tokenizer=tokenizer,
-            generate_scheduler=generate_scheduler,
-            output_queue=output_queue,
-            thread_lock=thread_lock,
-            mode=mode,
-            *args, **kwargs,
-        )
+    def __init__(self, *args, **kwargs):
+        # Remove opponent_generate_scheduler if passed (backward compat)
+        kwargs.pop("opponent_generate_scheduler", None)
+        super().__init__(*args, **kwargs)
         self.logger = get_logger()
-
-        if opponent_generate_scheduler is None:
-            raise ValueError("TwoPlayerTrajEnvManager requires opponent_generate_scheduler")
-
-        self.opponent_llm_proxy: BaseLLMProxy = create_llm_proxy(
-            generate_scheduler=opponent_generate_scheduler,
-            llm_proxy_config=self.worker_config.llm_proxy,
-            tokenizer=self.tokenizer,
-            env=self.env,
-        )
-
         # Track opponent's conversation history for prompt formatting
         self.opponent_history: list[dict] = []
 
@@ -87,11 +57,10 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         with self.thread_lock, self.env_step_limiter:
             obs_for_opponent, _, _, _, agent_step_info = self.env.step(action=agent_action)
 
-        # Store agent 0's response in rollout_cache (will get reward later)
+        # Store agent 0's response in rollout_cache (will get reward after round resolves)
         self.rollout_cache.history[-1]['llm_response'] = agent_action
-        # Don't store agent_step_info metrics yet — round not resolved
 
-        # --- Opponent's turn ---
+        # --- Opponent's turn (base model, lora_name=None) ---
         opponent_lm_input = self._format_opponent_messages(obs_for_opponent)
         opponent_input_ids = opponent_lm_input.batch["input_ids"]
 
@@ -105,13 +74,13 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         opponent_lm_input.meta_info["src_rank"] = self.env_config["env_id"] + 100000  # distinct src_rank
         opponent_lm_input.meta_info["generation_config"] = generation_config
         opponent_lm_input.meta_info["pad_to_seq_len"] = False
+        opponent_lm_input.meta_info["lora_name"] = None  # base model, no LoRA
 
         opponent_output: DataProto = ray.get(
-            self.opponent_llm_proxy.generate_scheduler.generate_one_request.remote(data=opponent_lm_input)
+            self.generate_scheduler.generate_one_request.remote(data=opponent_lm_input)
         )
 
         if opponent_output is None:
-            # Opponent failed — treat as invalid action
             self.rollout_cache.history[-1]['reward'] = 0.0
             self.rollout_cache.terminated = True
             return self.rollout_cache
@@ -132,7 +101,7 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         with self.thread_lock, self.env_step_limiter:
             obs_for_agent, reward, terminated, truncated, info = self.env.step(action=opponent_action)
 
-        # Now store the resolved reward and info for agent 0
+        # Store resolved reward and info for agent 0
         self.rollout_cache.step += 1
         self.rollout_cache.terminated = terminated
         self.rollout_cache.truncated = truncated
@@ -164,10 +133,8 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             messages.append({"role": "system", "content": self.agent_system_template})
             user_content = f"{self.env.get_instructions()}\n"
 
-        # Use the same agent_template
         render_dict = {"observation": observation}
         opponent_step = len(self.opponent_history) + 1
-        from roll.utils.str_utils import contains_renderable_field
         if contains_renderable_field(self.agent_template, "turn_idx"):
             render_dict["turn_idx"] = opponent_step
         if contains_renderable_field(self.agent_template, "actions_left"):
