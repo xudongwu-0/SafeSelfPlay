@@ -10,28 +10,16 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "agentic_pipeline"
+exp_name: "agentic_rps"
 seed: 42
 logging_dir: ./output/logs
 output_dir: ./output
-render_save_dir: /data/oss_bucket_0/yali/output/render
 system_envs:
   USE_MODELSCOPE: '1'
 
-#track_with: wandb
-#tracker_kwargs:
-#  api_key:
-#  project: roll-agentic
-#  name: ${exp_name}_frozen_lake
-#  notes: "agentic_pipeline"
-#  tags:
-#    - agentic
-#    - roll
-#    - baseline
-
 track_with: tensorboard
 tracker_kwargs:
-  log_dir: ./output/tensorboard/agentic_frozen_lake
+  log_dir: ./output/tensorboard/agentic_rps
 
 checkpoint_config:
   type: file_system
@@ -39,21 +27,19 @@ checkpoint_config:
 
 num_gpus_per_node: 1
 
-max_steps: 100
+max_steps: 50
 save_steps: 10000
 logging_steps: 1
 eval_steps: 10
 resume_from_checkpoint: false
 
 rollout_batch_size: 16
-val_batch_size: 16
+val_batch_size: 8
 sequence_length: 4096
 
 advantage_clip: 0.2
 ppo_epochs: 1
 adv_estimator: "grpo"
-#pg_clip: 0.1
-#dual_clip_loss: True
 init_kl_coef: 0.0
 whiten_advantages: true
 entropy_loss_coef: 0
@@ -89,7 +75,7 @@ actor_infer:
     disable_gradient_checkpointing: true
     dtype: fp16
   generating_args:
-    max_new_tokens: 32 # single-turn response length
+    max_new_tokens: 256
     top_p: 0.99
     top_k: 100
     num_beams: 1
@@ -121,33 +107,26 @@ reference:
   infer_batch_size: 1
 
 reward_normalization:
-  grouping: tags # 可以tags(env_type)/traj_group_id(group)/batch(rollout_batch)... group_by计算reward/adv
-  method: identity # asym_clip / identity / mean_std
+  grouping: tags
+  method: identity
 
 train_env_manager:
-  format_penalty: -0.15 # sokoban env penalty_for_step=-0.1
+  format_penalty: -0.01
   max_env_num_per_worker: 16
   num_env_groups: 1
-  # under the same group, the env config and env seed are ensured to be equal
   group_size: 1
-  tags: [FrozenLake]
-  num_groups_partition: [1] # If not set, all env names divide nums equally. Under the same group, the env config and env seed (prompt) are equal in each generation
+  tags: [RockPaperScissors]
+  num_groups_partition: [1]
 
 val_env_manager:
   max_env_num_per_worker: 1
-  num_env_groups: 2
-  group_size: 1 # should be set to 1 because val temperature is set to 0 and same prompt leads to same output
-  tags: [SimpleSokoban, LargerSokoban]
-  num_groups_partition: [1, 1] # TODO: If not set, all env names divide nums equally. Under the same group, the env config and env seed (prompt) are equal in each generation
+  num_env_groups: 1
+  group_size: 1
+  tags: [RockPaperScissors]
+  num_groups_partition: [1]
 
-max_tokens_per_step: 64
+max_tokens_per_step: 128
 
 custom_envs:
-  SimpleSokoban:
-    ${custom_env.SimpleSokoban}
-  LargerSokoban:
-    ${custom_env.LargerSokoban}
-  SokobanDifferentGridVocab:
-    ${custom_env.SokobanDifferentGridVocab}
-  FrozenLake:
-    ${custom_env.FrozenLake}
+  RockPaperScissors:
+    ${custom_env.RockPaperScissors}
