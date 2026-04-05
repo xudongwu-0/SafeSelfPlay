@@ -81,6 +81,20 @@ class AgenticPipeline(BasePipeline):
         )
         download_clusters = [self.actor_train, self.actor_infer]
 
+        # Two-player: create opponent inference cluster (frozen, no model updates)
+        self.opponent_infer = None
+        if self.pipeline_config.opponent_infer is not None:
+            self.pipeline_config.opponent_infer.name = "opponent_infer"
+            if self.pipeline_config.opponent_infer.model_args.model_name_or_path is None:
+                self.pipeline_config.opponent_infer.model_args.model_name_or_path = self.pipeline_config.pretrain
+            self.opponent_infer = Cluster(
+                name=self.pipeline_config.opponent_infer.name,
+                worker_cls=self.pipeline_config.opponent_infer.worker_cls,
+                resource_manager=self.resource_manager,
+                worker_config=self.pipeline_config.opponent_infer,
+            )
+            download_clusters.append(self.opponent_infer)
+
         if self.use_ref_model:
             self.reference: Any = Cluster(
                 name=self.pipeline_config.reference.name,
@@ -147,6 +161,7 @@ class AgenticPipeline(BasePipeline):
             resource_manager=self.resource_manager,
             infer_cluster=self.actor_infer,
             mode="train",
+            opponent_infer_cluster=self.opponent_infer,
         )
 
         self.val_rollout_scheduler = ray.remote(RolloutScheduler).options(
@@ -159,6 +174,7 @@ class AgenticPipeline(BasePipeline):
             resource_manager=self.resource_manager,
             infer_cluster=self.actor_infer,
             mode="val",
+            opponent_infer_cluster=self.opponent_infer,
         )
         self.val_dataset_manager = GlobalDatasetManager.options(name=f"val_dataset_manager",
                                                                 get_if_exists=True,
@@ -175,6 +191,8 @@ class AgenticPipeline(BasePipeline):
             # INIT PHASE: Initialize Reward Cluster
             refs.extend(self.reward.initialize(pipeline_config=self.pipeline_config, blocking=False))
         refs.extend(self.actor_infer.initialize(pipeline_config=self.pipeline_config, blocking=False))
+        if self.opponent_infer is not None:
+            refs.extend(self.opponent_infer.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
 
         if self.use_ref_model:
@@ -235,6 +253,8 @@ class AgenticPipeline(BasePipeline):
 
                     # PHASE 4: init kv cache
                     self.actor_infer.load_states()
+                    if self.opponent_infer is not None:
+                        self.opponent_infer.load_states()
                     if self.reward:
                         self.reward.load_states()
 

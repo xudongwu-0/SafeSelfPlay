@@ -188,6 +188,7 @@ class AgenticConfig(PPOConfig):
     custom_envs: Dict[str, Any] = field(default_factory=dict, metadata={"help": "List of environment configurations."})
     train_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     val_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
+    opponent_infer: Optional[WorkerConfig] = field(default=None, metadata={"help": "Configuration for opponent inference server in two-player games."})
     render_save_dir: str = field(default=None, metadata={"help": "Directory to save rendered frames."})
     reward: RewardConfig = field(default=None, metadata={"help": "Configuration for reward inference."})
     reward_normalization: RewardNormalizationConfig = field(
@@ -257,6 +258,9 @@ class AgenticConfig(PPOConfig):
             self.reference.worker_cls = "roll.pipeline.base_worker.ActorWorker"
         if self.critic.worker_cls is None:
             self.critic.worker_cls = "roll.pipeline.base_worker.CriticWorker"
+        if self.opponent_infer is not None:
+            if self.opponent_infer.worker_cls is None:
+                self.opponent_infer.worker_cls = "roll.pipeline.base_worker.InferWorker"
         if self.reward:
             if self.reward.worker_cls is None:
                 self.reward.worker_cls = "roll.pipeline.base_worker.InferWorker"
