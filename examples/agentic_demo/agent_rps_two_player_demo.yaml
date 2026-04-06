@@ -26,11 +26,12 @@ checkpoint_config:
 
 num_gpus_per_node: 4
 
-max_steps: 5
+max_steps: 10
 save_steps: 10000
 logging_steps: 1
-eval_steps: 5
+eval_steps: 10
 resume_from_checkpoint: false
+fsp_save_steps: 5
 
 rollout_batch_size: 16
 val_batch_size: 8
@@ -94,6 +95,7 @@ actor_infer:
       gpu_memory_utilization: 0.8
       block_size: 16
       load_format: auto
+      max_loras: 10
   device_mapping: list(range(2,4))
   infer_batch_size: 1
 
@@ -106,18 +108,19 @@ train_env_manager:
   max_env_num_per_worker: 16
   num_env_groups: 1
   group_size: 1
-  tags: [RockPaperScissorsLLM]
+  tags: [RockPaperScissorsLLMThink]
   num_groups_partition: [1]
 
 val_env_manager:
   max_env_num_per_worker: 1
   num_env_groups: 1
   group_size: 1
-  tags: [RockPaperScissorsLLM]
+  tags: [RockPaperScissorsLLMThink]
   num_groups_partition: [1]
 
-max_tokens_per_step: 128
+max_tokens_per_step: 512
+max_actions_per_traj: 1
 
 custom_envs:
-  RockPaperScissorsLLM:
-    ${custom_env.RockPaperScissorsLLM}
+  RockPaperScissorsLLMThink:
+    ${custom_env.RockPaperScissorsLLMThink}

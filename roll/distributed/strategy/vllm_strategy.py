@@ -89,7 +89,7 @@ class VllmStrategy(InferenceStrategy):
         if self.is_lora:
             lora_kwargs = {
                 "enable_lora": True,
-                "max_loras": 1,
+                "max_loras": vllm_config.get("max_loras", 1),
                 "max_lora_rank": self.worker_config.model_args.lora_rank,
             }
             vllm_config.update(lora_kwargs)
@@ -153,14 +153,20 @@ class VllmStrategy(InferenceStrategy):
 
         If lora_name is explicitly set in meta_info:
           - None → base model (no LoRA)
-          - str  → look up named LoRA adapter
+          - str (path) → file-based LoRA from checkpoint on disk
         If lora_name not in meta_info: default to first registered LoRA (backward compat).
         """
         if not self.is_lora:
             return None
         if "lora_name" in batch.meta_info:
-            if batch.meta_info["lora_name"] is None:
+            lora_name = batch.meta_info["lora_name"]
+            if lora_name is None:
                 return None
+            # File-based LoRA from enemy pool checkpoint
+            import hashlib
+            lora_int_id = int(hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
+            return LoRARequest(lora_name=lora_name, lora_int_id=lora_int_id, lora_path=lora_name)
+        # Default: use training agent's LoRA (loaded via model_update)
         lora_int_ids = list(await self.model.list_loras())
         if len(lora_int_ids) > 0:
             lora_int_id = lora_int_ids[0]

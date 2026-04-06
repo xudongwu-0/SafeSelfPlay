@@ -506,6 +506,7 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         save_dir/actor_train/{hf files}
         save_dir/actor_train/checkpoint/{checkpoint files}
         """
+        kwargs.pop("is_last_step", None)
         logger.info(f"save_dir: {save_dir}")
         if local_state_path is None:
             local_state_path = save_dir

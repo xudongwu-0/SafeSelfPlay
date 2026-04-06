@@ -40,16 +40,33 @@ class RockPaperScissorsEnv(Env):
         self.special_token_list = special_token_list
         self.opponent_strategy = opponent_strategy
         self.two_player = opponent_strategy == "llm"
-        self.env_instruction = env_instruction or (
-            "You are playing Rock Paper Scissors against an opponent. "
-            "Each round, choose one action. Rock beats Scissors, Scissors beats Paper, Paper beats Rock. "
-            "Try to win as many rounds as possible.\n\n"
-            "You MUST respond with exactly one of the following three formats (use angle brackets, not parentheses):\n"
-            "<answer>Rock</answer>\n"
-            "<answer>Paper</answer>\n"
-            "<answer>Scissors</answer>\n\n"
-            "Do NOT output anything else. Do NOT use parentheses like (answer)."
-        )
+        # Detect think mode from action_pattern (2 capture groups = think+answer)
+        import re
+        self.think_mode = re.compile(action_pattern).groups > 1
+
+        if env_instruction is not None:
+            self.env_instruction = env_instruction
+        elif self.think_mode:
+            self.env_instruction = (
+                "You are playing Rock Paper Scissors against an opponent. "
+                "Each round, choose one action. Rock beats Scissors, Scissors beats Paper, Paper beats Rock. "
+                "Try to win as many rounds as possible.\n\n"
+                "First think about your strategy inside <think>...</think> tags, "
+                "then give your answer.\n\n"
+                "You MUST respond in this exact format:\n"
+                "<think>your reasoning here</think><answer>selected action here</answer>\n"
+            )
+        else:
+            self.env_instruction = (
+                "You are playing Rock Paper Scissors against an opponent. "
+                "Each round, choose one action. Rock beats Scissors, Scissors beats Paper, Paper beats Rock. "
+                "Try to win as many rounds as possible.\n\n"
+                "You MUST respond with exactly one of the following three formats (use angle brackets, not parentheses):\n"
+                "<answer>Rock</answer>\n"
+                "<answer>Paper</answer>\n"
+                "<answer>Scissors</answer>\n\n"
+                "Do NOT output anything else. Do NOT use parentheses like (answer)."
+            )
 
         self.step_count = 0
         self.wins = 0
@@ -250,6 +267,15 @@ class RockPaperScissorsEnv(Env):
 
     def _render_for_player(self, player: int) -> str:
         """Render observation for a specific player."""
+        if self.max_steps == 1:
+            # Single-round mode: minimal prompt, no history
+            if not self.history:
+                if player == 0:
+                    return "Play Rock Paper Scissors. Make your move!"
+                else:
+                    return "Play Rock Paper Scissors. Your opponent has chosen. Make your move!"
+            return "Round complete."
+
         if not self.history:
             round_num = 1
             lines = [f"Rock Paper Scissors - Round {round_num}/{self.max_steps}"]
@@ -264,11 +290,10 @@ class RockPaperScissorsEnv(Env):
         lines.append(f"Score: W={self.wins} D={self.draws} L={self.losses}")
         lines.append("")
         lines.append("History:")
-        for h in self.history[-5:]:  # Show last 5 rounds
+        for h in self.history[-5:]:
             if player == 0:
                 lines.append(f"  R{h['round']}: You={h['player']} vs Opp={h['opponent']} -> {h['result']}")
             else:
-                # Swap perspective for player 1
                 swapped_result = {"Win": "Lose", "Lose": "Win", "Draw": "Draw"}[h["result"]]
                 lines.append(f"  R{h['round']}: You={h['opponent']} vs Opp={h['player']} -> {swapped_result}")
 

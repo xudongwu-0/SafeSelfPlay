@@ -511,6 +511,20 @@ class AgenticPipeline(BasePipeline):
 
                 self.do_checkpoint(global_step=global_step)
 
+                # Fictitious self-play: save LoRA to enemy pool at fsp_save_steps intervals
+                fsp_save_steps = self.pipeline_config.fsp_save_steps
+                if fsp_save_steps > 0 and global_step > 0 and global_step % fsp_save_steps == 0:
+                    # Save checkpoint via actor_train — path is output_dir/worker_name/checkpoint-N
+                    ckpt_refs = self.actor_train.do_checkpoint(
+                        global_step=global_step, is_last_step=False, blocking=True,
+                    )
+                    # Worker name is rank-specific; LoRA saved by rank 0
+                    worker_name = f"{self.pipeline_config.actor_train.name}-0-G{self.pipeline_config.actor_train.device_mapping[0]}"
+                    fsp_ckpt_dir = os.path.join(self.pipeline_config.output_dir, worker_name, f"checkpoint-{global_step}")
+                    logger.info(f"FSP: adding LoRA checkpoint to enemy pool: {fsp_ckpt_dir}")
+                    ray.get(self.train_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
+                    ray.get(self.val_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
+
                 with Timer(name="log", logger=None) as log_timer:
                     if self.pipeline_config.logging_steps > 0 and global_step % self.pipeline_config.logging_steps == 0:
                         if int(os.environ.get("RAY_PROFILING", "0")):

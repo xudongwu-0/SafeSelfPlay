@@ -1,5 +1,6 @@
 import copy
-from typing import Optional
+import random
+from typing import Optional, List
 
 import ray
 import torch
@@ -20,33 +21,38 @@ from roll.utils.str_utils import contains_renderable_field
 
 
 class TwoPlayerTrajEnvManager(TrajEnvManager):
-    """Env manager for two-player zero-sum games.
+    """Env manager for two-player zero-sum games with fictitious self-play.
 
     Extends TrajEnvManager to query the same vLLM server twice per round:
-    - Agent 0 (training agent): uses LoRA adapter (default lora_name)
-    - Agent 1 (opponent): uses base model (lora_name=None)
+    - Agent 0 (training agent): uses current LoRA adapter
+    - Agent 1 (opponent): sampled from enemy pool (base model or past LoRA checkpoints)
 
-    Per round:
-    1. Agent 0 sees observation, makes decision (parent's make_decision)
-    2. env.step(agent_0_action) → observation for agent 1
-    3. Agent 1 sees its observation, makes decision via base model
-    4. env.step(agent_1_action) → resolves round, returns obs + reward for agent 0
+    Enemy pool starts as [None] (base model only). The pipeline adds past LoRA
+    checkpoint paths to the pool at fsp_save_steps intervals.
 
     Only agent 0's trajectory data goes to training.
     """
 
     def __init__(self, *args, **kwargs):
-        # Remove opponent_generate_scheduler if passed (backward compat)
         kwargs.pop("opponent_generate_scheduler", None)
         super().__init__(*args, **kwargs)
         self.logger = get_logger()
-        # Track opponent's conversation history for prompt formatting
         self.opponent_history: list[dict] = []
+        # Fictitious self-play enemy pool: None = base model, str = LoRA checkpoint path
+        self.enemy_pool: List[Optional[str]] = [None]
+        self.current_opponent_lora: Optional[str] = None
 
     def reset(self) -> Optional[RolloutCache]:
         result = super().reset()
         self.opponent_history = []
+        # Sample opponent from enemy pool for this episode
+        self.current_opponent_lora = random.choice(self.enemy_pool)
         return result
+
+    def update_enemy_pool(self, lora_path: str):
+        """Add a LoRA checkpoint to the enemy pool."""
+        self.enemy_pool.append(lora_path)
+        self.logger.info(f"Enemy pool updated: {len(self.enemy_pool)} opponents (added {lora_path})")
 
     def step(self, llm_output: DataProto) -> RolloutCache:
         """Two-player step: agent 0 acts, then opponent acts, round resolves."""
@@ -74,7 +80,7 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         opponent_lm_input.meta_info["src_rank"] = self.env_config["env_id"] + 100000  # distinct src_rank
         opponent_lm_input.meta_info["generation_config"] = generation_config
         opponent_lm_input.meta_info["pad_to_seq_len"] = False
-        opponent_lm_input.meta_info["lora_name"] = None  # base model, no LoRA
+        opponent_lm_input.meta_info["lora_name"] = self.current_opponent_lora  # None=base, str=checkpoint path
 
         opponent_output: DataProto = ray.get(
             self.generate_scheduler.generate_one_request.remote(data=opponent_lm_input)

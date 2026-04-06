@@ -188,6 +188,7 @@ class AgenticConfig(PPOConfig):
     custom_envs: Dict[str, Any] = field(default_factory=dict, metadata={"help": "List of environment configurations."})
     train_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     val_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
+    fsp_save_steps: int = field(default=0, metadata={"help": "Fictitious self-play: save LoRA to enemy pool every N steps. 0 = disabled."})
     render_save_dir: str = field(default=None, metadata={"help": "Directory to save rendered frames."})
     reward: RewardConfig = field(default=None, metadata={"help": "Configuration for reward inference."})
     reward_normalization: RewardNormalizationConfig = field(

@@ -124,6 +124,12 @@ class EnvironmentWorker(Worker):
             env_manager.update_step(global_step)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
+    async def update_enemy_pool(self, lora_path: str):
+        for env_manager in self.env_managers.values():
+            if hasattr(env_manager, "update_enemy_pool"):
+                env_manager.update_enemy_pool(lora_path)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
     async def stop(self):
         for env_manager in self.env_managers.values():
             env_manager.stop()
