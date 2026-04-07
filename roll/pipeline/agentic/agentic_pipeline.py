@@ -514,13 +514,26 @@ class AgenticPipeline(BasePipeline):
                 # Fictitious self-play: save LoRA to enemy pool at fsp_save_steps intervals
                 fsp_save_steps = self.pipeline_config.fsp_save_steps
                 if fsp_save_steps > 0 and global_step > 0 and global_step % fsp_save_steps == 0:
-                    # Save checkpoint via actor_train — path is output_dir/worker_name/checkpoint-N
+                    # Save checkpoint via actor_train
                     ckpt_refs = self.actor_train.do_checkpoint(
                         global_step=global_step, is_last_step=False, blocking=True,
                     )
-                    # Worker name is rank-specific; LoRA saved by rank 0
-                    worker_name = f"{self.pipeline_config.actor_train.name}-0-G{self.pipeline_config.actor_train.device_mapping[0]}"
-                    fsp_ckpt_dir = os.path.join(self.pipeline_config.output_dir, worker_name, f"checkpoint-{global_step}")
+                    # Use the upload destination (checkpoint_config output_dir) which persists reliably.
+                    # The worker-level save_dir may be cleaned up after async upload.
+                    ckpt_id = f"checkpoint-{global_step}"
+                    upload_dir = self.pipeline_config.checkpoint_config.get("output_dir")
+                    if upload_dir:
+                        fsp_ckpt_dir = os.path.abspath(os.path.join(upload_dir, ckpt_id))
+                    else:
+                        # Fallback: use worker-level path
+                        worker_name = f"{self.pipeline_config.actor_train.name}-0-G{self.pipeline_config.actor_train.device_mapping[0]}"
+                        fsp_ckpt_dir = os.path.abspath(os.path.join(self.pipeline_config.output_dir, worker_name, ckpt_id))
+                    # Wait for adapter_config.json to be available (async upload may still be in progress)
+                    adapter_cfg = os.path.join(fsp_ckpt_dir, "adapter_config.json")
+                    for _ in range(60):
+                        if os.path.exists(adapter_cfg):
+                            break
+                        time.sleep(1)
                     logger.info(f"FSP: adding LoRA checkpoint to enemy pool: {fsp_ckpt_dir}")
                     ray.get(self.train_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
                     ray.get(self.val_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
