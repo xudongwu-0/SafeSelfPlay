@@ -204,6 +204,9 @@ class AgenticPipeline(BasePipeline):
         # Calculate tokens-per-second system throughput
         tps_timer = _Timer(window_size=5)
 
+        # Track FSP checkpoints for arena evaluation: None = base model
+        self.fsp_checkpoints: list = [None]
+
         for global_step in range(self.pipeline_config.max_steps):
             if global_step <= self.state.step:
                 global_step += 1
@@ -537,6 +540,7 @@ class AgenticPipeline(BasePipeline):
                     logger.info(f"FSP: adding LoRA checkpoint to enemy pool: {fsp_ckpt_dir}")
                     ray.get(self.train_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
                     ray.get(self.val_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
+                    self.fsp_checkpoints.append(fsp_ckpt_dir)
 
                 with Timer(name="log", logger=None) as log_timer:
                     if self.pipeline_config.logging_steps > 0 and global_step % self.pipeline_config.logging_steps == 0:
@@ -593,11 +597,36 @@ class AgenticPipeline(BasePipeline):
             global_step += 1
             logger.info(f"epoch {global_step} finished")
 
+        # Arena evaluation: pairwise payoff matrix for all FSP checkpoints
+        if self.pipeline_config.fsp_save_steps > 0 and len(self.fsp_checkpoints) > 1:
+            from roll.pipeline.agentic.arena_eval import (
+                run_arena_evaluation, log_payoff_matrix, save_payoff_matrix,
+            )
+            try:
+                generate_scheduler = ray.get(
+                    self.train_rollout_scheduler.get_generate_scheduler.remote()
+                )
+                ray.get(generate_scheduler.resume.remote())
+                env_tag = list(self.pipeline_config.custom_envs.keys())[0]
+                logger.info(f"Arena: starting evaluation with {len(self.fsp_checkpoints)} models")
+                payoff_matrix = run_arena_evaluation(
+                    lora_paths=self.fsp_checkpoints,
+                    generate_scheduler=generate_scheduler,
+                    pipeline_config=self.pipeline_config,
+                    tokenizer=self.tokenizer,
+                    env_tag=env_tag,
+                    episodes_per_pair=4,
+                    max_concurrent=32,
+                )
+                log_payoff_matrix(payoff_matrix, self.fsp_checkpoints)
+                save_payoff_matrix(payoff_matrix, self.fsp_checkpoints, self.pipeline_config.output_dir)
+            except Exception as e:
+                logger.error(f"Arena evaluation failed: {e}", exc_info=True)
+
         ray.get([
             self.train_rollout_scheduler.shutdown.remote(),
             self.val_rollout_scheduler.shutdown.remote(),
         ])
-
 
         logger.info("pipeline complete!")
 

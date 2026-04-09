@@ -1,0 +1,9 @@
+defaults:
+  - agent_kuhn_poker_fsp_train
+
+# Smoke test overrides
+max_steps: 3
+fsp_save_steps: 1
+eval_steps: 100
+rollout_batch_size: 16
+save_steps: 10000

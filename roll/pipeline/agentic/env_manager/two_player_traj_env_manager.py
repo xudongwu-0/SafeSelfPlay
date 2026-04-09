@@ -47,12 +47,76 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         self.opponent_history = []
         # Sample opponent from enemy pool for this episode
         self.current_opponent_lora = random.choice(self.enemy_pool)
+
+        if result is not None and self.rollout_cache.history[-1].get("opponent_first", False):
+            self._handle_opponent_first_move()
+
         return result
 
     def update_enemy_pool(self, lora_path: str):
         """Add a LoRA checkpoint to the enemy pool."""
         self.enemy_pool.append(lora_path)
         self.logger.info(f"Enemy pool updated: {len(self.enemy_pool)} opponents (added {lora_path})")
+
+    def _handle_opponent_first_move(self):
+        """Generate opponent's first action when the env signals opponent_first=True.
+
+        Used for games where the agent is randomly assigned as the second mover
+        (e.g., poker-P1 in Kuhn Poker). The opponent's first action is generated
+        during reset so the agent's first format_messages sees the result.
+        """
+        obs_for_opponent = self.rollout_cache.history[-1]["observation"]
+
+        # Generate opponent's action
+        opponent_lm_input = self._format_opponent_messages(obs_for_opponent)
+        opponent_input_ids = opponent_lm_input.batch["input_ids"]
+
+        max_new_tokens = min(
+            self.env_config["max_tokens_per_step"],
+            self.worker_config.generating_args.max_new_tokens,
+            self.pipeline_config.sequence_length - opponent_input_ids.shape[1],
+        )
+        generation_config = self.worker_config.generating_args.to_dict()
+        generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
+        opponent_lm_input.meta_info["src_rank"] = self.env_config["env_id"] + 100000
+        opponent_lm_input.meta_info["generation_config"] = generation_config
+        opponent_lm_input.meta_info["pad_to_seq_len"] = False
+        opponent_lm_input.meta_info["lora_name"] = self.current_opponent_lora
+
+        opponent_output: DataProto = ray.get(
+            self.generate_scheduler.generate_one_request.remote(data=opponent_lm_input)
+        )
+
+        if opponent_output is None:
+            self.rollout_cache.terminated = True
+            return
+
+        # Decode and store opponent's response
+        opponent_responses = self.tokenizer.batch_decode(
+            opponent_output.batch['responses'], skip_special_tokens=False
+        )
+        opponent_action = opponent_responses[0]
+
+        opponent_response_ids = opponent_output.batch['responses'][0].tolist()
+        if self.opponent_history:
+            self.opponent_history[-1]["response_ids"] = opponent_response_ids
+            self.opponent_history[-1]["messages"].append({
+                "role": "assistant",
+                "content": self.tokenizer.decode(opponent_response_ids, skip_special_tokens=True),
+            })
+
+        # Step env with opponent's first action
+        with self.thread_lock, self.env_step_limiter:
+            obs_for_agent, reward, terminated, truncated, info = self.env.step(action=opponent_action)
+
+        # Update rollout_cache so agent sees the post-opponent observation
+        self.rollout_cache.history[-1]["observation"] = obs_for_agent
+        if "opponent_first" in self.rollout_cache.history[-1]:
+            del self.rollout_cache.history[-1]["opponent_first"]
+        self.rollout_cache.history[-1]["actions_left"] = self.env_config.max_steps - self.rollout_cache.step
+
+        if terminated:
+            self.rollout_cache.terminated = True
 
     def step(self, llm_output: DataProto) -> RolloutCache:
         """Two-player step: agent 0 acts, then opponent acts, round resolves."""

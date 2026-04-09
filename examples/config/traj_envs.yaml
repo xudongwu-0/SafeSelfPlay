@@ -120,6 +120,32 @@ custom_env:
       max_steps: ${max_actions_per_traj}
       format_penalty: -0.01
       opponent_strategy: "llm"
+  KuhnPokerLLMThink:
+    env_type: kuhn_poker
+    max_steps: 2
+    max_tokens_per_step: 512
+    env_manager_cls: roll.pipeline.agentic.env_manager.two_player_traj_env_manager.TwoPlayerTrajEnvManager
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    env_config:
+      action_pattern: ${think_action_pattern}
+      max_steps: 2
+      format_penalty: -0.01
+      opponent_strategy: "llm"
+  KuhnPokerLLM:
+    env_type: kuhn_poker
+    max_steps: 2
+    max_tokens_per_step: 512
+    env_manager_cls: roll.pipeline.agentic.env_manager.two_player_traj_env_manager.TwoPlayerTrajEnvManager
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    env_config:
+      action_pattern: ${action_pattern}
+      max_steps: 2
+      format_penalty: -0.01
+      opponent_strategy: "llm"
   RockPaperScissorsThink:
     env_type: rock_paper_scissors
     max_steps: ${max_actions_per_traj}

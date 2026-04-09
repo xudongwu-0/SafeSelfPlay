@@ -1,0 +1,8 @@
+defaults:
+  - agent_kuhn_poker_fsp_train
+
+# Benchmark: 2 steps, no checkpointing, no eval
+max_steps: 2
+fsp_save_steps: 0
+eval_steps: 10000
+save_steps: 10000
