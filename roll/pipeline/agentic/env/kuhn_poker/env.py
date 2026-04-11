@@ -1,4 +1,5 @@
 import random
+import re
 from typing import Optional
 
 import gem
@@ -61,30 +62,26 @@ class KuhnPokerEnv(Env):
             self.env_instruction = env_instruction
         elif self.think_mode:
             self.env_instruction = (
-                "You are playing Kuhn Poker against an opponent.\n"
-                "Rules: 3-card deck (Jack < Queen < King). Each player antes 1 chip. "
-                "You are dealt one card. Actions: Pass or Bet (add 1 chip).\n"
-                "- If first player Passes: second player can Pass (showdown) or Bet.\n"
-                "  - If second player Bets: first player can Pass (fold, lose ante) or Bet (call, showdown).\n"
-                "- If first player Bets: second player can Pass (fold, lose ante) or Bet (call, showdown).\n"
-                "At showdown, higher card wins the pot.\n\n"
-                "First think about your strategy inside <think>...</think> tags, "
-                "then give your answer.\n\n"
-                "You MUST respond in this exact format:\n"
-                "<think>your reasoning here</think><answer>selected action here</answer>\n"
+                "Kuhn Poker: 3 cards (Jack < Queen < King), each player antes 1 chip.\n"
+                "Only two actions exist: Pass or Bet (+1 chip). There is NO raise or fold action.\n"
+                "Pass = check/fold depending on context. Bet = bet/call depending on context.\n\n"
+                "Game flow:\n"
+                "  P1: Pass or Bet\n"
+                "  P2: Pass or Bet\n"
+                "  If P1 passed and P2 bet → P1 gets one more chance: Pass(fold) or Bet(call)\n"
+                "Showdown: higher card wins the pot.\n\n"
+                "Reply ONLY in this format (nothing after the answer tag):\n"
+                "<think>your reasoning</think><answer>Pass</answer>\n"
+                "or\n"
+                "<think>your reasoning</think><answer>Bet</answer>"
             )
         else:
             self.env_instruction = (
-                "You are playing Kuhn Poker against an opponent.\n"
-                "Rules: 3-card deck (Jack < Queen < King). Each player antes 1 chip. "
-                "You are dealt one card. Actions: Pass or Bet (add 1 chip).\n"
-                "- If first player Passes: second player can Pass (showdown) or Bet.\n"
-                "  - If second player Bets: first player can Pass (fold, lose ante) or Bet (call, showdown).\n"
-                "- If first player Bets: second player can Pass (fold, lose ante) or Bet (call, showdown).\n"
-                "At showdown, higher card wins the pot.\n\n"
-                "You MUST respond with exactly one of:\n"
-                "<answer>Pass</answer>\n"
-                "<answer>Bet</answer>\n"
+                "Kuhn Poker: 3 cards (Jack < Queen < King), each player antes 1 chip.\n"
+                "Actions: Pass or Bet (+1 chip). No raise exists.\n\n"
+                "Game: P1 acts → P2 acts → (if P1 passed and P2 bet) P1 responds.\n"
+                "Showdown: higher card wins. Fold: lose your ante.\n\n"
+                "Format: <answer>Pass</answer> or <answer>Bet</answer>"
             )
 
         self.rng = random.Random()
@@ -251,14 +248,41 @@ class KuhnPokerEnv(Env):
 
     def _make_info(self, is_valid: bool, agg: dict, desc: str) -> dict:
         win_rate = self.wins / self.step_count if self.step_count > 0 else 0.0
+
+        # Behavioral metrics (only meaningful at game end)
+        agent_card = self.cards[0 if self.agent_is_p0 else 1]
+        agent_first_action = self.p0_action if self.agent_is_p0 else self.p1_action
+
+        # Did agent face a bet?
+        facing_bet = False
+        folded = False
+        if self.agent_is_p0 and self.p1_action == "Bet":
+            facing_bet = True
+            folded = self.p0_response == "Pass"
+        elif not self.agent_is_p0 and self.p0_action == "Bet":
+            facing_bet = True
+            folded = self.p1_action == "Pass"
+
         return {
             "metrics": {
                 "action_is_valid": is_valid,
                 "success": win_rate > 0.5,
                 "win_rate": win_rate,
                 "format_penalty": 0.0 if is_valid else self.format_penalty,
+                "agent_bet": 1.0 if agent_first_action == "Bet" else 0.0,
+                "bluff": 1.0 if (agent_card == 0 and agent_first_action == "Bet") else 0.0,
+                "value_bet": 1.0 if (agent_card == 2 and agent_first_action == "Bet") else 0.0,
+                "faced_bet": 1.0 if facing_bet else 0.0,
+                "fold_vs_bet": 1.0 if (facing_bet and folded) else 0.0,
             },
-            "metrics_agg_mode": agg,
+            "metrics_agg_mode": {
+                **agg,
+                "agent_bet": "mean",
+                "bluff": "mean",
+                "value_bet": "mean",
+                "faced_bet": "mean",
+                "fold_vs_bet": "mean",
+            },
             "action_desc": desc,
         }
 
@@ -294,7 +318,20 @@ class KuhnPokerEnv(Env):
         return "Game over."
 
     def parse_action(self, text: str) -> dict:
-        return default_parser_action_func(text, self.action_pattern, self.ACTION_LOOKUP, self.special_token_list)
+        result = default_parser_action_func(text, self.action_pattern, self.ACTION_LOOKUP, self.special_token_list)
+        if result["action"] is None:
+            cleaned = text
+            for token in self.special_token_list:
+                cleaned = cleaned.replace(token, "")
+            rev = {v.lower(): k for k, v in self.ACTION_LOOKUP.items()}
+            # "Pass (fold)" or "Bet (call)" inside answer tags
+            m = re.search(r'<answer>\s*(Pass|Bet)\s*\(', cleaned, re.IGNORECASE)
+            if not m:
+                # "answer: Bet" / "answer:Pass" (model forgot angle brackets)
+                m = re.search(r'answer\s*[:=]\s*(Pass|Bet)', cleaned, re.IGNORECASE)
+            if m:
+                result = {"action": rev.get(m.group(1).strip().lower()), "action_content": m.group(1).strip(), "think_content": ""}
+        return result
 
     def sample_random_action(self) -> str:
         return random.choice(list(self.ACTION_LOOKUP.values()))

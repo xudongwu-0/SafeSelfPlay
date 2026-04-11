@@ -126,6 +126,11 @@ class TrajEnvManager(BaseEnvManager):
                 self.logger.debug(f"group_id: {self.env_config['group_id']} env_id: {self.env_config['env_id']} episode_id: {self.episode_id} start_step {start_step} gen_stats: {log_stats}")
                 log_stats = {"generate_time": [], "step_time": [], "current_step": []}
                 rollout: DataProto = self.formulate_rollouts(rollout_cache)
+                if rollout is None:
+                    # Degenerate episode with no agent actions — skip
+                    rollout_cache = self.reset()
+                    start_step = self.current_step
+                    continue
                 traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
                 traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
                 rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id] * rollout.batch.batch_size[0], dtype=object)
@@ -288,6 +293,8 @@ class TrajEnvManager(BaseEnvManager):
         """
         if 'observation' in rollout_cache.history[-1]:
             rollout_cache.history.pop(-1)
+        if not rollout_cache.history:
+            return None
         history = rollout_cache.history[:-1]
         last_cache = copy.deepcopy(rollout_cache.history[-1])
         last_cache.pop("reward", None)

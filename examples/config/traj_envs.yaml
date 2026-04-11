@@ -173,16 +173,10 @@ custom_env:
       max_steps: ${max_actions_per_traj}
       format_penalty: -0.05
 
-agent_system_template: You're a helpful assistant. You are a good game player. You are aiming to get high reward in the game.
+agent_system_template: You are an expert game player. Think strategically and aim for high reward.
 agent_template: |
-  Turn {turn_idx}:
-  Observation:
   {observation}
-  Strictly follow this format:
-  1. output format is '<answer> [your answer] </answer>' with no extra text. 
-  2. You have {actions_left} actions left. 
-  3. Max response length: {max_response_length} words (tokens).
-  Decide the next action:
+  Reply: <think>reasoning</think><answer>your action</answer>
 
 single_prompt_agent_system_template: You're a helpful assistant.
 single_prompt_agent_template: "{observation}"

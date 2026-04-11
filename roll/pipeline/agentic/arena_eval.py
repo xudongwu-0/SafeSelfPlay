@@ -5,7 +5,7 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import ray
@@ -21,6 +21,49 @@ from roll.utils.logging import get_logger
 logger = get_logger()
 
 ARENA_SRC_RANK_BASE = 500000
+
+
+def _get_model_label(lora_path: Optional[str]) -> str:
+    return "base_model" if lora_path is None else os.path.basename(lora_path)
+
+
+def _build_trajectory(
+    env_manager: TwoPlayerTrajEnvManager,
+    tokenizer: PreTrainedTokenizer,
+    player_i_lora: Optional[str],
+    player_j_lora: Optional[str],
+    seed: int,
+    win_rate: float,
+) -> dict:
+    """Build trajectory dict from env_manager state after an episode, matching training log format."""
+    history = env_manager.rollout_cache.history
+    turns = []
+    scores = []
+    for entry in history:
+        if "prompt_ids" not in entry or "response_ids" not in entry:
+            continue
+        prompt = tokenizer.decode(entry["prompt_ids"], skip_special_tokens=False)
+        response = tokenizer.decode(entry["response_ids"], skip_special_tokens=False)
+        reward = entry.get("reward", 0.0)
+        turns.append({"prompt": prompt, "response": response})
+        scores.append(reward)
+
+    # Extract behavioral metrics from completed history entries
+    episode_metrics = {}
+    for entry in history:
+        if "metrics" in entry:
+            episode_metrics = entry["metrics"]
+
+    return {
+        "player_i": _get_model_label(player_i_lora),
+        "player_j": _get_model_label(player_j_lora),
+        "seed": seed,
+        "win_rate": win_rate,
+        "turns": turns,
+        "episode_score": sum(scores),
+        "step_scores": scores,
+        "metrics": episode_metrics,
+    }
 
 
 def _create_arena_env_manager(
@@ -130,7 +173,8 @@ def play_episode(
     worker_config: EnvManagerConfig,
     seed: int,
     src_rank_base: int,
-) -> float:
+    save_trajectory: bool = False,
+) -> Union[float, Tuple[float, dict]]:
     """Play one episode between player_i and player_j. Returns win rate from player_i's perspective.
 
     Reuses format_messages() and step() from TwoPlayerTrajEnvManager for identical
@@ -200,8 +244,14 @@ def play_episode(
 
     step_count = env_manager.env.step_count
     if step_count == 0:
-        return 0.5
-    return env_manager.env.wins / step_count
+        win_rate = 0.5
+    else:
+        win_rate = env_manager.env.wins / step_count
+
+    if save_trajectory:
+        traj = _build_trajectory(env_manager, tokenizer, player_i_lora, player_j_lora, seed, win_rate)
+        return win_rate, traj
+    return win_rate
 
 
 def run_arena_evaluation(
@@ -213,7 +263,8 @@ def run_arena_evaluation(
     episodes_per_pair: int = 4,
     max_concurrent: int = 32,
     seed_base: int = 12345,
-) -> np.ndarray:
+    save_trajectories: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, List[dict]]]:
     """Run pairwise matches between all LoRA models and return payoff matrix.
 
     Args:
@@ -260,6 +311,8 @@ def run_arena_evaluation(
             if i != j:
                 results[(i, j)] = []
 
+    all_trajectories: List[dict] = []
+
     # Run episodes concurrently
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
         # Map from future to (i, j, ep, env_manager_idx)
@@ -284,6 +337,7 @@ def run_arena_evaluation(
                     worker_config,
                     seed,
                     src_rank,
+                    save_trajectories,
                 )
                 future_to_info[future] = (i, j, ep, em_idx)
 
@@ -300,7 +354,12 @@ def run_arena_evaluation(
             for future in done_futures:
                 i, j, ep, em_idx = future_to_info.pop(future)
                 try:
-                    win_rate = future.result()
+                    result = future.result()
+                    if save_trajectories:
+                        win_rate, traj = result
+                        all_trajectories.append(traj)
+                    else:
+                        win_rate = result
                     results[(i, j)].append(win_rate)
                 except Exception as e:
                     logger.error(f"Arena episode ({i},{j}) ep={ep} failed: {e}")
@@ -317,6 +376,8 @@ def run_arena_evaluation(
     for (i, j), win_rates in results.items():
         payoff_matrix[i][j] = np.mean(win_rates) if win_rates else 0.5
 
+    if save_trajectories:
+        return payoff_matrix, all_trajectories
     return payoff_matrix
 
 
@@ -366,4 +427,15 @@ def save_payoff_matrix(
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
     logger.info(f"Arena payoff matrix saved to {filepath}")
+    return filepath
+
+
+def save_trajectories_jsonl(trajectories: List[dict], output_dir: str) -> str:
+    """Save trajectories as JSONL (one JSON per line per episode). Returns file path."""
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, "arena_trajectories.jsonl")
+    with open(filepath, "w") as f:
+        for traj in trajectories:
+            f.write(json.dumps(traj, ensure_ascii=False) + "\n")
+    logger.info(f"Arena trajectories saved to {filepath} ({len(trajectories)} episodes)")
     return filepath

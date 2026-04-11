@@ -116,7 +116,10 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         self.rollout_cache.history[-1]["actions_left"] = self.env_config.max_steps - self.rollout_cache.step
 
         if terminated:
-            self.rollout_cache.terminated = True
+            # Game ended on opponent's first action. Don't set terminated here —
+            # let the agent still act once so formulate_rollouts has valid data.
+            # env.step() will return GAME_OVER with stored reward.
+            pass
 
     def step(self, llm_output: DataProto) -> RolloutCache:
         """Two-player step: agent 0 acts, then opponent acts, round resolves."""
