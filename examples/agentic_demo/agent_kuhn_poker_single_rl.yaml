@@ -10,19 +10,19 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "agentic_kuhn_poker_fsp_train"
+exp_name: "agentic_kuhn_poker_single_rl"
 seed: 42
-logging_dir: /projects/bfoz/wchen11/kuhn_poker_output/logs
-output_dir: /projects/bfoz/wchen11/kuhn_poker_output
+logging_dir: /projects/bfoz/wchen11/kuhn_poker_single_rl/logs
+output_dir: /projects/bfoz/wchen11/kuhn_poker_single_rl
 system_envs: {}
 
-track_with: tensorboard
+track_with: wandb
 tracker_kwargs:
-  log_dir: /projects/bfoz/wchen11/kuhn_poker_output/tensorboard
+  project: kuhn-poker-single-rl
 
 checkpoint_config:
   type: file_system
-  output_dir: /projects/bfoz/wchen11/kuhn_poker_output/render
+  output_dir: /projects/bfoz/wchen11/kuhn_poker_single_rl/render
 
 num_gpus_per_node: 4
 
@@ -31,7 +31,7 @@ save_steps: 10000
 logging_steps: 1
 eval_steps: 50
 resume_from_checkpoint: false
-fsp_save_steps: 60
+fsp_save_steps: 0
 
 rollout_batch_size: 128
 val_batch_size: 8
@@ -61,7 +61,7 @@ actor_train:
     learning_rate: 2.0e-5
     weight_decay: 0
     per_device_train_batch_size: 4
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 32
     warmup_steps: 2
     lr_scheduler_type: cosine
   data_args:

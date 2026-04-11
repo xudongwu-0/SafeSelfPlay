@@ -5,14 +5,10 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --partition=gpuA40x4
 #SBATCH --account=bfoz-delta-gpu
-#SBATCH --time=12:00:00
+#SBATCH --time=28:00:00
 #SBATCH --gpus-per-node=4
-#SBATCH --job-name=grpo_sweep
-#SBATCH --output=/projects/bfoz/wchen11/grpo_sweep_%j.out
-
-# Capture arg before sourcing conda (which consumes $1)
-GROUP_SIZE=${1:-1}
-shift || true
+#SBATCH --job-name=kuhn_poker_single_rl
+#SBATCH --output=/projects/bfoz/wchen11/kuhn_poker_single_rl_%j.out
 
 set -ex
 
@@ -27,12 +23,10 @@ mkdir -p $TMPDIR
 cd /u/wchen11/ROLL
 export PYTHONPATH=/u/wchen11/ROLL:$PYTHONPATH
 
-echo "=== GRPO sweep: group_size=${GROUP_SIZE} ==="
-
 ray stop --force 2>/dev/null || true
 sleep 2
 
 python examples/start_agentic_pipeline.py \
-    --config_path agentic_demo/benchmark_grpo_sweep \
-    --config_name agent_kuhn_poker_grpo_gs${GROUP_SIZE} \
+    --config_path agentic_demo \
+    --config_name agent_kuhn_poker_single_rl \
     2>&1

@@ -125,10 +125,25 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         agent_action = responses[0]
 
         with self.thread_lock, self.env_step_limiter:
-            obs_for_opponent, _, _, _, agent_step_info = self.env.step(action=agent_action)
+            obs_for_opponent, agent_reward, agent_terminated, agent_truncated, agent_step_info = self.env.step(action=agent_action)
 
         # Store agent 0's response in rollout_cache (will get reward after round resolves)
         self.rollout_cache.history[-1]['llm_response'] = agent_action
+
+        # Game ended on agent's action (e.g., agent is P1 and action resolves the game)
+        if agent_terminated:
+            self.rollout_cache.step += 1
+            self.rollout_cache.terminated = True
+            self.rollout_cache.truncated = agent_truncated
+            self.rollout_cache.history[-1]['reward'] = agent_reward
+            if agent_step_info is not None:
+                self.rollout_cache.history[-1].update(agent_step_info)
+            self.rollout_cache.history.append({
+                "observation": "",
+                "actions_left": self.env_config.max_steps - self.rollout_cache.step,
+                "messages": None,
+            })
+            return self.rollout_cache
 
         # --- Opponent's turn (base model, lora_name=None) ---
         opponent_lm_input = self._format_opponent_messages(obs_for_opponent)

@@ -1,0 +1,24 @@
+# @package _global_
+defaults:
+  - ../agent_kuhn_poker_single_rl
+
+# Batch size sweep base config
+# Sweep per_device_train_batch_size while keeping effective batch = 32
+max_steps: 20
+eval_steps: 100
+
+train_env_manager:
+  num_env_groups: 32
+  group_size: 1
+  max_env_num_per_worker: 32
+  num_groups_partition: [32]
+
+val_env_manager:
+  num_env_groups: 4
+  group_size: 1
+  max_env_num_per_worker: 4
+  num_groups_partition: [4]
+
+reward_normalization:
+  grouping: tags
+  norm_mean_type: ~

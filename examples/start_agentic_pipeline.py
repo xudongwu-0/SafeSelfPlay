@@ -16,10 +16,10 @@ def main():
     parser.add_argument(
         "--config_name", help="The name of the main configuration file (without extension).", default="sppo_config"
     )
-    args = parser.parse_args()
+    args, overrides = parser.parse_known_args()
 
     initialize(config_path=args.config_path, job_name="app")
-    cfg = compose(config_name=args.config_name)
+    cfg = compose(config_name=args.config_name, overrides=overrides)
 
     ppo_config = from_dict(data_class=AgenticConfig, data=OmegaConf.to_container(cfg, resolve=True))
 

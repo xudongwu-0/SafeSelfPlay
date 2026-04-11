@@ -507,6 +507,13 @@ class AgenticPipeline(BasePipeline):
                 metrics.update(data_metrics)
                 metrics["system/tps"] = tps_timer.mean_throughput
                 metrics["system/samples"] = (global_step + 1) * self.pipeline_config.rollout_batch_size
+                total_tokens = torch.sum(batch.batch["attention_mask"]).detach().item()
+                if metrics.get("time/step_rollout", 0) > 0:
+                    metrics["system/tps_rollout"] = total_tokens / metrics["time/step_rollout"]
+                if metrics.get("time/step_old_log_probs_values", 0) > 0:
+                    metrics["system/tps_old_log_probs"] = total_tokens / metrics["time/step_old_log_probs_values"]
+                if metrics.get("time/step_train", 0) > 0:
+                    metrics["system/tps_train"] = total_tokens / metrics["time/step_train"]
 
                 # do ckpt
                 self.state.step = global_step
