@@ -148,6 +148,7 @@ class ActorPGWorker(ActorWorker):
             "kl_loss": kl_loss,
             "approxkl": approxkl,
             "policykl": policykl,
+            "entropy_loss": entropy_loss,
         })
 
         if self.pipeline_config.use_kl_loss:
@@ -476,6 +477,7 @@ class ActorPGWorker(ActorWorker):
             "actor/sample_weights_mean": cached["sample_weights"].mean().detach().item(),
             "actor/sample_weights_min": cached["sample_weights"].min().detach().item(),
             "actor/sample_weights_max": cached["sample_weights"].max().detach().item(),
+            "actor/entropy@sum": cached["entropy_loss"].detach().item(),
         }
 
         # 根据PG变体添加特定指标

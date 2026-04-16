@@ -207,6 +207,9 @@ class AgenticPipeline(BasePipeline):
         # Track FSP checkpoints for arena evaluation: None = base model
         self.fsp_checkpoints: list = [None]
 
+        # Early stopping state: count consecutive low-variance steps
+        early_stop_counter = 0
+
         for global_step in range(self.pipeline_config.max_steps):
             if global_step <= self.state.step:
                 global_step += 1
@@ -600,6 +603,27 @@ class AgenticPipeline(BasePipeline):
             metrics["time/step_total"] = step_timer.last
             self.tracker.log(values=metrics, step=global_step)
 
+            # Early stopping: stop when per-group reward std is consistently low (model converged)
+            es_threshold = self.pipeline_config.early_stop_group_std_threshold
+            if es_threshold > 0:
+                group_std_mean = metrics.get("critic/group_reward_std/mean", float("inf"))
+                reward_mean = metrics.get("critic/rewards/mean", 0)
+                if group_std_mean < es_threshold and reward_mean > 0:
+                    early_stop_counter += 1
+                    logger.info(
+                        f"Early stop: group_reward_std={group_std_mean:.4f} < {es_threshold}, "
+                        f"reward_mean={reward_mean:.3f} > 0, count={early_stop_counter}/"
+                        f"{self.pipeline_config.early_stop_group_std_patience}"
+                    )
+                else:
+                    early_stop_counter = 0
+                if early_stop_counter >= self.pipeline_config.early_stop_group_std_patience:
+                    logger.info(
+                        f"Early stopping triggered at step {global_step}: group_reward_std below "
+                        f"{es_threshold} for {early_stop_counter} consecutive steps"
+                    )
+                    break
+
             logger.info(f"pipeline step {global_step} finished")
             global_step += 1
             logger.info(f"epoch {global_step} finished")
@@ -770,7 +794,7 @@ class AgenticPipeline(BasePipeline):
         train_devices = set(self.actor_train.worker_config.device_mapping)
         infer_devices = set(self.actor_infer.worker_config.device_mapping)
         critic_devices = set(self.critic.worker_config.device_mapping) if hasattr(self, 'critic') and self.critic else set()
-        ref_devices = set(self.reference.worker_config.device_mapping) if self.pipeline_config.enable_reference else set()
+        ref_devices = set(self.reference.worker_config.device_mapping) if self.pipeline_config.enable_reference and hasattr(self, 'reference') else set()
         reward_devices = set(self.reward.worker_config.device_mapping) if self.reward else set()
 
         # VAL: VAL_NON_EMPTY - ensure device_mapping not empty
@@ -782,7 +806,7 @@ class AgenticPipeline(BasePipeline):
 
         # Universal validation: Reference must always colocate with actor_train (both Model A and B)
         # VAL: VAL_SUBSET (exact match) - reference colocation
-        if self.pipeline_config.enable_reference:
+        if self.pipeline_config.enable_reference and hasattr(self, 'reference'):
             assert ref_devices == train_devices, (
                 f"Reference device_mapping must match actor_train exactly: "
                 f"ref={list(ref_devices)}, train={list(train_devices)}"

@@ -95,17 +95,17 @@ class ActorWorker(BaseActorWorker):
             total_loss = pg_loss + kl_loss * self.pipeline_config.kl_loss_coef
         else:
             total_loss = pg_loss
+        entropy = self.strategy.op_compute_entropy(
+            logits=output_tensor, attention_mask=data.batch["response_mask"]
+        )
+        entropy_loss = agg_loss(
+            loss_mat=entropy,
+            loss_mask=response_mask,
+            loss_agg_mode=self.pipeline_config.loss_agg_mode,
+            batch_num_tokens=batch_num_tokens['response_mask'],
+            global_valid_samples=global_valid_samples['response_mask'],
+        )
         if self.pipeline_config.entropy_loss_coef > 0:
-            entropy = self.strategy.op_compute_entropy(
-                logits=output_tensor, attention_mask=data.batch["response_mask"]
-            )
-            entropy_loss = agg_loss(
-                loss_mat=entropy,
-                loss_mask=response_mask,
-                loss_agg_mode=self.pipeline_config.loss_agg_mode,
-                batch_num_tokens=batch_num_tokens['response_mask'],
-                global_valid_samples=global_valid_samples['response_mask'],
-            )
             total_loss = total_loss - entropy_loss * self.pipeline_config.entropy_loss_coef
 
         pg_metrics = {
@@ -133,6 +133,7 @@ class ActorWorker(BaseActorWorker):
             "actor/pg_loss@sum": pg_loss.detach().item(),
             "actor/kl_loss@sum": kl_loss.detach().item(),
             "actor/total_loss@sum": total_loss.detach().item(),
+            "actor/entropy@sum": entropy_loss.detach().item(),
             "actor/approxkl@sum": agg_loss(
                 loss_mat=approxkl, loss_mask=response_mask, loss_agg_mode=self.pipeline_config.loss_agg_mode,
                 batch_num_tokens=batch_num_tokens['response_mask'], global_valid_samples=global_valid_samples['response_mask']

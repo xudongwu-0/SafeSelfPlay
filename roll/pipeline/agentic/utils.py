@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from multiprocessing import Pool
-from typing import List, Callable, Dict, Optional
+from typing import List, Callable, Dict, Optional, Tuple
 
 import imageio
 import numpy as np
@@ -96,7 +96,18 @@ def compute_discounted_returns(batch: DataProto, adv_estimator, gamma=1.0) -> Da
 
 # TODO: 这里的功能性和rlvr比较接近，但因为后续agentic会有潜在的修改需求，所以就先拎出来
 @torch.no_grad()
-def agentic_reward_norm(batch: "DataProto", reward_normalization: RewardNormalizationConfig) -> torch.Tensor:
+def agentic_reward_norm(
+    batch: "DataProto",
+    reward_normalization: RewardNormalizationConfig,
+    filter_zero_variance_groups: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Normalize rewards per group and return (normalized_rewards, metrics).
+
+    Args:
+        filter_zero_variance_groups: If True, zero out rewards for groups where all
+            members have the same score (std < 1e-6). This prevents GRPO from
+            producing near-zero advantages that provide no learning signal.
+    """
     batch.batch["sample_order_placeholder"] = torch.arange(batch.batch.batch_size[0], device=batch.batch.device)
     grouping = reward_normalization.grouping
     norm_mean_type = reward_normalization.norm_mean_type
@@ -111,6 +122,10 @@ def agentic_reward_norm(batch: "DataProto", reward_normalization: RewardNormaliz
         batch_std = all_scores.std()
 
     batch_list = []
+    group_stds = []
+    group_means = []
+    num_zero_variance_groups = 0
+    num_total_groups = 0
     batch_grouped: Dict[str, DataProto] = {"default": batch}
     if grouping != "batch":
         batch_grouped = batch.group_by(keys=grouping)
@@ -118,6 +133,12 @@ def agentic_reward_norm(batch: "DataProto", reward_normalization: RewardNormaliz
         scores = group_batch.batch["scores"]
         original_dtype = scores.dtype
         scores_float = scores.float()
+        num_total_groups += 1
+
+        # Track per-group stats
+        group_std_val = scores_float.std().item() if scores_float.numel() > 1 else 0.0
+        group_stds.append(group_std_val)
+        group_means.append(scores_float.mean().item())
 
         if norm_mean_type == "batch":
             reward_mean = batch_mean
@@ -133,6 +154,17 @@ def agentic_reward_norm(batch: "DataProto", reward_normalization: RewardNormaliz
         else:
             reward_std = None
 
+        is_zero_variance = scores_float.numel() <= 1 or (reward_std is not None and reward_std.abs() < 1e-6)
+        if is_zero_variance:
+            # Also check raw score std for groups without std normalization
+            if reward_std is None and scores_float.numel() > 1 and scores_float.std().abs() < 1e-6:
+                is_zero_variance = True
+            elif reward_std is None:
+                is_zero_variance = False
+
+        if is_zero_variance:
+            num_zero_variance_groups += 1
+
         if reward_std is not None:
             # 处理单个元素或标准差为0的情况，避免除以0
             if scores_float.numel() > 1 and reward_std.abs() > 1e-6:
@@ -142,14 +174,28 @@ def agentic_reward_norm(batch: "DataProto", reward_normalization: RewardNormaliz
         else:
             normalized_scores = scores_float - reward_mean
 
+        # Option B: filter zero-variance groups by zeroing their rewards
+        if filter_zero_variance_groups and is_zero_variance:
+            normalized_scores = torch.zeros_like(scores_float)
+
         normalized_scores = normalized_scores.to(dtype=original_dtype)
         group_batch.batch["grouped_rewards"] = normalized_scores
         batch_list.append(group_batch)
 
+    # Build metrics
+    norm_metrics: Dict[str, float] = {}
+    if group_stds:
+        norm_metrics["critic/group_reward_std/mean"] = float(np.mean(group_stds))
+        norm_metrics["critic/group_reward_std/min"] = float(np.min(group_stds))
+        norm_metrics["critic/group_reward_std/max"] = float(np.max(group_stds))
+        norm_metrics["critic/group_reward_mean/mean"] = float(np.mean(group_means))
+        norm_metrics["critic/zero_variance_groups"] = float(num_zero_variance_groups)
+        norm_metrics["critic/zero_variance_group_frac"] = float(num_zero_variance_groups) / max(num_total_groups, 1)
+
     batch = DataProto.concat(batch_list)
     batch.reorder(indices=torch.argsort(batch.batch["sample_order_placeholder"]))
     batch.pop("sample_order_placeholder")
-    return batch.batch.pop("grouped_rewards")
+    return batch.batch.pop("grouped_rewards"), norm_metrics
 
 
 def build_state_group(batch: "DataProto") -> "DataProto":
@@ -178,15 +224,18 @@ def build_state_group(batch: "DataProto") -> "DataProto":
 @torch.no_grad()
 def compute_response_level_rewards(batch: "DataProto", pipeline_config: AgenticConfig) -> "DataProto":
     reward_metrics = {}
+    filter_zv = getattr(pipeline_config, "filter_zero_variance_groups", False)
     if pipeline_config.adv_estimator == "gigpo":
         # ref: https://github.com/langfengQ/verl-agent/blob/e03bd502667c45172e8c093cc506db8438ae8ab5/gigpo/core_gigpo.py#L109
         # step 1
         episode_scores = torch.from_numpy(batch.non_tensor_batch["episode_scores"].astype(np.float32))
         scores_to_group = DataProto.from_dict({"scores": episode_scores})
         scores_to_group.non_tensor_batch = batch.non_tensor_batch
-        episode_rewards: torch.Tensor = agentic_reward_norm(
-            scores_to_group, reward_normalization=pipeline_config.reward_normalization
+        episode_rewards, ep_norm_metrics = agentic_reward_norm(
+            scores_to_group, reward_normalization=pipeline_config.reward_normalization,
+            filter_zero_variance_groups=filter_zv,
         )
+        reward_metrics.update(ep_norm_metrics)
 
         # step 2
         batch = build_state_group(batch=batch)
@@ -194,12 +243,14 @@ def compute_response_level_rewards(batch: "DataProto", pipeline_config: AgenticC
         # step 3
         scores_to_group = DataProto.from_dict({"scores": batch.batch["step_rewards"]})
         scores_to_group.non_tensor_batch = batch.non_tensor_batch
-        step_rewards: torch.Tensor = agentic_reward_norm(
+        step_rewards, step_norm_metrics = agentic_reward_norm(
             batch=scores_to_group,
             reward_normalization=RewardNormalizationConfig(
                 grouping="state_group_id", method=pipeline_config.reward_normalization.method
             ),
+            filter_zero_variance_groups=filter_zv,
         )
+        reward_metrics.update({f"step_{k}": v for k, v in step_norm_metrics.items()})
 
         batch.batch["response_level_rewards"] = (
             pipeline_config.episode_reward_weight * episode_rewards + pipeline_config.step_reward_weight * step_rewards
@@ -209,15 +260,21 @@ def compute_response_level_rewards(batch: "DataProto", pipeline_config: AgenticC
     elif pipeline_config.adv_estimator == "step_reinforce":
         scores_to_group = DataProto.from_dict({"scores": batch.batch["step_rewards"]})
         scores_to_group.non_tensor_batch = batch.non_tensor_batch
-        batch.batch["response_level_rewards"] = agentic_reward_norm(
-            scores_to_group, reward_normalization=pipeline_config.reward_normalization
+        rewards, norm_metrics = agentic_reward_norm(
+            scores_to_group, reward_normalization=pipeline_config.reward_normalization,
+            filter_zero_variance_groups=filter_zv,
         )
+        batch.batch["response_level_rewards"] = rewards
+        reward_metrics.update(norm_metrics)
     else:
         scores_to_group = DataProto.from_dict({"scores": batch.batch["scores"].clone().sum(dim=-1)})
         scores_to_group.non_tensor_batch = batch.non_tensor_batch
-        batch.batch["response_level_rewards"] = agentic_reward_norm(
-            scores_to_group, reward_normalization=pipeline_config.reward_normalization
+        rewards, norm_metrics = agentic_reward_norm(
+            scores_to_group, reward_normalization=pipeline_config.reward_normalization,
+            filter_zero_variance_groups=filter_zv,
         )
+        batch.batch["response_level_rewards"] = rewards
+        reward_metrics.update(norm_metrics)
 
     # 加上clip
     if pipeline_config.reward_clip:

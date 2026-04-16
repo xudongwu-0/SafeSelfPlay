@@ -222,6 +222,20 @@ class AgenticConfig(PPOConfig):
                     "partial_gpu_mode from device_mapping; when False, partial GPU logic is disabled."
         },
     )
+    filter_zero_variance_groups: bool = field(
+        default=False,
+        metadata={"help": "Zero out rewards for GRPO groups where all members got the same score. "
+                          "Prevents near-zero advantages from producing noisy gradients."},
+    )
+    early_stop_group_std_threshold: float = field(
+        default=0.0,
+        metadata={"help": "Early stop when mean per-group reward std falls below this threshold "
+                          "and mean reward > 0. Set 0 to disable."},
+    )
+    early_stop_group_std_patience: int = field(
+        default=10,
+        metadata={"help": "Number of consecutive steps below threshold before early stopping."},
+    )
 
     parse_tool_call_parameter_to_dict: bool = field(default=False, metadata={"help": "Parse tool call parameter to dict. for https://github.com/QwenLM/Qwen3-Coder/issues/444"})
 
