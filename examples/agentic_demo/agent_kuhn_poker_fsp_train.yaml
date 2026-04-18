@@ -103,7 +103,7 @@ actor_infer:
       gpu_memory_utilization: 0.92
       block_size: 16
       load_format: auto
-      max_loras: 6
+      max_loras: 20
       enforce_eager: false
       max_num_batched_tokens: 16384
   device_mapping: list(range(1,4))

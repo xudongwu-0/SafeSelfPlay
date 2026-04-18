@@ -527,15 +527,18 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
                     nn_init.zeros_(param.data)
                 num_b += 1
 
-        # ZeRO-3: sync fp32 master <- bf16 so optimizer.step() won't revert
-        # bf16 from stale fp32 via _reassign_or_swap_out_partitioned_parameters
-        # (stage3.py:2069-2072). All trainable params are LoRA, so syncing the
-        # whole partitioned group is correct.
+        # ZeRO (stage 1/2/3) + bf16: sync fp32 master <- bf16 so optimizer.step()
+        # won't revert bf16 from stale fp32. Both DeepSpeedZeroOptimizer (stage 1/2,
+        # stage_1_and_2.py:2216) and DeepSpeedZeroOptimizer_Stage3 (stage3.py:2602)
+        # expose refresh_fp32_params(). All trainable params are LoRA, so syncing
+        # the whole partitioned groups is correct.
         num_fp32_synced = 0
-        if is_zero3 and hasattr(self.optimizer, "refresh_fp32_params"):
+        if hasattr(self.optimizer, "refresh_fp32_params"):
             try:
                 self.optimizer.refresh_fp32_params()
-                num_fp32_synced = len(self.optimizer.fp32_partitioned_groups_flat)
+                fp32_groups = getattr(self.optimizer, "fp32_partitioned_groups_flat",
+                                       getattr(self.optimizer, "single_partition_of_fp32_groups", []))
+                num_fp32_synced = len(fp32_groups)
             except Exception as e:
                 logger.warning(f"reset_lora_weights: refresh_fp32_params failed: {e}")
 
