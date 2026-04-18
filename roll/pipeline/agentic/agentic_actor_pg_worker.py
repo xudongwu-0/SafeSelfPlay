@@ -481,8 +481,7 @@ class ActorWorker(BaseActorWorker):
 
         # 构建基础指标
         base_metrics = {
-            "actor/ratio_mean@sum": agg_loss(loss_mat=ratio, loss_mask=response_mask, loss_agg_mode='seq-mean-token-mean',
-                                                global_valid_samples=global_valid_samples['response_mask'],).detach().item(),
+            "actor/ratio_mean@mean": masked_mean(ratio, response_mask).detach().item(),
             "actor/ratio_max@max": torch.max(ratio * response_mask).detach().item(),
             "actor/ratio_min@min": torch.min(ratio * response_mask + (1 - response_mask) * 1e10).detach().item(),
             "actor/pg_loss@sum": cached["original_pg_loss"].detach().item(),

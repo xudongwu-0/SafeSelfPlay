@@ -170,7 +170,7 @@ class VllmStrategy(InferenceStrategy):
         lora_int_ids = list(await self.model.list_loras())
         if len(lora_int_ids) > 0:
             lora_int_id = lora_int_ids[0]
-            return LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="dummy_lora_path")
+            return LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora")
         return None
 
     async def _generate_standard(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:

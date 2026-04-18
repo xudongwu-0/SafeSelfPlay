@@ -207,7 +207,30 @@ class AgenticPipeline(BasePipeline):
         # Track FSP checkpoints for arena evaluation: None = base model
         self.fsp_checkpoints: list = [None]
 
-        # Early stopping state: count consecutive low-variance steps
+        try:
+            self._run_impl(tps_timer)
+        finally:
+            # Clean up FSP LoRA weight directories at end of run (preserves logs/tensorboard/wandb/arena outputs)
+            if self.pipeline_config.fsp_save_steps > 0:
+                weight_dirs = [p for p in getattr(self, "fsp_checkpoints", []) if p]
+                if weight_dirs:
+                    try:
+                        import shutil as _shutil
+                        du_before = _shutil.disk_usage("/zfsauton/scratch")
+                        logger.info(f"FSP cleanup: scratch free before = {du_before.free // (1024**3)}G")
+                    except Exception:
+                        pass
+                    from roll.utils.fsp_ckpt import cleanup_fsp_weights
+                    cleanup_fsp_weights(weight_dirs)
+                    try:
+                        import shutil as _shutil
+                        du_after = _shutil.disk_usage("/zfsauton/scratch")
+                        logger.info(f"FSP cleanup: scratch free after = {du_after.free // (1024**3)}G")
+                    except Exception:
+                        pass
+
+    @torch.no_grad()
+    def _run_impl(self, tps_timer):
         early_stop_counter = 0
 
         for global_step in range(self.pipeline_config.max_steps):
@@ -541,16 +564,47 @@ class AgenticPipeline(BasePipeline):
                         # Fallback: use worker-level path
                         worker_name = f"{self.pipeline_config.actor_train.name}-0-G{self.pipeline_config.actor_train.device_mapping[0]}"
                         fsp_ckpt_dir = os.path.abspath(os.path.join(self.pipeline_config.output_dir, worker_name, ckpt_id))
-                    # Wait for adapter_config.json to be available (async upload may still be in progress)
+                    # Wait for adapter_config.json and DeepSpeed state pt (async upload may still be in progress).
+                    # File size must be stable for 2 consecutive samples to confirm the write has flushed,
+                    # otherwise torch.load hits `PytorchStreamReader failed reading zip archive`.
                     adapter_cfg = os.path.join(fsp_ckpt_dir, "adapter_config.json")
-                    for _ in range(60):
-                        if os.path.exists(adapter_cfg):
-                            break
+                    ds_state = os.path.join(fsp_ckpt_dir, "checkpoint", "mp_rank_00_model_states.pt")
+                    last_size = -1
+                    stable_hits = 0
+                    for _ in range(120):
+                        if os.path.exists(adapter_cfg) and os.path.exists(ds_state):
+                            try:
+                                cur_size = os.path.getsize(ds_state)
+                            except OSError:
+                                cur_size = -1
+                            if cur_size > 0 and cur_size == last_size:
+                                stable_hits += 1
+                                if stable_hits >= 2:
+                                    break
+                            else:
+                                stable_hits = 0
+                            last_size = cur_size
                         time.sleep(1)
-                    logger.info(f"FSP: adding LoRA checkpoint to enemy pool: {fsp_ckpt_dir}")
-                    ray.get(self.train_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
-                    ray.get(self.val_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
-                    self.fsp_checkpoints.append(fsp_ckpt_dir)
+                    # Convert DeepSpeed .pt -> PEFT adapter_model.safetensors so vLLM can load it
+                    from roll.utils.fsp_ckpt import export_peft_adapter
+                    fsp_exported = False
+                    try:
+                        export_peft_adapter(fsp_ckpt_dir)
+                        fsp_exported = True
+                    except Exception as e:
+                        logger.error(f"FSP: export_peft_adapter failed for {fsp_ckpt_dir}: {e}", exc_info=True)
+                    if fsp_exported:
+                        logger.info(f"FSP: adding LoRA checkpoint to enemy pool: {fsp_ckpt_dir}")
+                        ray.get(self.train_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
+                        ray.get(self.val_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
+                        self.fsp_checkpoints.append(fsp_ckpt_dir)
+                    # Cold-start: reset training LoRA to initial weights so the next
+                    # generation trains from scratch against the enemy pool.
+                    if self.pipeline_config.cold_start:
+                        logger.info(f"FSP cold_start: resetting training LoRA weights at step {global_step}")
+                        self.actor_train.reset_lora_weights(blocking=True)
+                    else:
+                        pass
 
                 with Timer(name="log", logger=None) as log_timer:
                     if self.pipeline_config.logging_steps > 0 and global_step % self.pipeline_config.logging_steps == 0:

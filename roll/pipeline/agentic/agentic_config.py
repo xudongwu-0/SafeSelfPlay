@@ -189,6 +189,7 @@ class AgenticConfig(PPOConfig):
     train_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     val_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     fsp_save_steps: int = field(default=0, metadata={"help": "Fictitious self-play: save LoRA to enemy pool every N steps. 0 = disabled."})
+    cold_start: bool = field(default=True, metadata={"help": "FSP cold-start: after each fsp_save_steps snapshot, reset training LoRA to initial (PEFT default) weights so the next generation trains from scratch."})
     render_save_dir: str = field(default=None, metadata={"help": "Directory to save rendered frames."})
     reward: RewardConfig = field(default=None, metadata={"help": "Configuration for reward inference."})
     reward_normalization: RewardNormalizationConfig = field(

@@ -42,7 +42,7 @@ class TensorLoraManager:
         lora_request = TensorLoRARequest(
             lora_name=f"{lora_int_id}",
             lora_int_id=lora_int_id,
-            lora_path="dummy_lora_path",
+            lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora",
             peft_config=peft_config,
             lora_tensors=self.lora_params,
         )

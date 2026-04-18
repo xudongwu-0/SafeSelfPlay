@@ -500,6 +500,57 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
                     self.offload_states(include=[OffloadStateType.optimizer_states], non_blocking=True)
         return metrics
 
+    @torch.no_grad()
+    def reset_lora_weights(self):
+        """Reset LoRA A/B params to PEFT default init (A=kaiming_uniform(a=sqrt(5)), B=0)
+        and clear Adam optimizer state for trainable params (LoRA-only in this config).
+        Base model weights are untouched.
+        """
+        import math
+        import torch.nn.init as nn_init
+
+        num_a = num_b = 0
+        is_zero3 = self.ds_config.is_zero3()
+        for name, param in self.model.module.named_parameters():
+            if "lora_A" in name:
+                if is_zero3:
+                    with GatheredParameters([param], modifier_rank=0):
+                        nn_init.kaiming_uniform_(param.data, a=math.sqrt(5))
+                else:
+                    nn_init.kaiming_uniform_(param.data, a=math.sqrt(5))
+                num_a += 1
+            elif "lora_B" in name:
+                if is_zero3:
+                    with GatheredParameters([param], modifier_rank=0):
+                        nn_init.zeros_(param.data)
+                else:
+                    nn_init.zeros_(param.data)
+                num_b += 1
+
+        # ZeRO-3: sync fp32 master <- bf16 so optimizer.step() won't revert
+        # bf16 from stale fp32 via _reassign_or_swap_out_partitioned_parameters
+        # (stage3.py:2069-2072). All trainable params are LoRA, so syncing the
+        # whole partitioned group is correct.
+        num_fp32_synced = 0
+        if is_zero3 and hasattr(self.optimizer, "refresh_fp32_params"):
+            try:
+                self.optimizer.refresh_fp32_params()
+                num_fp32_synced = len(self.optimizer.fp32_partitioned_groups_flat)
+            except Exception as e:
+                logger.warning(f"reset_lora_weights: refresh_fp32_params failed: {e}")
+
+        # Clear optimizer (Adam) state. With LoRA training, only LoRA params are
+        # trainable, so this clears only LoRA Adam state.
+        try:
+            base_opt = getattr(self.optimizer, "optimizer", self.optimizer)
+            base_opt.state = defaultdict(dict)
+        except Exception as e:
+            logger.warning(f"reset_lora_weights: failed to clear optimizer state: {e}")
+
+        logger.info(f"reset_lora_weights: reinit {num_a} lora_A + {num_b} lora_B params; "
+                    f"synced {num_fp32_synced} fp32 master groups; Adam state cleared")
+        return {"lora_A_reset": num_a, "lora_B_reset": num_b}
+
     def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", local_state_path=None, **kwargs):
         """
         save ckpt/hf model/tokenizer to local dir

@@ -10,18 +10,24 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "agentic_kuhn_poker_fsp_train"
+exp_name: "kuhn_fsp_5lora_klloss0p01_ga16_gs8_coldstart"
 seed: 42
 logging_dir: /projects/bfoz/wchen11/kuhn_poker_output/logs
 output_dir: /projects/bfoz/wchen11/kuhn_poker_output
 system_envs: {}
 
-track_with: tensorboard
+track_with: wandb
 tracker_kwargs:
-  log_dir: /projects/bfoz/wchen11/kuhn_poker_output/tensorboard
+  project: self-play
+  name: ${exp_name}
+  tags:
+    - kuhn_poker
+    - fsp_train
+    - auton
 
 checkpoint_config:
   type: file_system
+  async_upload: false
   output_dir: /projects/bfoz/wchen11/kuhn_poker_output/render
 
 num_gpus_per_node: 4
@@ -40,7 +46,9 @@ sequence_length: 1024
 advantage_clip: 10.0
 ppo_epochs: 1
 adv_estimator: "grpo"
-init_kl_coef: 0.0
+init_kl_coef: 0.01
+use_kl_loss: true
+kl_loss_coef: 0.01
 whiten_advantages: true
 entropy_loss_coef: 0
 max_grad_norm: 1.0
@@ -61,7 +69,7 @@ actor_train:
     learning_rate: 2.0e-5
     weight_decay: 0
     per_device_train_batch_size: 4
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 16
     warmup_steps: 2
     lr_scheduler_type: cosine
   data_args:
@@ -109,7 +117,7 @@ train_env_manager:
   format_penalty: -0.01
   max_env_num_per_worker: 64
   num_env_groups: 32
-  group_size: 4
+  group_size: 8
   tags: [KuhnPokerLLMThink]
   num_groups_partition: [32]
 
