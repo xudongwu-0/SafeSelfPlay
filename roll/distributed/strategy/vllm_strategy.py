@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import gc
+import inspect
 import os
 from collections import deque
 from typing import Dict, List, Optional
@@ -12,7 +13,10 @@ from transformers import set_seed
 from vllm import RequestOutput, SamplingParams
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, BeamSearchParams
-from vllm.inputs.data import TokensPrompt
+try:
+    from vllm.inputs.data import TokensPrompt
+except ImportError:
+    from vllm.inputs import TokensPrompt
 from vllm.utils import random_uuid
 
 from roll.distributed.executor.worker import Worker
@@ -85,6 +89,13 @@ class VllmStrategy(InferenceStrategy):
             }
         )
 
+        # Materialize reasoning_config dict into ReasoningConfig so vLLM's
+        # thinking_token_budget path (SamplingParams → logits_processors) is active.
+        # Accepts: {} (defaults: <think>/</think>) or a dict of overrides.
+        if isinstance(vllm_config.get("reasoning_config"), dict):
+            from vllm.config.reasoning import ReasoningConfig
+            vllm_config["reasoning_config"] = ReasoningConfig(**vllm_config["reasoning_config"])
+
         self.is_lora = self.worker_config.model_args.lora_target is not None
         if self.is_lora:
             lora_kwargs = {
@@ -108,17 +119,30 @@ class VllmStrategy(InferenceStrategy):
 
         self.model = await create_async_llm(resource_placement_groups=self.worker_config.resource_placement_groups, **vllm_config)
 
-        self.tokenizer = await self.model.get_tokenizer()
-        additional_special_tokens = self.tokenizer.additional_special_tokens
+        _tok = self.model.get_tokenizer()
+        self.tokenizer = await _tok if inspect.iscoroutine(_tok) else _tok
+        additional_special_tokens = (
+            getattr(self.tokenizer, "additional_special_tokens", None)
+            or getattr(self.tokenizer, "extra_special_tokens", None)
+            or []
+        )
         special_tokens = [
             add_token
             for add_token in self.tokenizer.added_tokens_decoder.values()
             if add_token.special and add_token.content not in additional_special_tokens
         ]
-        self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": special_tokens}, replace_additional_special_tokens=False
+        try:
+            self.tokenizer.add_special_tokens(
+                {"additional_special_tokens": special_tokens}, replace_additional_special_tokens=False
+            )
+        except TypeError:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+        _current = (
+            getattr(self.tokenizer, "additional_special_tokens", None)
+            or getattr(self.tokenizer, "extra_special_tokens", None)
+            or []
         )
-        logger.info(f"add {special_tokens} to additional_special_tokens: {self.tokenizer.additional_special_tokens}")
+        logger.info(f"add {special_tokens} to additional_special_tokens: {_current}")
 
         self.worker.rank_info.dp_rank = self.worker.rank
         self.worker.rank_info.dp_size = self.worker.world_size
@@ -443,6 +467,10 @@ def create_sampling_params_for_vllm(gen_kwargs):
         assert gen_kwargs["num_return_sequences"] == 1, (
             "fetch_output only supports num_return_sequences=1 or output_kind=FINAL"
         )
+    structured_outputs = None
+    if gen_kwargs.get("structured_outputs_regex"):
+        from vllm.sampling_params import StructuredOutputsParams
+        structured_outputs = StructuredOutputsParams(regex=gen_kwargs["structured_outputs_regex"])
     return SamplingParams(
         max_tokens=gen_kwargs["max_new_tokens"],
         temperature=gen_kwargs["temperature"],
@@ -455,4 +483,6 @@ def create_sampling_params_for_vllm(gen_kwargs):
         logprobs=gen_kwargs.get("logprobs", 0),
         output_kind=output_kind,
         include_stop_str_in_output=gen_kwargs.get("include_stop_str_in_output", True),
+        thinking_token_budget=gen_kwargs.get("thinking_token_budget"),
+        structured_outputs=structured_outputs,
     )

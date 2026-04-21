@@ -62,6 +62,14 @@ class GeneratingArguments:
         default=0,
         metadata={"help": "The number of logprobs to return. Set None to not return logprobs."},
     )
+    thinking_token_budget: Optional[int] = field(
+        default=None,
+        metadata={"help": "Max thinking tokens before vLLM forces </think>. None = unlimited (vLLM default)."},
+    )
+    structured_outputs_regex: Optional[str] = field(
+        default=None,
+        metadata={"help": "vLLM structured-output regex constraint applied to the full response."},
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         args = asdict(self)

@@ -1,5 +1,5 @@
 import json
-from typing import List, Dict
+from typing import List, Dict, Optional
 from functools import lru_cache
 from transformers import PreTrainedTokenizer
 
@@ -14,23 +14,38 @@ def compute_conversation_end_token_id(tokenizer: PreTrainedTokenizer) -> List[in
     find '<|im_end|>' token id
     """
     assistant_mock = [{"role": "user", "content": ""}]
-    assistant_token_ids_mock: List[int] = tokenizer.apply_chat_template(assistant_mock, tokenize=True)
+    assistant_token_ids_mock = _to_id_list(tokenizer.apply_chat_template(assistant_mock, tokenize=True))
     for token_id in reversed(assistant_token_ids_mock):
         if token_id in tokenizer.all_special_ids:
             return [token_id]
     return []
 
-def custom_apply_chat_template(messages: List[Dict], tokenizer: PreTrainedTokenizer, add_generation_prompt=True, enable_thinking=False) -> List:
+def _to_id_list(result):
+    # transformers v5 returns BatchEncoding from apply_chat_template with tokenize=True;
+    # v4 returned a flat list. Unwrap to a plain list of ints either way.
+    if hasattr(result, "input_ids"):
+        return list(result.input_ids)
+    return list(result)
+
+def custom_apply_chat_template(messages: List[Dict], tokenizer: PreTrainedTokenizer, add_generation_prompt=True, enable_thinking=False, template_name: Optional[str] = None) -> List:
     if len(messages) == 0:
         return []
+    if template_name == "qwen3":
+        # Route through the framework's registered qwen3 template, which forces
+        # enable_thinking=True so the assistant turn opens without an
+        # auto-injected empty <think></think>.
+        from roll.datasets.chat_template import get_chat_template
+        chat_fn = get_chat_template(template_name, tokenizer)
+        text = chat_fn(messages, add_generation_prompt=add_generation_prompt)
+        return list(tokenizer(text, add_special_tokens=False)["input_ids"])
     if messages[0]["role"] == "system":
         token_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=add_generation_prompt, enable_thinking=enable_thinking)
-        return token_ids
-    else:
-        system_mock = [{"role": "system", "content": ""}]
-        system_token_ids_mock = tokenizer.apply_chat_template(system_mock, tokenize=True)
-        token_ids = tokenizer.apply_chat_template(system_mock + messages, tokenize=True, add_generation_prompt=add_generation_prompt, enable_thinking=enable_thinking)
-        return token_ids[len(system_token_ids_mock):]
+        return _to_id_list(token_ids)
+    # Non-system-prefix case: Qwen3.5's template rejects a lone-system probe
+    # ("No user query found"), so apply directly and strip no prefix — Qwen
+    # templates don't auto-inject a system block when messages[0] isn't system.
+    token_ids = _to_id_list(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=add_generation_prompt, enable_thinking=enable_thinking))
+    return token_ids
 
 def custom_vl_apply_chat_template(messages: List[Dict], collator: DataCollatorWithPaddingForMM, add_generation_prompt=True) -> Dict:
     if len(messages) == 0:

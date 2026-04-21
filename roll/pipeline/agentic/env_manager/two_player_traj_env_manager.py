@@ -45,8 +45,22 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
     def reset(self) -> Optional[RolloutCache]:
         result = super().reset()
         self.opponent_history = []
-        # Sample opponent from enemy pool for this episode
-        self.current_opponent_lora = random.choice(self.enemy_pool)
+        # Sample opponent from enemy pool for this episode. 'uniform' preserves
+        # the original random.choice() behavior; other modes up-weight later
+        # (newer) checkpoints in the pool. See fsp_opponent_weight_mode.
+        mode = getattr(self.pipeline_config, "fsp_opponent_weight_mode", "uniform")
+        n = len(self.enemy_pool)
+        if n <= 1 or mode == "uniform":
+            self.current_opponent_lora = random.choice(self.enemy_pool)
+        else:
+            if mode == "linear":
+                weights = [i + 1 for i in range(n)]
+            elif mode == "exponential":
+                weights = [2 ** i for i in range(n)]
+            else:
+                # Unknown mode — fall back to uniform for safety.
+                weights = [1] * n
+            self.current_opponent_lora = random.choices(self.enemy_pool, weights=weights, k=1)[0]
 
         if result is not None and self.rollout_cache.history[-1].get("opponent_first", False):
             self._handle_opponent_first_move()
@@ -133,14 +147,25 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         # Store agent 0's response in rollout_cache (will get reward after round resolves)
         self.rollout_cache.history[-1]['llm_response'] = agent_action
 
+        # Capture agent's action_is_valid *now*, before the (optional) opponent env.step
+        # at line 215-217 would otherwise overwrite 'metrics' with opponent's.
+        if agent_step_info is not None:
+            merged_metrics = dict(self.rollout_cache.history[-1].get("metrics", {}))
+            merged_metrics.update(agent_step_info.get("metrics", {}))
+            merged_agg = dict(self.rollout_cache.history[-1].get("metrics_agg_mode", {}))
+            merged_agg.update(agent_step_info.get("metrics_agg_mode", {}))
+            self.rollout_cache.history[-1]["metrics"] = merged_metrics
+            self.rollout_cache.history[-1]["metrics_agg_mode"] = merged_agg
+            for k, v in agent_step_info.items():
+                if k not in ("metrics", "metrics_agg_mode"):
+                    self.rollout_cache.history[-1][k] = v
+
         # Game ended on agent's action (e.g., agent is P1 and action resolves the game)
         if agent_terminated:
             self.rollout_cache.step += 1
             self.rollout_cache.terminated = True
             self.rollout_cache.truncated = agent_truncated
             self.rollout_cache.history[-1]['reward'] = agent_reward
-            if agent_step_info is not None:
-                self.rollout_cache.history[-1].update(agent_step_info)
             self.rollout_cache.history.append({
                 "observation": "",
                 "actions_left": self.env_config.max_steps - self.rollout_cache.step,
@@ -200,7 +225,26 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
 
         self.rollout_cache.history[-1]['reward'] = reward
         if info is not None:
-            self.rollout_cache.history[-1].update(info)
+            # Merge opponent's env.step info without clobbering agent-side metrics
+            # recorded earlier. 'action_is_valid' is re-keyed as 'opponent/action_is_valid'
+            # because the agent-side one (already stored) is the training signal we want.
+            opp_metrics = info.get("metrics", {}) or {}
+            opp_agg = info.get("metrics_agg_mode", {}) or {}
+            merged_metrics = dict(self.rollout_cache.history[-1].get("metrics", {}))
+            merged_agg = dict(self.rollout_cache.history[-1].get("metrics_agg_mode", {}))
+            for k, v in opp_metrics.items():
+                target = f"opponent/{k}" if k == "action_is_valid" else k
+                if k == "action_is_valid" or target not in merged_metrics:
+                    merged_metrics[target] = v
+            for k, v in opp_agg.items():
+                target = f"opponent/{k}" if k == "action_is_valid" else k
+                if k == "action_is_valid" or target not in merged_agg:
+                    merged_agg[target] = v
+            self.rollout_cache.history[-1]["metrics"] = merged_metrics
+            self.rollout_cache.history[-1]["metrics_agg_mode"] = merged_agg
+            for k, v in info.items():
+                if k not in ("metrics", "metrics_agg_mode"):
+                    self.rollout_cache.history[-1][k] = v
 
         # Next observation for agent 0
         self.rollout_cache.history.append({
@@ -234,7 +278,7 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         user_content += self.agent_template.format(**render_dict)
         messages.append({"role": "user", "content": user_content})
 
-        prompt_ids = custom_apply_chat_template(messages=messages, tokenizer=self.tokenizer, add_generation_prompt=True)
+        prompt_ids = custom_apply_chat_template(messages=messages, tokenizer=self.tokenizer, add_generation_prompt=True, template_name=self.pipeline_config.actor_infer.data_args.template)
 
         # Build history token_ids from opponent's previous turns
         history_token_ids = []
