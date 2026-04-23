@@ -11,7 +11,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "kuhn_fsp_4b_kl0p01_cold_sync_so"
+exp_name: "kuhn_fsp_4b_kl0p01_cold_sync_so_r2"
 seed: 42
 logging_dir: /projects/bfoz/wchen11/kuhn_poker_output/logs
 output_dir: /projects/bfoz/wchen11/kuhn_poker_output
@@ -114,7 +114,7 @@ actor_infer:
       gpu_memory_utilization: 0.92
       block_size: 16
       load_format: auto
-      max_loras: 20
+      max_loras: 7  # ceil(max_steps/fsp_save_steps) + 1 = 300/50 + 1
       enforce_eager: false
       max_num_batched_tokens: 4096
       reasoning_parser: qwen3
