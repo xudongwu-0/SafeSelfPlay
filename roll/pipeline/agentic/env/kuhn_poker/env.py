@@ -62,7 +62,8 @@ class KuhnPokerEnv(Env):
             self.env_instruction = env_instruction
         elif self.think_mode:
             self.env_instruction = (
-                "Kuhn Poker: 3 cards (Jack < Queen < King), each player antes 1 chip.\n"
+                "As an expert poker strategist, analyze the following Kuhn Poker hand.\n"
+                "Kuhn Poker: 3-card deck (Jack < Queen < King). Each player antes 1 chip.\n"
                 "Only two actions exist: Pass or Bet (+1 chip). There is NO raise or fold action.\n"
                 "Pass = check/fold depending on context. Bet = bet/call depending on context.\n\n"
                 "Game flow:\n"
@@ -70,17 +71,20 @@ class KuhnPokerEnv(Env):
                 "  P2: Pass or Bet\n"
                 "  If P1 passed and P2 bet → P1 gets one more chance: Pass(fold) or Bet(call)\n"
                 "Showdown: higher card wins the pot.\n\n"
-                "Reply ONLY in this format (nothing after the answer tag):\n"
-                "<think>your reasoning</think><answer>Pass</answer>\n"
+                "For each decision: note the pot size and board state, calculate pot odds, then choose.\n"
+                "Reply ONLY in this format (nothing after the action tag):\n"
+                "<think>your reasoning</think><action>Pass</action>\n"
                 "or\n"
-                "<think>your reasoning</think><answer>Bet</answer>"
+                "<think>your reasoning</think><action>Bet</action>"
             )
         else:
             self.env_instruction = (
-                "Kuhn Poker: 3 cards (Jack < Queen < King), each player antes 1 chip.\n"
+                "As an expert poker strategist, analyze the following Kuhn Poker hand.\n"
+                "Kuhn Poker: 3-card deck (Jack < Queen < King). Each player antes 1 chip.\n"
                 "Actions: Pass or Bet (+1 chip). No raise exists.\n\n"
                 "Game: P1 acts → P2 acts → (if P1 passed and P2 bet) P1 responds.\n"
                 "Showdown: higher card wins. Fold: lose your ante.\n\n"
+                "For each decision: note the pot size and board state, calculate pot odds, then choose.\n"
                 "Format: <answer>Pass</answer> or <answer>Bet</answer>"
             )
 
@@ -97,6 +101,7 @@ class KuhnPokerEnv(Env):
         self.final_reward: float = 0.0
         self.step_count: int = 0
         self.wins: int = 0
+        self._last_think: str = ""
 
     def get_instructions(self) -> str:
         action_str = "\nYour available actions are:\n" + ", ".join(self.ACTION_LOOKUP.values())
@@ -143,6 +148,7 @@ class KuhnPokerEnv(Env):
 
         action_info = self.parse_action(action)
         is_valid = action_info["action"] is not None
+        self._last_think = action_info.get("think_content") or ""
 
         # Invalid action → default to Pass (fold/check) + penalty
         if not is_valid:
@@ -246,6 +252,19 @@ class KuhnPokerEnv(Env):
         info.update(action_info)
         return "", self.final_reward, True, False, info
 
+    # Nash prescribes a deterministic action (P=0 or P=1) at these info-sets.
+    # Mixed info-sets (J_P1_open, Q_P1_vs_bet, J_P2_vs_pass, Q_P2_vs_bet) are excluded.
+    _NASH_DETERMINISTIC = {
+        "Q_P1_open": "Pass",   # never bet Queen open
+        "K_P1_open": "Bet",    # always bet King open
+        "J_P1_vs_bet": "Pass", # always fold Jack to a raise
+        "K_P1_vs_bet": "Bet",  # always call King
+        "J_P2_vs_bet": "Pass", # always fold Jack facing bet
+        "K_P2_vs_bet": "Bet",  # always call King
+        "Q_P2_vs_pass": "Pass",# never bet Queen behind
+        "K_P2_vs_pass": "Bet", # always bet King behind
+    }
+
     def _make_info(self, is_valid: bool, agg: dict, desc: str) -> dict:
         win_rate = self.wins / self.step_count if self.step_count > 0 else 0.0
 
@@ -263,28 +282,111 @@ class KuhnPokerEnv(Env):
             facing_bet = True
             folded = self.p1_action == "Pass"
 
+        # Per-info-set visit/bet indicators. Each game visits at most 2 agent info
+        # sets (first decision, plus optionally P1_vs_bet if P1 passed and P2 bet).
+        # Indicators are mean-aggregated across the rollout batch; the downstream
+        # nash.compute_derived_metrics() recovers P(Bet | info set) as bet/visit
+        # and computes Nash distance + exploitability.
+        info_set_metrics = self._info_set_indicators()
+
+        # --- Reasoning quality metrics ---
+        think = getattr(self, "_last_think", "")
+
+        # think_card_error: model claims its card is "highest"/"strongest" but holds J or Q.
+        # Only K is the true highest; any such claim for J/Q is a hallucination.
+        claims_highest = bool(re.search(
+            r'\b(highest|strongest|best)\b.{0,30}\bcard\b',
+            think, re.IGNORECASE
+        ))
+        think_card_error = 1.0 if (claims_highest and agent_card != 2) else 0.0
+
+        # nash_action_correct: at deterministic-Nash info-sets, did the agent play correctly?
+        # Returns 1.0 (correct), 0.0 (wrong), or is omitted for mixed info-sets.
+        from roll.pipeline.agentic.env.kuhn_poker.nash import CARD_CHR
+        card_chr = CARD_CHR[agent_card]
+        if self.agent_is_p0:
+            iset_open = f"{card_chr}_P1_open"
+            iset_response = f"{card_chr}_P1_vs_bet" if (self.p0_action == "Pass" and self.p1_action == "Bet") else None
+        else:
+            role = "P2_vs_bet" if self.p0_action == "Bet" else "P2_vs_pass"
+            iset_open = f"{card_chr}_{role}"
+            iset_response = None
+
+        nash_correct_vals = []
+        for iset, action_taken in [(iset_open, agent_first_action), (iset_response, self.p0_response if self.agent_is_p0 else None)]:
+            if iset is None or action_taken is None:
+                continue
+            nash_action = self._NASH_DETERMINISTIC.get(iset)
+            if nash_action is not None:
+                nash_correct_vals.append(1.0 if action_taken == nash_action else 0.0)
+
+        base_metrics = {
+            "action_is_valid": is_valid,
+            "success": win_rate > 0.5,
+            "win_rate": win_rate,
+            "format_penalty": 0.0 if is_valid else self.format_penalty,
+            "agent_bet": 1.0 if agent_first_action == "Bet" else 0.0,
+            "bluff": 1.0 if (agent_card == 0 and agent_first_action == "Bet") else 0.0,
+            "value_bet": 1.0 if (agent_card == 2 and agent_first_action == "Bet") else 0.0,
+            "faced_bet": 1.0 if facing_bet else 0.0,
+            "fold_vs_bet": 1.0 if (facing_bet and folded) else 0.0,
+            "think_card_error": think_card_error,
+        }
+        if nash_correct_vals:
+            base_metrics["nash_action_correct"] = sum(nash_correct_vals) / len(nash_correct_vals)
+
+        base_metrics.update(info_set_metrics)
+
+        base_agg = {
+            **agg,
+            "agent_bet": "mean",
+            "bluff": "mean",
+            "value_bet": "mean",
+            "faced_bet": "mean",
+            "fold_vs_bet": "mean",
+            "think_card_error": "mean",
+            "nash_action_correct": "mean",
+        }
+        base_agg.update({k: "mean" for k in info_set_metrics})
+
         return {
-            "metrics": {
-                "action_is_valid": is_valid,
-                "success": win_rate > 0.5,
-                "win_rate": win_rate,
-                "format_penalty": 0.0 if is_valid else self.format_penalty,
-                "agent_bet": 1.0 if agent_first_action == "Bet" else 0.0,
-                "bluff": 1.0 if (agent_card == 0 and agent_first_action == "Bet") else 0.0,
-                "value_bet": 1.0 if (agent_card == 2 and agent_first_action == "Bet") else 0.0,
-                "faced_bet": 1.0 if facing_bet else 0.0,
-                "fold_vs_bet": 1.0 if (facing_bet and folded) else 0.0,
-            },
-            "metrics_agg_mode": {
-                **agg,
-                "agent_bet": "mean",
-                "bluff": "mean",
-                "value_bet": "mean",
-                "faced_bet": "mean",
-                "fold_vs_bet": "mean",
-            },
+            "metrics": base_metrics,
+            "metrics_agg_mode": base_agg,
             "action_desc": desc,
         }
+
+    def _info_set_indicators(self) -> dict:
+        """0/1 indicators for each info set: did this game visit it, and did the agent bet?
+
+        Mean-aggregated across a batch, the ratio bet/visit recovers P(Bet|info set).
+        """
+        from roll.pipeline.agentic.env.kuhn_poker.nash import ALL_INFO_SETS, CARD_CHR
+
+        out = {f"kuhn_visit/{iset}": 0.0 for iset in ALL_INFO_SETS}
+        out.update({f"kuhn_bet/{iset}": 0.0 for iset in ALL_INFO_SETS})
+
+        agent_card_chr = CARD_CHR[self.cards[0 if self.agent_is_p0 else 1]]
+
+        if self.agent_is_p0:
+            # Agent acted first. p0_action is the open action.
+            if self.p0_action is not None:
+                key = f"{agent_card_chr}_P1_open"
+                out[f"kuhn_visit/{key}"] = 1.0
+                out[f"kuhn_bet/{key}"] = 1.0 if self.p0_action == "Bet" else 0.0
+            # If P0 passed and P1 bet, agent had a second turn (P1_vs_bet).
+            if self.p0_action == "Pass" and self.p1_action == "Bet" and self.p0_response is not None:
+                key = f"{agent_card_chr}_P1_vs_bet"
+                out[f"kuhn_visit/{key}"] = 1.0
+                out[f"kuhn_bet/{key}"] = 1.0 if self.p0_response == "Bet" else 0.0
+        else:
+            # Agent acted second. p1_action is the response to p0's open.
+            if self.p1_action is not None and self.p0_action is not None:
+                role = "P2_vs_bet" if self.p0_action == "Bet" else "P2_vs_pass"
+                key = f"{agent_card_chr}_{role}"
+                out[f"kuhn_visit/{key}"] = 1.0
+                out[f"kuhn_bet/{key}"] = 1.0 if self.p1_action == "Bet" else 0.0
+
+        return out
 
     # --- Observation rendering ---
 
@@ -292,20 +394,26 @@ class KuhnPokerEnv(Env):
         """Observation for poker-P0's first action."""
         card = CARD_NAMES[self.cards[0]]
         return (f"Your card: {card}. You are Player 1 (first to act).\n"
+                f"Pot size: 2 chips (both antes). Board state: no action yet.\n"
                 f"Choose: Pass or Bet.")
 
     def _render_p1_action(self) -> str:
         """Observation for poker-P1 after P0's action."""
         card = CARD_NAMES[self.cards[1]]
+        pot = 3 if self.p0_action == "Bet" else 2
+        call_cost = 1 if self.p0_action == "Bet" else 0
+        pot_odds_str = f"Pot odds: {pot}:{call_cost} (call {call_cost} to win {pot})." if call_cost else "No bet to call."
         return (f"Your card: {card}. You are Player 2.\n"
-                f"Opponent (Player 1) chose: {self.p0_action}.\n"
+                f"Pot size: {pot} chips. Board state: Player 1 chose {self.p0_action}.\n"
+                f"{pot_odds_str}\n"
                 f"Choose: Pass or Bet.")
 
     def _render_p0_response(self) -> str:
         """Observation for poker-P0 responding to P1's bet."""
         card = CARD_NAMES[self.cards[0]]
         return (f"Your card: {card}. You are Player 1.\n"
-                f"You passed, opponent (Player 2) bet.\n"
+                f"Pot size: 3 chips. Board state: you passed, Player 2 bet.\n"
+                f"Pot odds: 3:1 (call 1 to win 3).\n"
                 f"Choose: Pass (fold) or Bet (call).")
 
     def render(self, mode: str = "text") -> str:
@@ -324,11 +432,16 @@ class KuhnPokerEnv(Env):
             for token in self.special_token_list:
                 cleaned = cleaned.replace(token, "")
             rev = {v.lower(): k for k, v in self.ACTION_LOOKUP.items()}
-            # "Pass (fold)" or "Bet (call)" inside answer tags
-            m = re.search(r'<answer>\s*(Pass|Bet)\s*\(', cleaned, re.IGNORECASE)
+            # Accept <action> or legacy <answer> tags as fallbacks.
+            m = re.search(r'<action>\s*(Pass|Bet)\s*</action>', cleaned, re.IGNORECASE)
             if not m:
-                # "answer: Bet" / "answer:Pass" (model forgot angle brackets)
-                m = re.search(r'answer\s*[:=]\s*(Pass|Bet)', cleaned, re.IGNORECASE)
+                m = re.search(r'<answer>\s*(Pass|Bet)\s*</answer>', cleaned, re.IGNORECASE)
+            if not m:
+                # "Pass (fold)" or "Bet (call)" inside action/answer tags
+                m = re.search(r'<(?:action|answer)>\s*(Pass|Bet)\s*\(', cleaned, re.IGNORECASE)
+            if not m:
+                # "action: Bet" / "answer:Pass" (model forgot angle brackets)
+                m = re.search(r'(?:action|answer)\s*[:=]\s*(Pass|Bet)', cleaned, re.IGNORECASE)
             if m:
                 result = {"action": rev.get(m.group(1).strip().lower()), "action_content": m.group(1).strip(), "think_content": ""}
         return result
