@@ -1,6 +1,6 @@
 all_response_pattern: ^(.*)$
 action_pattern: <answer>(.*?)</answer>
-think_action_pattern: <think>(.*?)</think>\s*<answer>(.*?)</answer>
+think_action_pattern: <think>(.*?)</think>\s*<action>(.*?)</action>
 
 max_tokens_per_step: 128
 max_actions_per_traj: 10
@@ -123,7 +123,7 @@ custom_env:
   KuhnPokerLLMThink:
     env_type: kuhn_poker
     max_steps: 2
-    max_tokens_per_step: 512
+    max_tokens_per_step: ${max_tokens_per_step}
     env_manager_cls: roll.pipeline.agentic.env_manager.two_player_traj_env_manager.TwoPlayerTrajEnvManager
     use_thread_lock: true
     agent_system_template: ${agent_system_template}
@@ -136,7 +136,7 @@ custom_env:
   KuhnPokerLLM:
     env_type: kuhn_poker
     max_steps: 2
-    max_tokens_per_step: 512
+    max_tokens_per_step: ${max_tokens_per_step}
     env_manager_cls: roll.pipeline.agentic.env_manager.two_player_traj_env_manager.TwoPlayerTrajEnvManager
     use_thread_lock: true
     agent_system_template: ${agent_system_template}
@@ -173,10 +173,11 @@ custom_env:
       max_steps: ${max_actions_per_traj}
       format_penalty: -0.05
 
-agent_system_template: You are an expert game player. Think strategically and aim for high reward.
+agent_system_template: You are a concise, analytical Kuhn Poker strategist. Think strategically and aim for high reward. There are no community cards, no board, and no additional cards will be revealed.
 agent_template: |
+  As an expert poker strategist, analyze the following hand. Calculate pot odds first, then provide a strategy recommendation.
   {observation}
-  Reply: <think>reasoning</think><answer>your action</answer>
+  Reply: <think>your reasoning</think><action>Pass</action> or <think>your reasoning</think><action>Bet</action>
 
 single_prompt_agent_system_template: You're a helpful assistant.
 single_prompt_agent_template: "{observation}"
