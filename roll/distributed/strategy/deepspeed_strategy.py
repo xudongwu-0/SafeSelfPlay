@@ -25,6 +25,7 @@ from roll.third_party.deepspeed.offload_states_patch import bind_deepspeed_offlo
 from roll.utils.collective import collective
 from roll.utils.context_parallel import get_ulysses_group, set_upg_manager
 from roll.utils.deepspeed_utils import get_optimizer_grouped_parameters
+from roll.utils.dynamic_batching import split_mini_batch_sorted_chunks_narrowed
 from roll.utils.functionals import append_to_dict, entropy_from_logits, log_probs_from_logits
 from roll.utils.constants import IGNORE_INDEX
 from roll.utils.logging import get_logger
@@ -396,6 +397,27 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         )
         bind_deepspeed_offload_states_func(self.model)
 
+        # torch 2.10+ LR scheduler uses strict=True zip on (param_groups, base_lrs).
+        # After DeepSpeed wraps optimizer, the scheduler's captured base_lrs may
+        # mismatch the live optimizer.param_groups. Rebuild the scheduler against
+        # whichever optimizer object the scheduler now refers to, so get_lr() and
+        # param_groups always have equal length at step time.
+        try:
+            sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
+            new_scheduler = get_scheduler(
+                self.worker_config.training_args.lr_scheduler_type,
+                sched_opt,
+                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(
+                    self.worker_config.training_args.max_steps
+                ),
+                num_training_steps=self.worker_config.training_args.max_steps,
+            )
+            self.scheduler = new_scheduler
+            if hasattr(self.model, "lr_scheduler"):
+                self.model.lr_scheduler = new_scheduler
+        except Exception as _lr_rebuild_err:
+            logger.warning(f"lr scheduler rebuild skipped: {_lr_rebuild_err}")
+
         logger.info(f"{self.model}")
         dist.barrier()
 
@@ -444,7 +466,23 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         loss_scale = mini_steps * self.worker.rank_info.dp_size
         batch.meta_info['micro_batch_size'] = mini_batch_size
 
-        data_iter = batch.make_iterator(mini_batch_size=mini_batch_size, epochs=1)
+        if self.worker_config.use_inner_dynamic_batching_in_train:
+            # Sort samples in this mini-batch by length and split into exactly
+            # mini_steps (= gradient_accumulation_steps) sorted chunks, narrowed to
+            # per-chunk max seq length. num_microbatches is unchanged so DS's grad
+            # accumulator state stays correct.
+            ga_steps = self.worker_config.training_args.gradient_accumulation_steps
+            assert mini_steps == ga_steps, (
+                f"expected mini_steps == gradient_accumulation_steps for inner dynbatch, "
+                f"got mini_steps={mini_steps} ga={ga_steps}"
+            )
+            data_iter = split_mini_batch_sorted_chunks_narrowed(
+                batch,
+                num_chunks=ga_steps,
+                sequence_length_round=self.worker_config.sequence_length_round_in_train,
+            )  # generator — yields one chunk at a time for lazy allocation
+        else:
+            data_iter = batch.make_iterator(mini_batch_size=mini_batch_size, epochs=1)
         metrics = {}
 
         for step in range(mini_steps):

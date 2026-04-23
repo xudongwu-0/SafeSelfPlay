@@ -156,6 +156,18 @@ class WorkerConfig:
             "Note: This config must be set when using dynamic batching."
         },
     )
+    use_inner_dynamic_batching_in_train: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Within-mini-batch sort + equal-count chunking into exactly "
+                "gradient_accumulation_steps micro-batches, each narrowed to its own "
+                "max actual seq length (rounded to sequence_length_round_in_train). "
+                "Keeps num_microbatches == gradient_accumulation_steps so DS's internal "
+                "grad-accum counter is undisturbed. Honored by deepspeed_train only."
+            )
+        },
+    )
     use_dynamic_batching_in_infer: bool = field(
         default=False,
         metadata={
