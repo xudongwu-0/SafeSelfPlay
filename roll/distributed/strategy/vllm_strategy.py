@@ -1,10 +1,14 @@
 import asyncio
 import copy
 import gc
+import hashlib as _hashlib
 import inspect
 import os
 from collections import deque
 from typing import Dict, List, Optional
+
+# Must match _TRAINING_LORA_INT_ID in roll/third_party/vllm/worker.py.
+_TRAINING_LORA_INT_ID: int = int(_hashlib.sha256(b"roll_training_lora_v1").hexdigest(), 16) % 0x7FFFFFFF
 
 import torch
 import torch.distributed as dist
@@ -190,12 +194,13 @@ class VllmStrategy(InferenceStrategy):
             import hashlib
             lora_int_id = int(hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
             return LoRARequest(lora_name=lora_name, lora_int_id=lora_int_id, lora_path=lora_name)
-        # Default: use training agent's LoRA (loaded via model_update)
-        lora_int_ids = list(await self.model.list_loras())
-        if len(lora_int_ids) > 0:
-            lora_int_id = lora_int_ids[0]
-            return LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora")
-        return None
+        # Training agent: use the fixed slot loaded by model_update / custom_add_lora.
+        # model_update (PHASE 3) always runs before rollout (PHASE 7) each step.
+        return LoRARequest(
+            lora_name="training_lora",
+            lora_int_id=_TRAINING_LORA_INT_ID,
+            lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora",
+        )
 
     async def _generate_standard(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:
         """Standard generate method for non-beam search cases."""
@@ -471,7 +476,7 @@ def create_sampling_params_for_vllm(gen_kwargs):
     if gen_kwargs.get("structured_outputs_regex"):
         from vllm.sampling_params import StructuredOutputsParams
         structured_outputs = StructuredOutputsParams(regex=gen_kwargs["structured_outputs_regex"])
-    return SamplingParams(
+    sampling_kwargs = dict(
         max_tokens=gen_kwargs["max_new_tokens"],
         temperature=gen_kwargs["temperature"],
         top_p=gen_kwargs["top_p"],
@@ -483,6 +488,10 @@ def create_sampling_params_for_vllm(gen_kwargs):
         logprobs=gen_kwargs.get("logprobs", 0),
         output_kind=output_kind,
         include_stop_str_in_output=gen_kwargs.get("include_stop_str_in_output", True),
-        thinking_token_budget=gen_kwargs.get("thinking_token_budget"),
-        structured_outputs=structured_outputs,
     )
+    if structured_outputs is not None:
+        sampling_kwargs["structured_outputs"] = structured_outputs
+    thinking_token_budget = gen_kwargs.get("thinking_token_budget")
+    if thinking_token_budget is not None:
+        sampling_kwargs["thinking_token_budget"] = thinking_token_budget
+    return SamplingParams(**sampling_kwargs)
