@@ -190,6 +190,7 @@ class AgenticConfig(PPOConfig):
     val_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     fsp_save_steps: int = field(default=0, metadata={"help": "Fictitious self-play: save LoRA to enemy pool every N steps. 0 = disabled."})
     cold_start: bool = field(default=True, metadata={"help": "FSP cold-start: after each fsp_save_steps snapshot, reset training LoRA to initial (PEFT default) weights so the next generation trains from scratch."})
+    fsp_opponent_weight_mode: str = field(default="uniform", metadata={"help": "FSP enemy-pool sampling weights. 'uniform' = equal probability (default, preserves original behavior). 'linear' = weight proportional to (index+1); newer checkpoints are more likely. 'exponential' = weight 2**index, stronger recency bias."})
     render_save_dir: str = field(default=None, metadata={"help": "Directory to save rendered frames."})
     reward: RewardConfig = field(default=None, metadata={"help": "Configuration for reward inference."})
     reward_normalization: RewardNormalizationConfig = field(
@@ -315,6 +316,15 @@ class AgenticConfig(PPOConfig):
                 f"The scheduler collects trajectories in complete groups, so batch_size must be divisible by group_size. "
                 f"Suggested values: rollout_batch_size={self.rollout_batch_size} with group_size in {[i for i in [1, 2, 4, 8, 16] if self.rollout_batch_size % i == 0]}, "
                 f"or group_size={self.train_env_manager.group_size} with rollout_batch_size as a multiple of {self.train_env_manager.group_size}."
+            )
+            # Enforce 1 trajectory per env per rollout: rollout_batch_size == num_env_groups * group_size.
+            # Multi-traj-per-env setups force long-lived workers to replay seeds and can skew GRPO
+            # group composition; the 1-traj path maps cleanly to one group sample per env group.
+            assert self.rollout_batch_size == train_env_num, (
+                f"rollout_batch_size ({self.rollout_batch_size}) must equal "
+                f"num_env_groups * group_size ({self.train_env_manager.num_env_groups} * "
+                f"{self.train_env_manager.group_size} = {train_env_num}). "
+                f"This guarantees exactly 1 trajectory per env per rollout (traj_per_env={traj_per_env})."
             )
 
         val_env_num = self.val_env_manager.num_env_groups * self.val_env_manager.group_size
