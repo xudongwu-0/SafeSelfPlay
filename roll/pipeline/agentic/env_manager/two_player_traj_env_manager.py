@@ -228,17 +228,21 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             # Merge opponent's env.step info without clobbering agent-side metrics
             # recorded earlier. 'action_is_valid' is re-keyed as 'opponent/action_is_valid'
             # because the agent-side one (already stored) is the training signal we want.
+            # Terminal outcome metrics (win_rate, success, reward-derived) always overwrite
+            # the non-terminal 0.0 placeholders written by the agent's non-final env step.
+            TERMINAL_METRICS = {"win_rate", "success", "bluff", "value_bet", "agent_bet",
+                                 "faced_bet", "fold_vs_bet"}
             opp_metrics = info.get("metrics", {}) or {}
             opp_agg = info.get("metrics_agg_mode", {}) or {}
             merged_metrics = dict(self.rollout_cache.history[-1].get("metrics", {}))
             merged_agg = dict(self.rollout_cache.history[-1].get("metrics_agg_mode", {}))
             for k, v in opp_metrics.items():
                 target = f"opponent/{k}" if k == "action_is_valid" else k
-                if k == "action_is_valid" or target not in merged_metrics:
+                if k == "action_is_valid" or target not in merged_metrics or k in TERMINAL_METRICS:
                     merged_metrics[target] = v
             for k, v in opp_agg.items():
                 target = f"opponent/{k}" if k == "action_is_valid" else k
-                if k == "action_is_valid" or target not in merged_agg:
+                if k == "action_is_valid" or target not in merged_agg or k in TERMINAL_METRICS:
                     merged_agg[target] = v
             self.rollout_cache.history[-1]["metrics"] = merged_metrics
             self.rollout_cache.history[-1]["metrics_agg_mode"] = merged_agg
