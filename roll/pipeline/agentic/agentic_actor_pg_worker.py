@@ -10,6 +10,20 @@ from roll.utils.train_infer_corrections import compute_train_infer_correction
 from roll.platforms import current_platform
 
 
+def _effective_kl_coef(pipeline_config, global_step: int) -> float:
+    """Linear decay of kl_loss_coef from start value to kl_loss_coef_end over max_steps.
+
+    Returns the constant kl_loss_coef if kl_loss_coef_end < 0 (schedule disabled).
+    """
+    start = float(pipeline_config.kl_loss_coef)
+    end = float(getattr(pipeline_config, "kl_loss_coef_end", -1.0))
+    if end < 0:
+        return start
+    max_steps = int(getattr(pipeline_config, "max_steps", 0)) or 1
+    t = max(0.0, min(1.0, global_step / max_steps))
+    return start + (end - start) * t
+
+
 class ActorWorker(BaseActorWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -116,7 +130,8 @@ class ActorWorker(BaseActorWorker):
         )
 
         if self.pipeline_config.use_kl_loss:
-            total_loss = pg_loss + kl_loss * self.pipeline_config.kl_loss_coef
+            kl_coef = _effective_kl_coef(self.pipeline_config, data.meta_info.get("global_step", 0))
+            total_loss = pg_loss + kl_loss * kl_coef
         else:
             total_loss = pg_loss
         if self.pipeline_config.entropy_loss_coef > 0:
