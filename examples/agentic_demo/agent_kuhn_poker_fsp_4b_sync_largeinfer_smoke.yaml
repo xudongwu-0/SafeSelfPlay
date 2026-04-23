@@ -1,0 +1,39 @@
+defaults:
+  - agent_kuhn_poker_fsp_4b
+
+exp_name: "kuhn_fsp_4b_3tr1inf_infer6_smoke"
+tracker_kwargs:
+  project: self-play-debug
+  name: ${exp_name}
+  tags:
+    - kuhn_poker
+    - fsp_sync
+    - smoke
+    - qwen3_5_4b
+    - infer_bsz_test
+    - 3tr1inf
+    - auton
+
+logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
+output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output
+checkpoint_config:
+  type: file_system
+  async_upload: false
+  output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/render
+
+# Smoke: 3 train steps, no FSP snapshot.
+max_steps: 3
+save_steps: 10000
+logging_steps: 1
+eval_steps: 1000
+fsp_save_steps: 1000
+
+# sync (default async_generation_ratio=0)
+async_generation_ratio: 0
+
+# Bump forward-only micro batch size for ref + old log prob compute.
+# In LoRA mode, ref log probs reuse actor_train (disable_adapter), so this single
+# knob covers both ref and old log prob forward passes. Forward-only has no
+# grad/optimizer memory pressure (and ZeRO-2 shards optimizer across 3 GPUs).
+actor_train:
+  infer_batch_size: 6

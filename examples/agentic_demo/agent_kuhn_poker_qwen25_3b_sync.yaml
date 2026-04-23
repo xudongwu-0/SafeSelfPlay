@@ -1,0 +1,142 @@
+defaults:
+  - ../config/traj_envs@_here_
+  - ../config/deepspeed_zero@_here_
+  - ../config/deepspeed_zero2@_here_
+  - ../config/deepspeed_zero2_cpuoffload@_here_
+  - ../config/deepspeed_zero3@_here_
+  - ../config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "kuhn_qwen25_3b_sync"
+seed: 42
+logging_dir: /projects/bfoz/wchen11/kuhn_poker_output/logs
+output_dir: /projects/bfoz/wchen11/kuhn_poker_output
+system_envs: {}
+
+track_with: wandb
+tracker_kwargs:
+  project: self-play
+  name: ${exp_name}
+  tags:
+    - kuhn_poker
+    - qwen25_3b
+
+checkpoint_config:
+  type: file_system
+  async_upload: false
+  output_dir: /projects/bfoz/wchen11/kuhn_poker_output/render
+
+num_gpus_per_node: 4
+
+max_steps: 300
+save_steps: 10000
+logging_steps: 1
+eval_steps: 50
+resume_from_checkpoint: false
+fsp_save_steps: 50
+cold_start: false
+async_generation_ratio: 0
+
+rollout_batch_size: 256
+val_batch_size: 8
+sequence_length: 1024
+
+advantage_clip: 10.0
+ppo_epochs: 1
+adv_estimator: "grpo"
+init_kl_coef: 0.01
+use_kl_loss: true
+kl_loss_coef: 0.1
+kl_loss_coef_end: 0.01
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+pretrain: /zfsauton/scratch/wentsec/hf_cache/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1
+reward_pretrain: /zfsauton/scratch/wentsec/hf_cache/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1
+
+actor_train:
+  model_args:
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true   # gc=off fine for 3B (unlike 4B which OOMs)
+    dtype: fp16
+    model_type: ~
+    lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    lora_rank: 32
+    lora_alpha: 32
+  training_args:
+    learning_rate: 2.0e-5
+    weight_decay: 0
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 3         # eff_batch = DP(3) × bs(4) × ga(3) = 36
+    warmup_steps: 2
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: "[0,1,2]"               # 3 train GPUs (DP=3)
+  infer_batch_size: 4
+
+actor_infer:
+  model_args:
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true
+    dtype: fp16
+    lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    lora_rank: 32
+    lora_alpha: 32
+  generating_args:
+    max_new_tokens: 512
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+    stop_strings:
+      - "</answer>"
+    structured_outputs_regex: '(\s*<think>[\s\S]*?</think>)?\s*<answer>(Pass|Bet)</answer>'
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.92
+      block_size: 16
+      load_format: auto
+      max_loras: 20
+      enforce_eager: false                 # CUDA graphs: 2× rollout speed
+      max_num_batched_tokens: 4096         # sweep winner (faster than 16384 for short prompts)
+  device_mapping: "[3]"                    # 1 vLLM GPU (vLLM under-saturated at 3 GPUs)
+  infer_batch_size: 1
+
+reward_normalization:
+  grouping: tags
+  method: identity
+
+train_env_manager:
+  format_penalty: -0.01
+  max_env_num_per_worker: 64
+  num_env_groups: 64                       # num_env_groups × group_size == rollout_batch_size
+  group_size: 4                            # sweep winner at rb=256
+  tags: [KuhnPokerLLMThink]
+  num_groups_partition: [64]
+
+val_env_manager:
+  max_env_num_per_worker: 4
+  num_env_groups: 4
+  group_size: 1
+  tags: [KuhnPokerLLMThink]
+  num_groups_partition: [4]
+
+max_tokens_per_step: 512
+max_actions_per_traj: 2
+
+custom_envs:
+  KuhnPokerLLMThink:
+    ${custom_env.KuhnPokerLLMThink}

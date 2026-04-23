@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - agent_kuhn_poker_grpo_sweep
+
+exp_name: "kuhn_grpo_gs8"
+
+train_env_manager:
+  group_size: 8
+  max_env_num_per_worker: 256
+
+reward_normalization:
+  grouping: traj_group_id
+  norm_mean_type: group
+
+output_dir: /projects/bfoz/wchen11/kuhn_grpo_sweep/gs8
+logging_dir: /projects/bfoz/wchen11/kuhn_grpo_sweep/gs8/logs
+tracker_kwargs:
+  project: kuhn-grpo-sweep
+checkpoint_config:
+  type: file_system
+  output_dir: /projects/bfoz/wchen11/kuhn_grpo_sweep/gs8/render

@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - agent_kuhn_poker_vllm_sweep
+
+exp_name: "kuhn_vllm_eager_false"
+
+actor_infer:
+  strategy_args:
+    strategy_config:
+      enforce_eager: false
+
+output_dir: /projects/bfoz/wchen11/kuhn_vllm_sweep/eager_false
+logging_dir: /projects/bfoz/wchen11/kuhn_vllm_sweep/eager_false/logs
+tracker_kwargs:
+  project: kuhn-vllm-sweep
+checkpoint_config:
+  type: file_system
+  output_dir: /projects/bfoz/wchen11/kuhn_vllm_sweep/eager_false/render
