@@ -539,10 +539,14 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         return metrics
 
     @torch.no_grad()
-    def reset_lora_weights(self):
+    def reset_lora_weights(self, num_training_steps: int):
         """Reset LoRA A/B params to PEFT default init (A=kaiming_uniform(a=sqrt(5)), B=0)
         and clear Adam optimizer state for trainable params (LoRA-only in this config).
         Base model weights are untouched.
+
+        Also rebuilds the LR scheduler from step 0 with num_training_steps as the new
+        generation length, so each FSP generation gets a fresh LR curve instead of
+        inheriting the decayed tail of the global schedule.
         """
         import math
         import torch.nn.init as nn_init
@@ -588,8 +592,26 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         except Exception as e:
             logger.warning(f"reset_lora_weights: failed to clear optimizer state: {e}")
 
+        # Rebuild LR scheduler from step 0. num_training_steps is in pipeline-step units;
+        # divide by dp_size the same way setup() does to get the per-rank step count.
+        per_rank_steps = max(1, num_training_steps // self.worker.rank_info.dp_size)
+        try:
+            sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
+            new_scheduler = get_scheduler(
+                self.worker_config.training_args.lr_scheduler_type,
+                sched_opt,
+                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(per_rank_steps),
+                num_training_steps=per_rank_steps,
+            )
+            self.scheduler = new_scheduler
+            if hasattr(self.model, "lr_scheduler"):
+                self.model.lr_scheduler = new_scheduler
+        except Exception as e:
+            logger.warning(f"reset_lora_weights: scheduler rebuild failed: {e}")
+
         logger.info(f"reset_lora_weights: reinit {num_a} lora_A + {num_b} lora_B params; "
-                    f"synced {num_fp32_synced} fp32 master groups; Adam state cleared")
+                    f"synced {num_fp32_synced} fp32 master groups; Adam state cleared; "
+                    f"LR scheduler rebuilt for {per_rank_steps} per-rank steps")
         return {"lora_A_reset": num_a, "lora_B_reset": num_b}
 
     def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", local_state_path=None, **kwargs):
