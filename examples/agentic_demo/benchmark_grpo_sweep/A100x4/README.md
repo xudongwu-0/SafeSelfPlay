@@ -54,10 +54,12 @@
 
 | Variant | bs | ga_steps | tok/s | step_time_s | gpu_util_% | winner |
 |---------|-----|----------|-------|-------------|------------|--------|
-| bs4 | 4 | 1 | — | — | — | |
+| bs4 | 4 | 1 | 2127 | 50 | 42.3 | |
 | bs8 | 8 | 1 | — | — | — | |
 | bs16 | 16 | 1 | — | — | — | |
 | bs32 | 32 | 1 | — | — | — | |
+
+*tok/s = final cumulative system/tps; step_time = avg steps 1-3; gpu_util = training-steps window (13:46–13:52)*
 
 **Winner:** TBD
 
