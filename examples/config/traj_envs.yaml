@@ -132,7 +132,24 @@ custom_env:
       action_pattern: ${think_action_pattern}
       max_steps: 2
       format_penalty: -0.01
+      reasoning_penalty: 0.0
       opponent_strategy: "llm"
+      stochastic_policy: false
+  KuhnPokerLLMThinkStochastic:
+    env_type: kuhn_poker
+    max_steps: 2
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: roll.pipeline.agentic.env_manager.two_player_traj_env_manager.TwoPlayerTrajEnvManager
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${stochastic_agent_template}
+    env_config:
+      action_pattern: ${think_action_pattern}
+      max_steps: 2
+      format_penalty: -0.01
+      reasoning_penalty: 0.0
+      opponent_strategy: "llm"
+      stochastic_policy: true
   KuhnPokerLLM:
     env_type: kuhn_poker
     max_steps: 2
@@ -173,11 +190,16 @@ custom_env:
       max_steps: ${max_actions_per_traj}
       format_penalty: -0.05
 
-agent_system_template: You are a concise, analytical Kuhn Poker strategist. Think strategically and aim for high reward. There are no community cards, no board, and no additional cards will be revealed.
+agent_system_template: You are a concise, analytical Kuhn Poker strategist. Think strategically and aim for high long-term reward. There are no community cards, no board, and no additional cards will be revealed. Consider both when to bet and when to pass based on your card strength.
 agent_template: |
-  As an expert poker strategist, analyze the following hand. Calculate pot odds first, then provide a strategy recommendation.
+  As an expert poker strategist, analyze the following hand. Consider your card strength and the expected value of each action, then choose.
   {observation}
   Reply: <think>your reasoning</think><action>Pass</action> or <think>your reasoning</think><action>Bet</action>
+stochastic_agent_template: |
+  As an expert poker strategist, analyze the following hand. Calculate pot odds first, then provide a mixed strategy.
+  {observation}
+  Reply: <think>your reasoning</think><action>Pass N1/D Bet N2/D</action> where N1/D + N2/D = 1
+  Example format: <action>Pass 1/3 Bet 2/3</action>
 
 single_prompt_agent_system_template: You're a helpful assistant.
 single_prompt_agent_template: "{observation}"

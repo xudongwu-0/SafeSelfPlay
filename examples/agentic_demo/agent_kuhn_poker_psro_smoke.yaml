@@ -10,67 +10,63 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "kuhn_3b_acttag_fix"
+exp_name: "kuhn_psro_smoke"
 seed: 42
-logging_dir: /projects/bfoz/wchen11/kuhn_poker_output/logs
-output_dir: /projects/bfoz/wchen11/kuhn_poker_output
+logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
+output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output
 system_envs: {}
 
 track_with: wandb
 tracker_kwargs:
-  project: self-play
+  project: self-play-debug
   name: ${exp_name}
   tags:
     - kuhn_poker
-    - fsp_train
-    - qwen2_5_3b
-    - cold_start
-    - async
+    - psro
+    - debug
     - auton
 
 checkpoint_config:
   type: file_system
   async_upload: false
-  output_dir: /projects/bfoz/wchen11/kuhn_poker_output/render
+  output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/render
 
-num_gpus_per_node: 4
+num_gpus_per_node: 2
 
-max_steps: 300
+max_steps: 3
 save_steps: 10000
 logging_steps: 1
-eval_steps: 50
+eval_steps: 100
 resume_from_checkpoint: false
-fsp_save_steps: 50
-fsp_opponent_weight_mode: uniform
-fsp_win_rate_threshold: 0.6
-fsp_win_rate_window: 10
-fsp_win_rate_timeout: 150
+fsp_save_steps: 1
 cold_start: true
-async_generation_ratio: 1
 
-rollout_batch_size: 264
-val_batch_size: 8
+# PSRO: expand payoff matrix + compute Nash after each FSP generation
+psro_mode: true
+psro_episodes_per_pair: 1   # 1 episode per pair keeps smoke test fast
+psro_max_concurrent_eval: 4
+psro_seed_base: 12345
+
+rollout_batch_size: 8
+val_batch_size: 4
 sequence_length: 1024
 
 advantage_clip: 10.0
 ppo_epochs: 1
 adv_estimator: "grpo"
-init_kl_coef: 0.01
-use_kl_loss: true
-kl_loss_coef: 0.01
-kl_loss_coef_end: -1.0
+init_kl_coef: 0.0
 whiten_advantages: true
 entropy_loss_coef: 0
 max_grad_norm: 1.0
 
-pretrain: Qwen/Qwen2.5-3B-Instruct
-reward_pretrain: Qwen/Qwen2.5-3B-Instruct
+pretrain: Qwen/Qwen2.5-0.5B-Instruct
+reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
 
 actor_train:
   model_args:
-    flash_attn: fa2
-    disable_gradient_checkpointing: false
-    dtype: bf16
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true
+    dtype: fp16
     model_type: ~
     lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
     lora_rank: 32
@@ -78,8 +74,8 @@ actor_train:
   training_args:
     learning_rate: 2.0e-5
     weight_decay: 0
-    per_device_train_batch_size: 4
-    gradient_accumulation_steps: 11
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 2
     warmup_steps: 2
     lr_scheduler_type: cosine
   data_args:
@@ -87,23 +83,19 @@ actor_train:
   strategy_args:
     strategy_name: deepspeed_train
     strategy_config: ${deepspeed_zero2}
-  device_mapping: "[0,1,2]"
-  infer_batch_size: 4
-  use_dynamic_batching_in_train: false
-  max_tokens_per_microbatch_in_train: 0
-  sequence_length_round_in_train: 4
-  use_inner_dynamic_batching_in_train: false
+  device_mapping: "[0]"
+  infer_batch_size: 1
 
 actor_infer:
   model_args:
     flash_attn: sdpa
     disable_gradient_checkpointing: true
-    dtype: bf16
+    dtype: fp16
     lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
     lora_rank: 32
     lora_alpha: 32
   generating_args:
-    max_new_tokens: 512
+    max_new_tokens: 256
     top_p: 0.99
     top_k: 100
     num_beams: 1
@@ -114,38 +106,37 @@ actor_infer:
   strategy_args:
     strategy_name: vllm
     strategy_config:
-      gpu_memory_utilization: 0.92
+      gpu_memory_utilization: 0.85
       block_size: 16
       load_format: auto
-      max_loras: 7  # ceil(max_steps/fsp_save_steps) + 1 = 300/50 + 1
-      enforce_eager: false
-      max_num_batched_tokens: 4096
-  device_mapping: "[3]"
-  infer_batch_size: 4
+      max_loras: 6  # ceil(max_steps/fsp_save_steps) + 1 = 3 + 1 = 4, using 6 for headroom
+      enforce_eager: true
+      max_num_batched_tokens: 8192
+  device_mapping: "[1]"
+  infer_batch_size: 1
 
-reward_normalization: {}
+reward_normalization:
+  grouping: tags
+  method: identity
 
 train_env_manager:
   format_penalty: -0.01
-  max_env_num_per_worker: 64
-  num_env_groups: 33
-  group_size: 8
-  tags: [KuhnPokerLLMThink]
-  num_groups_partition: [33]
-  include_opponent_reasoning: false
-
-val_env_manager:
-  max_env_num_per_worker: 4
+  max_env_num_per_worker: 8
   num_env_groups: 4
-  group_size: 1
+  group_size: 2
   tags: [KuhnPokerLLMThink]
   num_groups_partition: [4]
 
-max_tokens_per_step: 512
+val_env_manager:
+  max_env_num_per_worker: 2
+  num_env_groups: 2
+  group_size: 1
+  tags: [KuhnPokerLLMThink]
+  num_groups_partition: [2]
+
+max_tokens_per_step: 256
 max_actions_per_traj: 2
 
 custom_envs:
   KuhnPokerLLMThink:
     ${custom_env.KuhnPokerLLMThink}
-  KuhnPokerLLMThinkStochastic:
-    ${custom_env.KuhnPokerLLMThinkStochastic}

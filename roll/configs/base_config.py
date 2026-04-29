@@ -112,8 +112,8 @@ class BaseConfig(ScheduleConfig):
         metadata={"help": "Number of steps between logging information."}
     )
     eval_steps: int = field(
-        default=10,
-        metadata={"help": "Run an evaluation every X steps."},
+        default=0,
+        metadata={"help": "Run an evaluation every X steps. 0 disables evaluation."},
     )
     rollout_batch_size: int = field(
         default=128, metadata={"help": "The number of samples to rollout in each inference batch."}

@@ -18,4 +18,9 @@ max_steps: 5
 fsp_save_steps: 2
 eval_steps: 100
 save_steps: 10000
-rollout_batch_size: 16
+rollout_batch_size: 16  # must equal num_env_groups * group_size
+
+train_env_manager:
+  num_env_groups: 2
+  group_size: 8
+  num_groups_partition: [2]

@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=kuhn_3b_arena_debug
-#SBATCH --output=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_3b_arena_debug_%j.out
-#SBATCH --error=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_3b_arena_debug_%j.err
-#SBATCH --partition=debug
-#SBATCH --qos=qos_debug
+#SBATCH --job-name=kuhn_3b_async_grponorm
+#SBATCH --output=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_3b_async_grponorm_%j.out
+#SBATCH --error=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_3b_async_grponorm_%j.err
+#SBATCH --partition=general
+#SBATCH --qos=qos_general
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
-#SBATCH --time=01:00:00
-#SBATCH --gres=gpu:v100:1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=192G
+#SBATCH --time=2-00:00:00
+#SBATCH --gres=gpu:a6000:4
 
 set -ex
 
@@ -17,8 +17,10 @@ ENV_PATH=/zfsauton/scratch/wentsec/envs/roll3
 ROLL_DIR=/zfsauton/scratch/wentsec/ROLL
 
 RUN_ID="${SLURM_JOB_ID:-$(date +%s)}_$(hostname -s)_$$"
-EVAL_OUTPUT_ROOT=/zfsauton/scratch/wentsec/kuhn_poker_output/eval/${RUN_ID}
-mkdir -p $EVAL_OUTPUT_ROOT
+FSP_OUTPUT_ROOT=/zfsauton/scratch/wentsec/kuhn_poker_output/runs/${RUN_ID}
+mkdir -p $FSP_OUTPUT_ROOT/logs $FSP_OUTPUT_ROOT/render
+
+trap "rm -rf ${FSP_OUTPUT_ROOT}/render/*/checkpoint-* ${FSP_OUTPUT_ROOT}/render/checkpoint-* ${FSP_OUTPUT_ROOT}/actor_train-*/checkpoint-* 2>/dev/null || true" EXIT
 
 source $CONDA_ROOT/etc/profile.d/conda.sh
 conda activate $ENV_PATH
@@ -35,7 +37,6 @@ export PYTHONPATH=$ROLL_DIR:$PYTHONPATH
 export TMPDIR=/zfsauton/scratch/wentsec/tmp_ray_$$
 export TRITON_CACHE_DIR=/zfsauton/scratch/wentsec/triton_cache
 export RAY_TMPDIR=/zfsauton/scratch/wentsec/ray_tmp
-export ROLL_DISABLE_SLEEP_MODE=1
 mkdir -p $TMPDIR $TRITON_CACHE_DIR $RAY_TMPDIR
 
 df -h /zfsauton/scratch /zfsauton2/home/wentsec
@@ -45,20 +46,16 @@ ray stop --force 2>/dev/null || true
 sleep 2
 
 cd $ROLL_DIR
-python examples/start_arena_eval.py \
+python examples/start_agentic_pipeline.py \
     --config_path agentic_demo \
     --config_name agent_kuhn_poker_fsp_train \
-    --self_play \
-    --env_tag KuhnPokerLLMThink \
-    --output_dir ${EVAL_OUTPUT_ROOT} \
-    --episodes_per_pair 32 \
-    --max_concurrent 32 \
-    --save_trajectories \
-    num_gpus_per_node=1 \
-    actor_infer.strategy_args.strategy_config.enforce_eager=true \
-    actor_infer.strategy_args.strategy_config.gpu_memory_utilization=0.75 \
-    actor_infer.model_args.dtype=fp16 \
+    logging_dir=${FSP_OUTPUT_ROOT}/logs \
+    output_dir=${FSP_OUTPUT_ROOT} \
+    checkpoint_config.output_dir=${FSP_OUTPUT_ROOT}/render \
+    train_env_manager.format_penalty=-0.1 \
+    exp_name=kuhn_3b_async_grponorm \
+    tracker_kwargs.tags="[kuhn_poker,fsp_train,qwen2_5_3b,async,auton,grpo_norm,traj_group]" \
     2>&1
 
 rm -rf $TMPDIR
-echo "===== KUHN 3B ARENA DEBUG DONE (RUN_ID=${RUN_ID}, OUT=${EVAL_OUTPUT_ROOT}) ====="
+echo "===== KUHN 3B ASYNC GRPONORM DONE (RUN_ID=${RUN_ID}) ====="

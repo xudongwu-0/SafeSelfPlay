@@ -10,7 +10,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "kuhn_debug_lora_fix"
+exp_name: "kuhn_debug_arena_wandb"
 seed: 42
 logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
 output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output
