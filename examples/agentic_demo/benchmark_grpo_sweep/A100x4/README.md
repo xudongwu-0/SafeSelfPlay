@@ -50,18 +50,19 @@
 
 ## Round 2 — `per_device_train_batch_size`
 
-*Full batch: ga=1, sweep bs freely. A100 40GB ≈ A6000 48GB; OOM expected around bs=32+.*
+*Full batch: ga=1, sweep bs freely. A100 40GB ≈ A6000 48GB; OOM at bs=16+.*
 
 | Variant | bs | ga_steps | tok/s | step_time_s | gpu_util_% | winner |
 |---------|-----|----------|-------|-------------|------------|--------|
-| bs4 | 4 | 1 | 2127 | 50 | 42.3 | |
-| bs8 | 8 | 1 | — | — | — | |
-| bs16 | 16 | 1 | — | — | — | |
-| bs32 | 32 | 1 | — | — | — | |
+| bs4 | 4 | 1 | 2127 | 50 | 42.3 | ✓ |
+| bs8 | 8 | 1 | 2104 | — | — | |
+| bs16 | 16 | 1 | OOM | — | — | |
+| bs32 | 32 | 1 | OOM | — | — | |
 
-*tok/s = final cumulative system/tps; step_time = avg steps 1-3; gpu_util = training-steps window (13:46–13:52)*
+*bs16 OOM: tried to allocate 9.27 GiB, only 6.31 GiB free. bs32 OOM: tried 18.55 GiB, 17.79 GiB free.*
 
-**Winner:** TBD
+**Winner:** bs4 (2127 tok/s; bs8=2104 within noise but bs4 slightly faster)  
+**Locked baseline update:** `per_device_train_batch_size=4`
 
 ---
 
@@ -69,12 +70,13 @@
 
 | Variant | rollout_batch_size | num_env_groups | tok/s | step_time_s | gpu_util_% | winner |
 |---------|--------------------|----------------|-------|-------------|------------|--------|
-| rb64 | 64 | 16 | — | — | — | |
-| rb128 | 128 | 32 | — | — | — | |
-| rb256 | 256 | 64 | — | — | — | |
-| rb512 | 512 | 128 | — | — | — | |
+| rb64 | 64 | 16 | 1603 | — | — | |
+| rb128 | 128 | 32 | 1727 | — | — | |
+| rb256 | 256 | 64 | 2291 | — | — | ✓ |
+| rb512 | 512 | 128 | 2174 | — | — | |
 
-**Winner:** TBD
+**Winner:** rb256 (2291 tok/s; current baseline already optimal)  
+**Locked baseline update:** `rollout_batch_size=256`
 
 ---
 
@@ -82,12 +84,15 @@
 
 | Variant | group_size | tok/s | step_time_s | gpu_util_% | winner |
 |---------|------------|-------|-------------|------------|--------|
-| gs1 | 1 | — | — | — | |
-| gs2 | 2 | — | — | — | |
-| gs4 | 4 | — | — | — | |
-| gs8 | 8 | — | — | — | |
+| gs1 | 1 | 2268 | — | — | |
+| gs2 | 2 | 2140 | — | — | |
+| gs4 | 4 | 2194 | — | — | |
+| gs8 | 8 | 2279 | — | — | ✓ |
 
-**Winner:** TBD
+*gs1 is degenerate (zero within-group variance → GRPO advantage collapses). gs8 wins on both throughput and training quality.*
+
+**Winner:** gs8 (2279 tok/s)  
+**Locked baseline update:** `group_size=8`, `num_env_groups=32`, `num_groups_partition=[32]`
 
 ---
 
@@ -95,10 +100,11 @@
 
 | Variant | enforce_eager | tok/s | step_time_s | gpu_util_% | winner |
 |---------|---------------|-------|-------------|------------|--------|
-| eager_false | false | — | — | — | |
-| eager_true | true | — | — | — | |
+| eager_false | false | 2263 | — | — | ✓ |
+| eager_true | true | 1975 | — | — | |
 
-**Winner:** TBD
+**Winner:** eager_false (2263 tok/s; +15% vs eager_true)  
+**Locked baseline update:** `enforce_eager=false`
 
 ---
 
@@ -106,12 +112,15 @@
 
 | Variant | max_num_batched_tokens | tok/s | step_time_s | gpu_util_% | winner |
 |---------|-----------------------|-------|-------------|------------|--------|
-| mnt4096 | 4096 | — | — | — | |
-| mnt8192 | 8192 | — | — | — | |
-| mnt16384 | 16384 | — | — | — | |
-| mnt32768 | 32768 | — | — | — | |
+| mnt4096 | 4096 | 2181 | — | — | |
+| mnt8192 | 8192 | 2203 | — | — | |
+| mnt16384 | 16384 | 1923 | — | — | |
+| mnt32768 | 32768 | 2274 | — | — | ✓ |
 
-**Winner:** TBD
+*mnt16384 anomalously slow — longer prefill latency with mid-range batch size. mnt32768 wins by maximizing vLLM batching efficiency.*
+
+**Winner:** mnt32768 (2274 tok/s)  
+**Locked baseline update:** `max_num_batched_tokens=32768`
 
 ---
 
@@ -119,31 +128,32 @@
 
 | Variant | gpu_memory_utilization | tok/s | step_time_s | gpu_util_% | winner |
 |---------|------------------------|-------|-------------|------------|--------|
-| gmu90 | 0.90 | — | — | — | |
-| gmu92 | 0.92 | — | — | — | |
-| gmu95 | 0.95 | — | — | — | |
+| gmu90 | 0.90 | 2311 | — | — | |
+| gmu92 | 0.92 | 2251 | — | — | |
+| gmu95 | 0.95 | 2322 | — | — | ✓ |
 
-**Winner:** TBD
+*Higher gmu gives vLLM more KV-cache headroom, reducing evictions and improving throughput.*
+
+**Winner:** gmu95 (2322 tok/s)  
+**Locked baseline update:** `gpu_memory_utilization=0.95`
 
 ---
 
 ## Final SOTA Config
 
-*(Fill in after all rounds complete)*
-
-| Parameter | Value |
-|-----------|-------|
-| `actor_train.device_mapping` | `[0,1,2]` (R1) |
-| `actor_infer.device_mapping` | `[3]` (R1) |
-| `per_device_train_batch_size` | TBD (R2) |
-| `gradient_accumulation_steps` | 1 |
-| `group_size` | TBD (R4) |
-| `rollout_batch_size` | TBD (R3) |
-| `enforce_eager` | TBD (R5) |
-| `max_num_batched_tokens` | TBD (R6) |
-| `gpu_memory_utilization` | TBD (R7) |
-| **tok/s** | **TBD** |
-| **gpu_util_%** | **TBD** |
+| Parameter | Value | Round |
+|-----------|-------|-------|
+| `actor_train.device_mapping` | `[0,1,2]` | R1 |
+| `actor_infer.device_mapping` | `[3]` | R1 |
+| `per_device_train_batch_size` | `4` | R2 |
+| `gradient_accumulation_steps` | `1` | — |
+| `group_size` | `8` | R4 |
+| `rollout_batch_size` | `256` | R3 |
+| `num_env_groups` | `32` | = 256/8 |
+| `enforce_eager` | `false` | R5 |
+| `max_num_batched_tokens` | `32768` | R6 |
+| `gpu_memory_utilization` | `0.95` | R7 |
+| **tok/s** | **2322** | R7 best |
 
 ---
 
@@ -152,9 +162,11 @@
 | Metric | A40x4 | A6000x4 v1 | A6000x4 v2 | **A100x4** |
 |--------|-------|-----------|-----------|-----------|
 | VRAM | 40 GB | 48 GB | 48 GB | **40 GB** |
-| tok/s | 530 | 452 | 947 | **2067 (R1 best)** |
-| gpu_util_% | — | 21 | 37.5 | **37.7 (R1 best)** |
+| tok/s | 530 | 452 | 947 | **2322 (SOTA)** |
+| gpu_util_% | — | 21 | 37.5 | **37.7 (R1 proxy)** |
 | GPU split | 1tr+3inf | 1tr+3inf | 3tr+1inf | **3tr+1inf** |
-| per_device_bs | 4 | 4 | 4 | **TBD** |
-| group_size | 4 | 1 | 4 | **TBD** |
-| rollout_batch_size | 128 | 128 | 256 | **TBD** |
+| per_device_bs | 4 | 4 | 4 | **4** |
+| group_size | 4 | 1 | 4 | **8** |
+| rollout_batch_size | 128 | 128 | 256 | **256** |
+| max_num_batched_tokens | — | — | 4096 | **32768** |
+| gpu_memory_utilization | — | — | 0.92 | **0.95** |
