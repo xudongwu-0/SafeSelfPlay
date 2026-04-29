@@ -130,6 +130,12 @@ class EnvironmentWorker(Worker):
                 env_manager.update_enemy_pool(lora_path)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
+    async def update_nash_probabilities(self, probs) -> None:
+        for env_manager in self.env_managers.values():
+            if hasattr(env_manager, "set_nash_probabilities"):
+                env_manager.set_nash_probabilities(probs)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
     async def stop(self):
         for env_manager in self.env_managers.values():
             env_manager.stop()

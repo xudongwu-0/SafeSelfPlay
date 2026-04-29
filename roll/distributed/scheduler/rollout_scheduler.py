@@ -652,6 +652,9 @@ class RolloutScheduler(RolloutMockMixin):
     async def update_enemy_pool(self, lora_path: str):
         await asyncio.gather(*self.es_manager.update_enemy_pool(lora_path, blocking=False))
 
+    async def update_nash_probabilities(self, probs) -> None:
+        await asyncio.gather(*self.es_manager.update_nash_probabilities(probs, blocking=False))
+
     async def _run_rollout_loop(self, seed):
         await asyncio.gather(*self.es_manager.run_rollout_loop(seed, blocking=False))
 
