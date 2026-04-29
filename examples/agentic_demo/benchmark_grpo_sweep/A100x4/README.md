@@ -139,6 +139,21 @@
 
 ---
 
+## Round 8 — `infer_batch_size`
+
+*Batch size for log-prob computation pass (actor_train.infer_batch_size). Larger = better GPU utilization during the log-probs phase.*
+
+| Variant | infer_batch_size | tok/s | step_time_s | gpu_util_% | winner |
+|---------|-----------------|-------|-------------|------------|--------|
+| ibs4 | 4 | — | — | — | |
+| ibs8 | 8 | — | — | — | |
+| ibs16 | 16 | — | — | — | |
+| ibs32 | 32 | — | — | — | |
+
+**Winner:** TBD
+
+---
+
 ## Final SOTA Config
 
 | Parameter | Value | Round |

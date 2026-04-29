@@ -130,6 +130,12 @@ case "${ROUND}/${VARIANT}" in
     round7_gmu/gmu92)          VARIANT_OVERRIDE="actor_infer.strategy_args.strategy_config.gpu_memory_utilization=0.92" ;;
     round7_gmu/gmu95)          VARIANT_OVERRIDE="actor_infer.strategy_args.strategy_config.gpu_memory_utilization=0.95" ;;
 
+    # R8: infer_batch_size — log-prob computation batch size (currently fixed at 4)
+    round8_infer_bs/ibs4)      VARIANT_OVERRIDE="actor_train.infer_batch_size=4" ;;
+    round8_infer_bs/ibs8)      VARIANT_OVERRIDE="actor_train.infer_batch_size=8" ;;
+    round8_infer_bs/ibs16)     VARIANT_OVERRIDE="actor_train.infer_batch_size=16" ;;
+    round8_infer_bs/ibs32)     VARIANT_OVERRIDE="actor_train.infer_batch_size=32" ;;
+
     *) echo "ERROR: unknown round/variant ${ROUND}/${VARIANT}"; exit 2 ;;
 esac
 
