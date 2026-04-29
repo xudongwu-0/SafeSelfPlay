@@ -165,8 +165,8 @@ class SFTPipeline(BasePipeline):
                 self.pipeline_config.sequence_length,
                 encode_function,
                 num_proc=self.pipeline_config.sft_train.data_args.preprocessing_num_workers)
-
-            global_val_batch_size = dp_size * ga_steps * self.pipeline_config.sft_train.infer_batch_size
+            
+            global_val_batch_size = dp_size * self.pipeline_config.sft_train.infer_batch_size
             self.val_dataloader = DataLoader(
                 dataset=self.val_dataset,
                 batch_size=global_val_batch_size,
@@ -207,7 +207,8 @@ class SFTPipeline(BasePipeline):
 
                 with Timer(name="step_train", logger=None) as step_train_timer:
                     batch: DataProto = DataProto.from_single_dict(batch_dict)
-                    batch.meta_info = {"global_step": global_step, "is_offload_optimizer_states_in_train_step": False,
+                    batch.meta_info = {"global_step": global_step, "is_offload_states": False,
+                                       "is_offload_optimizer_states_in_train_step": False,
                                        "loss_mask_keys": ["labels"]}
                     # Reorder data for DP rank load balancing
                     batch_balance_metrics = batch_balance(batch, dp_size=self.sft_train.dp_size,

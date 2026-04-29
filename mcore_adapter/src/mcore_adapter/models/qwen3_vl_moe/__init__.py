@@ -23,7 +23,6 @@ from ..converter.template import (
     QKVConverOp,
     RenameConverOp,
     StackedTensors,
-    Template,
     register_template,
 )
 from ..qwen3_vl import Qwen3VLConfig, Qwen3VLModel, Qwen3VLTemplate

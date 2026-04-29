@@ -43,8 +43,8 @@ from roll.utils.functionals import (
 from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
 from roll.utils.metrics.metrics_manager import MetricsManager
-from roll.utils.packages import is_transformers_version_greater_than
 from roll.utils.offload_states import OffloadStateType
+from roll.utils.train_infer_corrections import apply_train_infer_correction_to_batch
 
 
 logger = get_logger()
@@ -320,29 +320,27 @@ class RLVRVLMPipeline(BasePipeline):
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(), soft=False
                 )
-            ).remote(pipeline_config=self.pipeline_config)
-            ray.get(
-                generate_scheduler.set_scheduler.remote(
-                    actor_cluster=self.actor_infer,
-                    reward_clusters={domain: self.rewards[domain]},
-                    dataset=self.domain_datasets[domain],
-                    collect_fn_cls=DataCollatorWithPaddingForMM,
-                    collect_fn_kwargs=dict(
-                        # tokenizer passed by DynamicSamplingScheduler.set_scheduler
-                        # tokenizer=self.tokenizer,
-                        extra_unpadded_keys=["domain", "reward_model"],
-                        extra_data_provider=get_extra_data_provider(
-                            self.pipeline_config.actor_train.model_args.model_name_or_path, processor=self.processor
-                        ),
-                        prompt_key="prompt",
-                        answer_key="ground_truth",
-                        image_key="images",
-                        image_flag_key="image_flag",
-                        max_length=self.pipeline_config.prompt_length,
-                        padding="max_length",
+            ).remote(
+                pipeline_config=self.pipeline_config,
+                actor_cluster=self.actor_infer,
+                reward_clusters={domain: self.rewards[domain]},
+                dataset=self.domain_datasets[domain],
+                collect_fn_cls=DataCollatorWithPaddingForMM,
+                collect_fn_kwargs=dict(
+                    # tokenizer passed by DynamicSamplingScheduler.set_scheduler
+                    # tokenizer=self.tokenizer,
+                    extra_unpadded_keys=["domain", "reward_model"],
+                    extra_data_provider=get_extra_data_provider(
+                        self.pipeline_config.actor_train.model_args.model_name_or_path, processor=self.processor
                     ),
-                    state=self.state.kv.get(f"scheduler_state_{domain}", None),
-                )
+                    prompt_key="prompt",
+                    answer_key="ground_truth",
+                    image_key="images",
+                    image_flag_key="image_flag",
+                    max_length=self.pipeline_config.prompt_length,
+                    padding="max_length",
+                ),
+                state=self.state.kv.get(f"scheduler_state_{domain}", None),
             )
             self.generate_schedulers[domain] = generate_scheduler
             self.domain_batch_size[domain] = domain_batch_size
@@ -359,31 +357,28 @@ class RLVRVLMPipeline(BasePipeline):
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(), soft=False
                 )
-            ).remote(pipeline_config=val_pipeline_config)
-        if self.val_dataset:
-            ray.get(
-                self.val_generate_scheduler.set_scheduler.remote(
-                    actor_cluster=self.actor_infer,
-                    reward_clusters=self.rewards,
-                    dataset=self.val_dataset,
-                    collect_fn_cls=DataCollatorWithPaddingForMM,
-                    collect_fn_kwargs=dict(
-                        # tokenizer passed by DynamicSamplingScheduler.set_scheduler
-                        # tokenizer=self.tokenizer,
-                        # val metrics are grouped by tag rather than domain
-                        extra_unpadded_keys=["domain", "reward_model", "tag"],
-                        extra_data_provider=get_extra_data_provider(
-                            self.pipeline_config.actor_train.model_args.model_name_or_path, processor=self.processor
-                        ),
-                        prompt_key="prompt",
-                        answer_key="ground_truth",
-                        image_key="images",
-                        image_flag_key="image_flag",
-                        max_length=self.pipeline_config.prompt_length,
-                        padding="max_length",
+            ).remote(
+                pipeline_config=val_pipeline_config,
+                actor_cluster=self.actor_infer,
+                reward_clusters=self.rewards,
+                dataset=self.val_dataset,
+                collect_fn_cls=DataCollatorWithPaddingForMM,
+                collect_fn_kwargs=dict(
+                    # tokenizer passed by DynamicSamplingScheduler.set_scheduler
+                    # tokenizer=self.tokenizer,
+                    # val metrics are grouped by tag rather than domain
+                    extra_unpadded_keys=["domain", "reward_model", "tag"],
+                    extra_data_provider=get_extra_data_provider(
+                        self.pipeline_config.actor_train.model_args.model_name_or_path, processor=self.processor
                     ),
-                    is_val=True,
-                )
+                    prompt_key="prompt",
+                    answer_key="ground_truth",
+                    image_key="images",
+                    image_flag_key="image_flag",
+                    max_length=self.pipeline_config.prompt_length,
+                    padding="max_length",
+                ),
+                is_val=True,
             )
 
         refs = []
@@ -402,6 +397,10 @@ class RLVRVLMPipeline(BasePipeline):
         if self.pipeline_config.adv_estimator == "gae":
             refs.extend(self.critic.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
+
+        ray.get([scheduler.initialize.remote() for scheduler in self.generate_schedulers.values()])
+        if self.val_dataset:
+            ray.get(self.val_generate_scheduler.initialize.remote())
 
         self.set_model_update_pair(
             src_cluster=self.actor_train,
@@ -607,6 +606,7 @@ class RLVRVLMPipeline(BasePipeline):
                             whiten_advantages=self.pipeline_config.whiten_advantages,
                             whiten_rewards=self.pipeline_config.whiten_rewards,
                             response_mask=final_response_mask,
+                            pipeline_config=self.pipeline_config,
                         )
                         domain_metrics = reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         metrics_mgr.add_domain_metrics(domain, domain_metrics)
@@ -642,6 +642,10 @@ class RLVRVLMPipeline(BasePipeline):
                 )
                 batch_grouped: Dict[str, DataProto] = batch.group_by("domain")
                 metrics_mgr.add_domain_all_metrics(global_step, batch_grouped)
+
+                if self.pipeline_config.enable_old_logprobs_recompute:
+                    batch, corr_metrics = apply_train_infer_correction_to_batch(self.pipeline_config, batch)
+                    metrics_mgr.add_metrics(corr_metrics)
 
                 with Timer(name="step_train", logger=None) as step_train_timer:
                     if self.pipeline_config.adv_estimator == "gae":
@@ -702,7 +706,8 @@ class RLVRVLMPipeline(BasePipeline):
             pre_step_total_time = step_total_timer.last
 
         ray.get([scheduler.shutdown.remote() for scheduler in self.generate_schedulers.values()])
-        ray.get(self.val_generate_scheduler.shutdown.remote())
+        if self.val_dataset:
+            ray.get(self.val_generate_scheduler.shutdown.remote())
 
         logger.info("pipeline complete!")
 

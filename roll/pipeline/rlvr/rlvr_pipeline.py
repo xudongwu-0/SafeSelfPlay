@@ -20,10 +20,13 @@ from roll.datasets.chat_template import get_chat_template
 from roll.datasets.collator import DataCollatorWithPaddingForPaddedKeys
 from roll.datasets.dataset import get_dataset
 from roll.distributed.executor.cluster import Cluster
+from roll.configs.base_config import RouterArguments
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
+from roll.distributed.scheduler.router import RouterManager
 from roll.distributed.scheduler.protocol import DataProto
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.base_pipeline import BasePipeline
+from roll.utils.constants import RAY_NAMESPACE
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
 from roll.pipeline.rlvr.utils import dump_rollout_to_specific_path
 from roll.utils.dynamic_batching import dynamic_batching_shard
@@ -215,7 +218,44 @@ class RLVRPipeline(BasePipeline):
             for key, worker_config in self.pipeline_config.rewards.items()
         }
         download_clusters.extend(self.rewards.values())
+
+        # Create reward model cluster (shared InferWorker + vLLM for LLM-as-judge)
+        self.reward_model_cluster = None
+        self.reward_model_scheduler = None
+        if (
+            self.pipeline_config.reward_model is not None
+            and self.pipeline_config.reward_model.device_mapping
+            and len(self.pipeline_config.reward_model.device_mapping) > 0
+        ):
+            self.reward_model_cluster = Cluster(
+                name=self.pipeline_config.reward_model.name,
+                worker_cls=self.pipeline_config.reward_model.worker_cls,
+                resource_manager=self.resource_manager,
+                worker_config=self.pipeline_config.reward_model,
+            )
+            download_clusters.append(self.reward_model_cluster)
+
         self.download_models(*download_clusters)
+
+        # Create RouterManager for reward model cluster (Ray named actor)
+        if self.reward_model_cluster:
+            self.reward_model_scheduler = ray.remote(RouterManager).options(
+                name=f"RewardModelScheduler-{self.pipeline_config.reward_model.name}",
+                get_if_exists=True,
+                namespace=RAY_NAMESPACE,
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=ray.get_runtime_context().get_node_id(),
+                    soft=False,
+                ),
+            ).remote(
+                actor_cluster=self.reward_model_cluster,
+                router_args=RouterArguments(router_name="PromptAffinityRouter"),
+                num_gpus_per_node=self.pipeline_config.num_gpus_per_node,
+            )
+            ray.get(self.reward_model_scheduler.initialize.remote())
+            logger.info(
+                f"Created reward model scheduler: RewardModelScheduler-{self.pipeline_config.reward_model.name}"
+            )
 
         domain_ratios = self.pipeline_config.actor_train.data_args.domain_interleave_probs
         self.generate_schedulers: Dict[str, DynamicSamplingScheduler] = {}
@@ -233,16 +273,14 @@ class RLVRPipeline(BasePipeline):
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
                 )
-            ).remote(pipeline_config=self.pipeline_config)
-            ray.get(
-                generate_scheduler.set_scheduler.remote(
-                    actor_cluster=self.actor_infer,
-                    reward_clusters={domain: self.rewards[domain]},
-                    dataset=self.domain_datasets[domain],
-                    collect_fn_cls=DataCollatorWithPaddingForPaddedKeys,
-                    collect_fn_kwargs=dict(max_length=self.pipeline_config.prompt_length, padding="max_length"),
-                    state=self.state.kv.get(f"scheduler_state_{domain}", None),
-                )
+            ).remote(
+                pipeline_config=self.pipeline_config,
+                actor_cluster=self.actor_infer,
+                reward_clusters={domain: self.rewards[domain]},
+                dataset=self.domain_datasets[domain],
+                collect_fn_cls=DataCollatorWithPaddingForPaddedKeys,
+                collect_fn_kwargs=dict(max_length=self.pipeline_config.prompt_length, padding="max_length"),
+                state=self.state.kv.get(f"scheduler_state_{domain}", None),
             )
             self.generate_schedulers[domain] = generate_scheduler
             self.domain_batch_size[domain] = domain_batch_size
@@ -260,21 +298,20 @@ class RLVRPipeline(BasePipeline):
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
                 )
-            ).remote(pipeline_config=val_pipeline_config)
-        if self.val_dataset:
-            ray.get(
-                self.val_generate_scheduler.set_scheduler.remote(
-                    actor_cluster=self.actor_infer,
-                    reward_clusters=self.rewards,
-                    dataset=self.val_dataset,
-                    collect_fn_cls=DataCollatorWithPaddingForPaddedKeys,
-                    collect_fn_kwargs=dict(max_length=self.pipeline_config.prompt_length, padding="max_length"),
-                    is_val=True,
-                )
+            ).remote(
+                pipeline_config=val_pipeline_config,
+                actor_cluster=self.actor_infer,
+                reward_clusters=self.rewards,
+                dataset=self.val_dataset,
+                collect_fn_cls=DataCollatorWithPaddingForPaddedKeys,
+                collect_fn_kwargs=dict(max_length=self.pipeline_config.prompt_length, padding="max_length"),
+                is_val=True,
             )
 
         refs = []
         refs.extend(self.actor_infer.initialize(pipeline_config=self.pipeline_config, blocking=False))
+        if self.reward_model_cluster:
+            refs.extend(self.reward_model_cluster.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
 
         if self.use_ref_model:
@@ -290,6 +327,10 @@ class RLVRPipeline(BasePipeline):
         if self.pipeline_config.adv_estimator == "gae":
             refs.extend(self.critic.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
+
+        ray.get([scheduler.initialize.remote() for scheduler in self.generate_schedulers.values()])
+        if self.val_dataset:
+            ray.get(self.val_generate_scheduler.initialize.remote())
 
         self.set_model_update_pair(
             src_cluster=self.actor_train,
@@ -408,6 +449,8 @@ class RLVRPipeline(BasePipeline):
         if self.pipeline_config.async_pipeline:
             for reward_cluster in self.rewards.values():
                 reward_cluster.load_states()
+            if self.reward_model_cluster:
+                self.reward_model_cluster.load_states()
 
         for global_step in range(self.pipeline_config.max_steps):
             if global_step <= self.state.step:
@@ -448,6 +491,8 @@ class RLVRPipeline(BasePipeline):
                 if not self.pipeline_config.async_pipeline:
                     for reward_cluster in self.rewards.values():
                         reward_cluster.load_states()
+                    if self.reward_model_cluster:
+                        self.reward_model_cluster.load_states()
 
                 if self.val_dataset and global_step % self.pipeline_config.eval_steps == 0:
                     with Timer(name="val_step", logger=None) as val_step_timer:
@@ -482,6 +527,8 @@ class RLVRPipeline(BasePipeline):
                         self.actor_infer.offload_states()
                         for reward_cluster in self.rewards.values():
                             reward_cluster.offload_states()
+                        if self.reward_model_cluster:
+                            self.reward_model_cluster.offload_states()
                 metrics_mgr.add_metric("time/step_generate", step_generate_timer.last)
 
                 batch = generate_output
@@ -494,7 +541,7 @@ class RLVRPipeline(BasePipeline):
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_ref_log_probs_timer:
                     if self.pipeline_config.enable_reference:
                         worker_config = self.pipeline_config.reference if self.use_ref_model else self.pipeline_config.actor_train
-                        worker = self.reference if self.use_ref_model else self.pipeline_config.actor_train
+                        worker = self.reference if self.use_ref_model else self.actor_train
                         if worker_config.use_dynamic_batching_in_infer:
                             batch, dynamic_batching_metrics = dynamic_batching_shard(
                                 batch,
@@ -613,6 +660,7 @@ class RLVRPipeline(BasePipeline):
                             whiten_advantages=self.pipeline_config.whiten_advantages,
                             whiten_rewards=self.pipeline_config.whiten_rewards,
                             response_mask=final_response_mask,
+                            pipeline_config=self.pipeline_config,
                         )
                         domain_metrics = reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         metrics_mgr.add_domain_metrics(domain, domain_metrics)
@@ -734,7 +782,8 @@ class RLVRPipeline(BasePipeline):
             pre_step_total_time = step_total_timer.last
 
         ray.get([scheduler.shutdown.remote() for scheduler in self.generate_schedulers.values()])
-        ray.get(self.val_generate_scheduler.shutdown.remote())
+        if self.val_dataset:
+            ray.get(self.val_generate_scheduler.shutdown.remote())
 
         logger.info("pipeline complete!")
 

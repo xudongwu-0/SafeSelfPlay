@@ -9,22 +9,23 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "qwen3_vl_32B_rlvr"
+exp_name: "qwen3_5_35BA3_rlvr" 
 seed: 42
 logging_dir: ./output/logs
 output_dir: ./output
 
 checkpoint_config:
   type: file_system
-  output_dir: /data/cpfs_0/yuzhao/models
+  output_dir: /data/cpfs_0/models
 
 track_with: tensorboard
 tracker_kwargs:
-  log_dir: /data/oss_bucket_0/yuzhao/llm/tensorboard
+  log_dir: ./output/tensorboard
 
-save_steps: 20
+max_steps: 500
+save_steps: 100
+eval_steps: 20
 logging_steps: 1
-eval_steps: 10
 resume_from_checkpoint: false
 
 rollout_batch_size: 256
@@ -43,14 +44,15 @@ adv_estimator: "grpo"
 use_kl_loss: true
 kl_loss_coef: 1.0e-2
 
-pretrain: Qwen/Qwen3-VL-32B-Thinking
+pretrain: Qwen/Qwen3.5-35B-A3B
 
 validation:
  data_args:
    file_name:
-     - /data/oss_bucket_0/yuzhao/data/One-RL-to-See-Them-All/Orsta-Data-47k/test/test_math_megabench_237.parquet
-     - /data/oss_bucket_0/yuzhao/data/One-RL-to-See-Them-All/Orsta-Data-47k/test/test_detection_coco_test_multi_2000.parquet
+     - data/One-RL-to-See-Them-All/Orsta-Data-47k/test/test_math_megabench_237.parquet
+     - data/One-RL-to-See-Them-All/Orsta-Data-47k/test/test_detection_coco_test_multi_2000.parquet
    dataset_dir: ./
+   preprocessing_num_workers: 32
  generating_args:
    max_new_tokens: ${response_length}
    top_p: 0.99
@@ -62,8 +64,8 @@ validation:
 
 actor_train:
   model_args:
-    flash_attn: fa2
-    attn_implementation: fa2
+    flash_attn: sdpa
+    attn_implementation: sdpa
     disable_gradient_checkpointing: false
     dtype: bf16
     model_type: ~
@@ -71,16 +73,16 @@ actor_train:
   training_args:
     learning_rate: 1.0e-6
     weight_decay: 1.0e-2
-    per_device_train_batch_size: 2
-    gradient_accumulation_steps: 64
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 256
     warmup_steps: 0
     num_train_epochs: 50
   data_args:
     # use One-RL-to-See-Them-All/Orsta-Data-47k as train dataset
     # download from https://huggingface.co/datasets/One-RL-to-See-Them-All/Orsta-Data-47k
     file_name:
-      - /data/oss_bucket_0/yuzhao/data/One-RL-to-See-Them-All/Orsta-Data-47k/train/train_detection_v3det_4000.parquet
-      - /data/oss_bucket_0/yuzhao/data/One-RL-to-See-Them-All/Orsta-Data-47k/train/train_math_mmmath_3539.parquet
+      - data/One-RL-to-See-Them-All/Orsta-Data-47k/train/train_detection_v3det_4000.parquet
+      - data/One-RL-to-See-Them-All/Orsta-Data-47k/train/train_math_mmmath_3539.parquet
     domain_interleave_probs:
       math: 0.5
       cv_detection: 0.5
@@ -91,15 +93,21 @@ actor_train:
     strategy_name: megatron_train
     strategy_config:
       sequence_parallel: true
-      tensor_model_parallel_size: 4
-      context_parallel_size: 2
-      expert_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
-      overlap_grad_reduce: true
+      tensor_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      pipeline_model_parallel_size: 2
       use_distributed_optimizer: true
+      moe_token_dispatcher_type: alltoall
+      recompute_granularity: selective
+      recompute_modules: "moe,layernorm"
+      bias_activation_fusion: true
+      apply_rope_fusion: true
+      moe_grouped_gemm: true
+      moe_shared_expert_overlap: true
       bf16: true
-  device_mapping: list(range(0,32))
-  infer_batch_size: 8
+  device_mapping: list(range(0,16))
+  infer_batch_size: 1
 
 actor_infer:
   model_args:
@@ -117,17 +125,20 @@ actor_infer:
   strategy_args:
     strategy_name: vllm
     strategy_config:
-      gpu_memory_utilization: 0.7
-      block_size: 16
+      gpu_memory_utilization: 0.65
       max_model_len: 8192
-  num_gpus_per_worker: 4
-  device_mapping: list(range(0,32))
-  infer_batch_size: 32
+      load_format: dummy
+      tensor_parallel_size: 2
+      optimization_level: 1
+      sleep_level: 2
+  num_gpus_per_worker: 2
+  device_mapping: list(range(0,16))
+  infer_batch_size: 1
 
 reference:
   model_args:
-    flash_attn: fa2
-    attn_implementation: fa2
+    flash_attn: sdpa
+    attn_implementation: sdpa
     disable_gradient_checkpointing: true
     dtype: bf16
     model_type: ~
@@ -135,13 +146,13 @@ reference:
     strategy_name: megatron_infer
     strategy_config:
       sequence_parallel: true
-      tensor_model_parallel_size: 2
+      tensor_model_parallel_size: 1
       context_parallel_size: 1
       pipeline_model_parallel_size: 1
-      expert_model_parallel_size: 1
+      expert_model_parallel_size: 4
       bf16: true
-  device_mapping: list(range(0,32))
-  infer_batch_size: 8
+  device_mapping: list(range(0,16))
+  infer_batch_size: 1
 
 rewards:
   math:

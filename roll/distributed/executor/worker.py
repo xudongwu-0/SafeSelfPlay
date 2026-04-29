@@ -100,44 +100,16 @@ class Worker:
         ).remote()
         master_addr = Worker.get_node_ip()
         max_retry_count = int(os.environ.get("MAX_PORT_RETRY_COUNT", 1000))
-        retry_count = 0
-        master_port = collect_free_port()
-        while retry_count < max_retry_count:
-            master_addr_port_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
-            if ray.get(shared_storage.get.remote(master_addr_port_key)) is None:
-                ray.get(shared_storage.put.remote(master_addr_port_key, True))
-                break
-            master_port = collect_free_port()
-            retry_count += 1
-        if retry_count >= max_retry_count:
-            raise RuntimeError(f"Can not allocate unique MASTER_PORT on {master_addr}.")
-        return master_port
 
+        for i in range(max_retry_count):
+            master_port = collect_free_port()
+            master_addr_port_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
+            success = ray.get(shared_storage.put_if_absent.remote(master_addr_port_key, True))
+            if success:
+                return master_port
+        raise RuntimeError(f"Can not allocate unique MASTER_PORT on {master_addr}.")
     def get_master_addr_and_port(self):
         return self.master_addr, self.master_port
-
-    def _get_strategy_load_state(self) -> Optional[bool]:
-        """Check if strategy model is loaded in GPU.
-
-        Handles multiple strategy implementations:
-        - vLLM: strategy.is_model_in_gpu (direct attribute)
-        - SGLang: strategy.model.is_model_in_gpu (nested attribute)
-        - Others: None (not trackable)
-
-        Returns:
-            True if loaded, False if offloaded, None if not trackable
-        """
-        if getattr(self, "strategy", None) is None:
-            return None
-
-        # Try direct attribute (vLLM pattern)
-        is_loaded = getattr(self.strategy, 'is_model_in_gpu', None)
-
-        # Try nested attribute (SGLang pattern)
-        if is_loaded is None and hasattr(self.strategy, 'model'):
-            is_loaded = getattr(self.strategy.model, 'is_model_in_gpu', None)
-
-        return is_loaded
 
     @staticmethod
     def get_visible_gpus():

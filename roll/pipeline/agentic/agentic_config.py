@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from omegaconf import DictConfig
 
-from roll.configs.base_config import PPOConfig
+from roll.configs.base_config import PPOConfig, RouterArguments
 from roll.configs.worker_config import WorkerConfig
 from roll.utils.logging import get_logger
 
@@ -240,7 +240,19 @@ class AgenticConfig(PPOConfig):
 
     parse_tool_call_parameter_to_dict: bool = field(default=False, metadata={"help": "Parse tool call parameter to dict. for https://github.com/QwenLM/Qwen3-Coder/issues/444"})
 
+    skip_mock_system_prompt: bool = field(
+        default=False,
+        metadata={
+            "help": "Set to True when chat template will not add system prompt automatically if not present in messages, e.g. Qwen3.5 series."
+        }
+    )
+
     def __post_init__(self):
+        # Handle OPD mapping FIRST before any access to actor_train/actor_infer/reference
+        # This ensures student_train/student_infer/teacher are mapped correctly
+        self._handle_opd_mapping()
+
+        # Now safe to access actor_infer (may have been mapped from student_infer)
         assert self.actor_infer.generating_args or self.train_env_manager.generating_args, "must have generating_args in env_manager or actor infer."
 
         # If actor_infer.generating_args exists, set it for both env managers
@@ -278,6 +290,10 @@ class AgenticConfig(PPOConfig):
                 self.reward.worker_cls = "roll.pipeline.base_worker.InferWorker"
             if self.reward.name is None:
                 self.reward.name = "reward"
+
+        if self.router_args is None:
+            self.router_args = RouterArguments(router_name="EnvAffinityRouter", router_config=dict())
+            self.router_args.max_running_requests = self.max_running_requests
 
         self.train_env_manager.name = "train_env"
         self.val_env_manager.name = "val_env"
@@ -353,6 +369,9 @@ class AgenticConfig(PPOConfig):
             )
             self.actor_infer.max_concurrency = max(self.actor_infer.max_concurrency, max_concurrency)
             logger.info(f"Set max_concurrency of actor_infer to {self.actor_infer.max_concurrency}")
+
+        # Apply OPD configuration at the end (handles student_train/student_infer/teacher mapping)
+        self._apply_opd_config()
 
     def make_env_configs(self, env_manager_config: EnvManagerConfig):
         # construct env configs

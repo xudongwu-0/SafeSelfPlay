@@ -30,6 +30,27 @@ class RolloutMockConfig:
     )
 
 @dataclass
+class RouterArguments:
+    router_name: Literal[
+        "PromptAffinityRouter",
+        "EnvAffinityRouter",
+        "SglangRouter",
+    ] = field(
+        default=None,
+        metadata={
+            "help": "The name of the router."
+        },
+    )
+    router_config: Dict = field(
+        default_factory=dict,
+        metadata={"help": "Configuration dictionary for the router."},
+    )
+    max_running_requests: int = field(
+        default=128,
+        metadata={"help": "The maximum number of running requests."}
+    )
+
+@dataclass
 class ScheduleConfig:
     generate_opt_level: int = field(
         default=1,
@@ -55,6 +76,10 @@ class ScheduleConfig:
     user_defined_rollout_loop_cls: str = field(
         default="roll.distributed.scheduler.user_defined_rollout_loop.UserDefinedRolloutLoop",
         metadata={"help": "Path to class UserDefinedRolloutLoop."}
+    )
+    router_args: RouterArguments = field(
+        default=None,
+        metadata={"help": "The router configuration, encapsulated in a RouterArguments object."},
     )
 
 
@@ -160,6 +185,27 @@ class BaseConfig(ScheduleConfig):
     profiler_timeline: bool = field(default=False, metadata={"help": "Whether to use profiler mode or not."})
     profiler_memory: bool = field(default=False, metadata={"help": "Whether to use profiler memory or not."})
     report_length_and_rewards: bool = field(default=False, metadata={"help": "Whether to report lengths and rewards of prompts in each epoch."})
+
+    is_offload_states: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to offload model states to CPU to save GPU memory. "
+                "Models will be offloaded after each operation and reloaded before the next one. "
+                "Reduces GPU memory usage at the cost of CPU-GPU transfer overhead."
+            )
+        }
+    )
+    is_offload_optimizer_states_in_train_step: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to offload optimizer states to CPU during training to save GPU memory. "
+                "Optimizer states will be offloaded during forward/backward and reloaded for optimizer step. "
+                "Reduces GPU memory usage at the cost of CPU-GPU transfer overhead."
+            )
+        }
+    )
 
     length_profiler_dir: str = field(
         default='./output/profiler',
@@ -504,6 +550,48 @@ class PPOConfig(BaseConfig):
         },
     )
 
+    # OPD (On-Policy Distillation) Configuration
+    pure_opd_pipeline_type: Literal["rlvr", "agentic"] = field(
+        default="rlvr",
+        metadata={"help": "Pipeline type for pure On-Policy Distillation. Used by start_onpolicy_distill_pipeline.py "
+                 "to determine which config class and pipeline to use. "
+                 "'rlvr': RLVRConfig + RLVRPipeline, 'agentic': AgenticConfig + AgenticPipeline"}
+    )
+    teacher: WorkerConfig = field(
+        default_factory=WorkerConfig,
+        metadata={"help": "Configuration for the teacher role (used in OPD mode). "
+                 "When is_pure_opd=True or use_opd=True, teacher is automatically mapped to reference."}
+    )
+    student_train: WorkerConfig = field(
+        default_factory=WorkerConfig,
+        metadata={"help": "Configuration for the student training role (used in OPD mode). "
+                 "When configured, student_train is mapped to actor_train."}
+    )
+    student_infer: WorkerConfig = field(
+        default_factory=WorkerConfig,
+        metadata={"help": "Configuration for the student inference role (used in OPD mode). "
+                 "When configured, student_infer is mapped to actor_infer."}
+    )
+    is_pure_opd: bool = field(
+        default=False,
+        metadata={"help": "Enable pure On-Policy Distillation mode. "
+                 "In this mode, rewards come entirely from Teacher KL divergence. "
+                 "Automatically sets: gamma=0, adv_estimator='reinforce', critic_warmup=0. "
+                 "This is set by start_onpolicy_distill_pipeline.py automatically."}
+    )
+    use_opd: bool = field(
+        default=False,
+        metadata={"help": "Enable mixed OPD mode: add OPD KL penalty to token_level_reward. "
+                 "This allows combining RL reward with distillation signal. "
+                 "The OPD KL is computed as: reverse_kl = student_logp - teacher_logp, "
+                 "and added to token_level_rewards as: reward - opd_kl_coef * reverse_kl"}
+    )
+    opd_kl_coef: float = field(
+        default=1.0,
+        metadata={"help": "Coefficient for OPD KL penalty when use_opd=True. "
+                 "Controls the weight of distillation signal relative to RL reward."}
+    )
+
     def __post_init__(self):
         super().__post_init__()
         assert self.async_generation_ratio == 0 or self.generate_opt_level == 1
@@ -539,6 +627,76 @@ class PPOConfig(BaseConfig):
             self.set_old_logprobs_status()
 
         logger.info(f"enable_old_logprobs_recompute: {self.enable_old_logprobs_recompute}\tenable_reference: {self.enable_reference}")
+
+    def _handle_opd_mapping(self):
+        """
+        Handle OPD (On-Policy Distillation) mode configuration mapping.
+
+        Pure OPD mode (is_pure_opd=True):
+        - Requires: student_train, student_infer, teacher
+        - Forbidden: reference
+        - Mapping: student_train → actor_train, student_infer → actor_infer, teacher → reference
+
+        Mixed OPD mode (use_opd=True):
+        - Requires: teacher
+        - Forbidden: reference
+        - Mapping: teacher → reference only
+        - actor_train/actor_infer are configured normally by user
+
+        This method is called at the beginning of __post_init__ before normal PPO initialization.
+        """
+        has_student_train = self.student_train.is_configured
+        has_student_infer = self.student_infer.is_configured
+        has_teacher = self.teacher.is_configured
+        has_reference_configured = self.reference.is_configured
+
+        # Mutual exclusion check
+        if self.is_pure_opd and self.use_opd:
+            raise ValueError(
+                "is_pure_opd=True and use_opd=True are mutually exclusive. "
+                "Use is_pure_opd=True for pure OPD mode (rewards from Teacher KL only), "
+                "or use_opd=True for mixed mode (external rewards + Teacher KL)."
+            )
+
+        # ========== Pure OPD mode ==========
+        if self.is_pure_opd:
+            # Validation: all student fields and teacher must be configured
+            if not (has_student_train and has_student_infer and has_teacher):
+                raise ValueError(
+                    "In pure OPD mode (is_pure_opd=True), 'student_train', 'student_infer' "
+                    "and teacher must be configured.\n"
+                )
+
+            # Perform mapping for pure OPD
+            logger.info(f"Pure OPD mode: mapping student_train to actor_train")
+            self.actor_train = self.student_train
+            logger.info(f"Pure OPD mode: mapping student_infer to actor_infer")
+            self.actor_infer = self.student_infer
+            logger.info(f"Pure OPD mode: mapping teacher to reference")
+            self.reference = self.teacher
+
+            # Enable reference for OPD mode (needed for both pure and mixed mode)
+            self.enable_reference = True
+
+        # ========== Mixed OPD mode ==========
+        elif self.use_opd:
+            # Validation: teacher must be configured, reference should NOT be configured
+            if not has_teacher:
+                raise ValueError(
+                    "In mixed OPD mode (use_opd=True), 'teacher' must be configured.\n"
+                )
+            if has_reference_configured:
+                raise ValueError(
+                    "In mixed OPD mode (use_opd=True), 'reference' should NOT be configured. "
+                )
+
+            # Perform mapping for mixed OPD (only teacher → reference)
+            logger.info(f"Mixed OPD mode: mapping teacher to reference")
+            self.reference = self.teacher
+            # Note: actor_train and actor_infer are configured normally by user
+
+            # Enable reference for OPD mode (needed for both pure and mixed mode)
+            self.enable_reference = True
 
     def set_max_steps(self, max_steps: int):
         actor_backward_batch_size = (
@@ -630,3 +788,47 @@ class PPOConfig(BaseConfig):
             reference=self.reference,
             critic=self.critic
         )
+
+    def _apply_opd_config(self):
+        """
+        Apply OPD-specific parameter overrides.
+
+        This method should be called at the end of __post_init__ in subclasses
+        (RLVRConfig, AgenticConfig) to apply OPD-specific settings.
+
+        Note: The mapping of student_*/teacher to actor_*/reference is already
+        handled by _handle_opd_mapping(). This method only applies OPD-specific
+        parameter overrides like gamma, adv_estimator, etc.
+
+        This method handles both pure OPD mode (is_pure_opd=True)
+        and mixed OPD mode (use_opd=True).
+        """
+        # Pure OPD mode specific settings
+        if self.is_pure_opd:
+            # Set worker names for OPD mode (override default names for both modes)
+            self.actor_train.name = "student_train"
+            self.actor_infer.name = "student_infer"
+            self.reference.name = "teacher"
+
+            # gamma=0: OPD's token_level_rewards has KL penalty at every token
+            # If gamma=1, compute_reinforce_return will accumulate KL values across entire sequence
+            self.gamma = 0
+
+            # Use reinforce as default advantage estimator (no GAE, no critic needed)
+            logger.warning("Pure OPD mode: set adv_estimator as 'reinforce'")
+            self.adv_estimator = "reinforce"
+
+            # No critic warmup needed (reinforce doesn't use critic)
+            self.critic_warmup = 0
+
+            # Disable KL loss (OPD handles KL through token_level_rewards)
+            self.use_kl_loss = False
+            self.add_token_level_kl = False
+
+            logger.info(f"Pure OPD mode configured: gamma={self.gamma}, adv_estimator={self.adv_estimator}")
+
+        # Mixed OPD mode doesn't need parameter overrides
+        elif self.use_opd:
+            # Set worker names for OPD mode (override default names for both modes)
+            self.reference.name = "teacher"
+            logger.info(f"Mixed OPD mode configured: opd_kl_coef={self.opd_kl_coef}")

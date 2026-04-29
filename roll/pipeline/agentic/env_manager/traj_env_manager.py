@@ -18,7 +18,7 @@ from roll.utils.env_action_limiter import get_global_limiter
 from roll.distributed.scheduler.rollout_scheduler import GroupQueueManager
 from roll.pipeline.agentic.env_manager.token_mask_utils import custom_apply_chat_template, compute_conversation_end_token_id
 from roll.pipeline.agentic.tools.tool_env_wrapper import tool_wrapper
-from roll.distributed.scheduler.generate_scheduler import RequestScheduler
+from roll.distributed.scheduler.router import RouterManager
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_config import EnvManagerConfig, AgenticConfig
 from roll.utils.constants import GenerateStopReason
@@ -48,7 +48,7 @@ class TrajEnvManager(BaseEnvManager):
         self.tokenizer: PreTrainedTokenizer = tokenizer
         self.output_queue = output_queue
         self.mode = mode
-        self.generate_scheduler: RequestScheduler = generate_scheduler
+        self.generate_scheduler: RouterManager = generate_scheduler
 
         # EnvManager states
         self.rollout_cache: Optional[RolloutCache] = None
@@ -261,7 +261,7 @@ class TrajEnvManager(BaseEnvManager):
             user_content += self.agent_template.format(**render_dict)
             messages.append({"role": "user", "content": user_content})
 
-        prompt_ids = custom_apply_chat_template(messages=messages, tokenizer=self.tokenizer, add_generation_prompt=True)
+        prompt_ids = custom_apply_chat_template(messages=messages, tokenizer=self.tokenizer, add_generation_prompt=True, skip_mock_system_prompt=self.pipeline_config.skip_mock_system_prompt)
         history_token_ids = []
         for items in self.rollout_cache.history[:-1]:
             history_token_ids.extend(items["prompt_ids"])

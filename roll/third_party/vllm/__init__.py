@@ -10,6 +10,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.envs import get_default_cache_root
 from vllm.usage.usage_lib import UsageContext
 
+from roll.platforms import current_platform
 import roll.third_party.vllm.fp8 as fp8
 from roll.utils.import_utils import safe_import_class
 from roll.utils.logging import get_logger
@@ -30,12 +31,17 @@ elif Version("0.11.0") == Version(vllm.__version__) or Version("0.11.1rc1") == V
 elif Version("0.12.0") == Version(vllm.__version__):
     ray_executor_class_v0 = None  # V0 deprecated
     ray_executor_class_v1 = safe_import_class("roll.third_party.vllm.vllm_0_12_0.ray_distributed_executor.CustomRayDistributedExecutor")
+elif Version("0.15") <= Version(vllm.__version__):
+    if Version("0.16").release <= Version(vllm.__version__).release:
+        import roll.third_party.vllm.patch_transformers # apply patch
+    ray_executor_class_v0 = None  # V0 deprecated
+    ray_executor_class_v1 = safe_import_class("roll.third_party.vllm.ray_distributed_executor.CustomRayDistributedExecutor")
 else:
     ray_executor_class_v0 = None
     ray_executor_class_v1 = None
     logger.warning(f"ROLL is not tested on vllm version {vllm.__version__}, something strange may happen!!!")
 
-logger.info("Using vllm version {vllm.__version__}")
+logger.info(f"Using vllm version {vllm.__version__}")
 
 
 async def create_async_llm(resource_placement_groups: List[Dict], **kwargs):
@@ -53,7 +59,7 @@ async def create_async_llm(resource_placement_groups: List[Dict], **kwargs):
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
     # torch.cuda may already init, explicitly disable expandable_segments
     # here (only matters when VLLM_USE_RAY_SPMD_WORKER=0)
-    torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+    current_platform.memory._set_allocator_settings("expandable_segments:False")
 
     os.environ["VLLM_CACHE_ROOT"] = os.path.join(get_default_cache_root(), "vllm", os.environ.get("WORKER_NAME", ""))
 
@@ -63,6 +69,10 @@ async def create_async_llm(resource_placement_groups: List[Dict], **kwargs):
 
     # Default fork method is not compatible with Roll.
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+    if Version(torch.__version__) >= Version("2.8.0"):
+        os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+        # os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN" # for 280 rollout pipeline 乱码
 
     engine_args = AsyncEngineArgs(**kwargs)
     # VLLM_USE_V1 may be modified inside create_engine_config

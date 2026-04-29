@@ -32,6 +32,11 @@ class StrategyArguments:
         metadata={"help": "Configuration dictionary for the strategy."},
     )
 
+    def __post_init__(self):
+        # Ensure strategy_config is always a dict, even when YAML sets it to null (~)
+        if self.strategy_config is None:
+            self.strategy_config = {}
+
 @dataclass
 class SequencePackingConfig:
     algorithm: str = field(
@@ -192,7 +197,7 @@ class WorkerConfig:
     )
 
     sequence_packing_args: SequencePackingConfig = field(
-        default= SequencePackingConfig(),
+        default_factory= SequencePackingConfig,
         metadata={
             "help": "Sequence packing related arguments "
         }
@@ -250,6 +255,11 @@ class WorkerConfig:
 
         self.resource_placement_groups: Optional[List[Dict]] = None
         self.checkpoint_config: Optional[Dict] = None
+
+        # Flag to indicate if this worker is configured (has GPU or model path)
+        has_gpu = bool(self.device_mapping)
+        has_model = self.model_args is not None and self.model_args.model_name_or_path is not None
+        self.is_configured: bool = has_gpu or has_model
 
         if hasattr(self, "model_args"):
             if self.model_args.dtype == "bf16":

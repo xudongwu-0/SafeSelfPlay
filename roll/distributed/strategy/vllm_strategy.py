@@ -4,11 +4,13 @@ import gc
 import os
 from collections import deque
 from typing import Dict, List, Optional
+from packaging.version import Version
 
 import torch
 import torch.distributed as dist
 from torch.nn.utils.rnn import pad_sequence
 from transformers import set_seed
+import vllm
 from vllm import RequestOutput, SamplingParams
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, BeamSearchParams
@@ -19,7 +21,11 @@ from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto, list_of_dict_to_dict_of_list
 from roll.distributed.strategy.strategy import InferenceStrategy
 from roll.third_party.vllm import create_async_llm
-from roll.utils.functionals import concatenate_input_and_output, reduce_metrics
+from roll.utils.functionals import (
+    concatenate_input_and_output,
+    reduce_metrics,
+    gather_unpadded_input_ids,
+)
 from roll.utils.logging import get_logger
 from roll.utils.offload_states import OffloadStateType
 from roll.platforms import current_platform
@@ -108,20 +114,14 @@ class VllmStrategy(InferenceStrategy):
 
         self.model = await create_async_llm(resource_placement_groups=self.worker_config.resource_placement_groups, **vllm_config)
 
-        self.tokenizer = await self.model.get_tokenizer()
-        additional_special_tokens = self.tokenizer.additional_special_tokens
-        special_tokens = [
-            add_token
-            for add_token in self.tokenizer.added_tokens_decoder.values()
-            if add_token.special and add_token.content not in additional_special_tokens
-        ]
-        self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": special_tokens}, replace_additional_special_tokens=False
-        )
-        logger.info(f"add {special_tokens} to additional_special_tokens: {self.tokenizer.additional_special_tokens}")
 
-        self.worker.rank_info.dp_rank = self.worker.rank
-        self.worker.rank_info.dp_size = self.worker.world_size
+        if Version("0.15.0") <= Version(vllm.__version__):
+            self.tokenizer = self.model.get_tokenizer()
+        else:
+            self.tokenizer = await self.model.get_tokenizer()
+
+        assert self.worker.rank_info.dp_rank == self.worker.rank
+        assert self.worker.rank_info.dp_size == self.worker.world_size
 
         self.is_model_in_gpu = True
 
@@ -175,7 +175,7 @@ class VllmStrategy(InferenceStrategy):
 
     async def _generate_standard(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:
         """Standard generate method for non-beam search cases."""
-        sampling_params = create_sampling_params_for_vllm(gen_kwargs=generation_config)
+        sampling_params = SamplingParams(**create_sampling_params_for_vllm(gen_kwargs=generation_config))
 
         input_ids = batch.batch["input_ids"]  # (bs, prompt_length)
         attention_mask = batch.batch["attention_mask"]  # left-padded attention_mask
@@ -279,24 +279,12 @@ class VllmStrategy(InferenceStrategy):
 
         return output
 
-    async def generate_request(self, data: DataProto):
-        collect_unfinished = data.meta_info.get("collect_unfinished", False)
-        input_ids = data.batch["input_ids"]
-        attention_mask = data.batch["attention_mask"]
-        request_id = data.meta_info["request_id"]
-        generation_config = data.meta_info.get("generation_config")
-        max_new_tokens = data.meta_info.get("max_new_tokens", generation_config["max_new_tokens"])
-        max_new_tokens = min(max_new_tokens, generation_config["max_new_tokens"])
-        output_kind = RequestOutputKind.CUMULATIVE if collect_unfinished else RequestOutputKind.FINAL_ONLY
-        sampling_params = create_sampling_params_for_vllm(
-            gen_kwargs={**generation_config, "max_new_tokens": max_new_tokens, "output_kind": output_kind}
-        )
-        assert sampling_params.n == 1 or not collect_unfinished, "collect_unfinished is not supported in parallel sampling"
-        if "multi_modal_data" in data.non_tensor_batch:
-            assert len(data.non_tensor_batch["multi_modal_data"]) == 1
-            prompt_token_ids = data.non_tensor_batch["multi_modal_data"][0]["prompt_token_ids"]
-            multi_modal_data = (data.non_tensor_batch["multi_modal_data"][0]["multi_modal_data"]
-                                if "multi_modal_data" in data.non_tensor_batch["multi_modal_data"][0] else None)
+    async def generate_request(self, payload: Dict):
+        if "multi_modal_data" in payload:
+            multi_modal_data = payload["multi_modal_data"]
+            prompt_token_ids = multi_modal_data["prompt_token_ids"]
+            multi_modal_data = (multi_modal_data["multi_modal_data"]
+                                if "multi_modal_data" in multi_modal_data else None)
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids, multi_modal_data=multi_modal_data)
         else:
             assert input_ids.size(0) == 1, f"data['input_ids'] must have exactly one batch dimension"
@@ -307,8 +295,8 @@ class VllmStrategy(InferenceStrategy):
 
         result_generator = self.model.generate(
             prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
+            sampling_params=SamplingParams(**payload["sampling_params"]),
+            request_id=payload["rid"],
             lora_request=lora_request,
         )
         output: Optional[RequestOutput] = None
@@ -320,9 +308,7 @@ class VllmStrategy(InferenceStrategy):
                 output = result
         except asyncio.CancelledError:
             if output is None:
-                output_data = DataProto(meta_info=data.meta_info)
-                output_data.meta_info["finish_reasons"] = ["abort"]
-                return output_data
+                return {"finish_reasons": ["abort"]}
 
         output_token_ids, finish_reasons, logprobs = [], [], []
         for completion_output in output.outputs:
@@ -337,11 +323,11 @@ class VllmStrategy(InferenceStrategy):
                         for token_id, lps in zip(completion_output.token_ids, completion_output.logprobs)
                     ]
                 )
-        output_data = DataProto(meta_info=data.meta_info)
-        output_data.meta_info["output_token_ids"] = output_token_ids
-        output_data.meta_info["finish_reasons"] = finish_reasons
-        output_data.meta_info["output_logprobs"] = logprobs
-        return output_data
+        return {
+            "output_token_ids": output_token_ids,
+            "finish_reasons": finish_reasons,
+            "output_logprobs": logprobs,
+        }
 
     async def abort_requests(self, request_ids):
         for id in request_ids:
@@ -363,8 +349,8 @@ class VllmStrategy(InferenceStrategy):
         gc.collect()
         current_platform.empty_cache()
     
-    def process_weights_after_loading(self,*args, **kwargs):
-        self.model.process_weights_after_loading()
+    async def process_weights_after_loading(self,*args, **kwargs):
+        await self.model.process_weights_after_loading()
 
     # 参数同步相关接口
     async def setup_collective_group(self, master_address, master_port, rank_offset, world_size, group_name, backend=None):
@@ -419,10 +405,6 @@ class VllmStrategy(InferenceStrategy):
         self._metrics_snapshots.clear()
         return reduce_metrics(metrics_snapshots)
 
-def gather_unpadded_input_ids(input_ids: torch.Tensor, attention_mask: torch.Tensor):
-    gathered_input_ids = [ids[mask.bool()].tolist() for ids, mask in zip(input_ids, attention_mask)]
-    return gathered_input_ids
-
 
 def gather_outputs_to_pad_tensor(request_outputs: List["RequestOutput"], pad_token_id, device=None) -> torch.Tensor:
     if device is None:
@@ -436,14 +418,10 @@ def gather_outputs_to_pad_tensor(request_outputs: List["RequestOutput"], pad_tok
     return output_tensor
 
 
-def create_sampling_params_for_vllm(gen_kwargs):
-    # TODO vllm 0.10.2 support partial rollout, and do not need to set RequestOutputKind to CUMULATIVE
-    output_kind = gen_kwargs.get("output_kind", RequestOutputKind.FINAL_ONLY)
-    if output_kind != RequestOutputKind.FINAL_ONLY:
-        assert gen_kwargs["num_return_sequences"] == 1, (
-            "fetch_output only supports num_return_sequences=1 or output_kind=FINAL"
-        )
-    return SamplingParams(
+def create_sampling_params_for_vllm(gen_kwargs, collect_unfinished=False):
+    # TODO vLLM support partial rollout in v1 from 0.10.1, and do not need to set RequestOutputKind to CUMULATIVE
+    output_kind = RequestOutputKind.CUMULATIVE if collect_unfinished else RequestOutputKind.FINAL_ONLY
+    return dict(
         max_tokens=gen_kwargs["max_new_tokens"],
         temperature=gen_kwargs["temperature"],
         top_p=gen_kwargs["top_p"],

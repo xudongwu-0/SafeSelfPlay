@@ -159,6 +159,9 @@ class DeepSpeedInferStrategy(InferenceStrategy):
                 position_ids = data.batch["position_ids"]
                 forward_args = data.meta_info.get("forward_args", {})
                 if position_ids.dim() == 3:
+                    # same as megatron to be compatible with fsdp packing which change position_ids.size(1) to 4
+                    if position_ids.size(1) == 4:
+                        position_ids = position_ids[:, 1:, :].contiguous()  # (bsz, 4, seqlen) -> (bsz, 3, seqlen)
                     # qwen2vl mrope, maybe use a placeholder and let model generate position_ids
                     position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
                 if "multi_modal_inputs" in data.non_tensor_batch:
@@ -551,7 +554,7 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
                     f"synced {num_fp32_synced} fp32 master groups; Adam state cleared")
         return {"lora_A_reset": num_a, "lora_B_reset": num_b}
 
-    def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", local_state_path=None, **kwargs):
+    def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", local_state_path=None, is_last_step=None, **kwargs):
         """
         save ckpt/hf model/tokenizer to local dir
         save_dir/actor_train/{hf files}
@@ -587,9 +590,11 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             if getattr(self, "processor", None):
                 self.processor.save_pretrained(save_dir)
             # save tokenizer
+        # DeepSpeedEngine.load_checkpoint method doesn't take an is_last_step argument
+        kwargs.pop("is_last_step", None)
         self.model.save_checkpoint(save_dir, tag=tag, **kwargs)
 
-        if self.worker_config.checkpoint_config.get("async_upload", True):
+        if self.worker_config.checkpoint_config.get("async_upload", True) and not is_last_step:
             self.thread_executor.submit(self.checkpoint_manager.upload, ckpt_id=ckpt_id, local_state_path=local_state_path)
         else:
             self.checkpoint_manager.upload(ckpt_id=ckpt_id, local_state_path=local_state_path)

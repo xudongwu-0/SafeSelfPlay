@@ -4,15 +4,16 @@ from dataclasses import dataclass
 import torch
 
 from ..converter.dist_converter import (
-    DistParallelConfig,
     default_dist_config,
+    gdn_dist_config,
     register_dist_config,
     shared_moe_dist_config,
 )
 from ..converter.template import (
     ConverOp,
     CopyConverOp,
-    QKVConverOp,
+    GatedQKVConverOp,
+    GDNConv1dConverOp,
     RenameConverOp,
     StackConverOp,
     Template,
@@ -24,9 +25,6 @@ from .modeling_qwen3_next import Qwen3NextModel
 
 @dataclass
 class DropConverOp(ConverOp):
-    def __init__(self, hf_names, mca_names):
-        super().__init__(hf_names, mca_names)
-
     def _hf_to_mca(self, weights):
         return []
 
@@ -35,58 +33,73 @@ class DropConverOp(ConverOp):
 
 
 @dataclass
-class NextQKVConverOp(QKVConverOp):
-    """query weight used for calculating query_states and gate"""
+class NextGDNConverOp(ConverOp):
+    def __post_init__(self):
+        super().__post_init__()
+        assert len(self.hf_names) == 2, f"GDNConverOp only support two hf_names {self.hf_names}"
+        assert len(self.mca_names) == 1, f"GDNConverOp only support one mca_name {self.mca_names}"
+
     def _hf_to_mca(self, weights):
-        if self.hidden_size is None:
-            self.hidden_size = self.mca_config.hidden_size
-        q_weight, k_weight, v_weight = weights
-        nh = self.mca_config.num_attention_heads
-        ng = self.mca_config.num_query_groups
-        dim = self.mca_config.kv_channels
-        assert nh % ng == 0
-        mca_qkv_weight = torch.cat(
+        qkvz_weight, ba_weight = weights
+        hidden_size = self.mca_config.hidden_size
+        qk_head_dim = self.mca_config.linear_key_head_dim
+        v_head_dim = self.mca_config.linear_value_head_dim
+        num_qk_heads = self.mca_config.linear_num_key_heads
+        num_v_heads = self.mca_config.linear_num_value_heads
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+
+        qkvz_reshaped = qkvz_weight.reshape(num_qk_heads, (qk_dim * 2 + v_dim * 2) // num_qk_heads, -1)
+        ba_reshaped = ba_weight.reshape(num_qk_heads, 2 * num_v_heads // num_qk_heads, -1)
+        q, k, v, z = torch.split(
+            qkvz_reshaped,
             [
-                q_weight.reshape((ng, dim * nh // ng * 2, -1)),
-                k_weight.reshape((ng, dim, -1)),
-                v_weight.reshape((ng, dim, -1)),
+                qk_head_dim,
+                qk_head_dim,
+                num_v_heads // num_qk_heads * v_head_dim,
+                num_v_heads // num_qk_heads * v_head_dim,
             ],
             dim=1,
-        ).reshape((-1, self.hidden_size))
-        return mca_qkv_weight
+        )
+        b, a = torch.split(ba_reshaped, [num_v_heads // num_qk_heads, num_v_heads // num_qk_heads], dim=1)
+        q, k, v, z, b, a = [weight.reshape(-1, hidden_size) for weight in [q, k, v, z, b, a]]
+        in_proj_weight = torch.cat([q, k, v, z, b, a], dim=0).reshape(-1, hidden_size)
+        return in_proj_weight
 
     def _mca_to_hf(self, weights):
-        if self.hidden_size is None:
-            self.hidden_size = self.mca_config.hidden_size
-        qkv_weight = weights[0]
-        ng = self.mca_config.num_query_groups
-        nh = self.mca_config.num_attention_heads
-        dim = self.mca_config.kv_channels
-        qkv_weight = qkv_weight.reshape((ng, dim * (nh // ng * 2 + 2), -1))
-        qkv_weights = torch.split(qkv_weight, [dim * nh // ng * 2, dim, dim], dim=1)
-        q_weight = qkv_weights[0].reshape((-1, self.hidden_size))
-        k_weight = qkv_weights[1].reshape((-1, self.hidden_size))
-        v_weight = qkv_weights[2].reshape((-1, self.hidden_size))
-        return [q_weight, k_weight, v_weight]
+        in_proj_weight = weights[0]
+        hidden_size = self.mca_config.hidden_size
+        qk_head_dim = self.mca_config.linear_key_head_dim
+        v_head_dim = self.mca_config.linear_value_head_dim
+        num_qk_heads = self.mca_config.linear_num_key_heads
+        num_v_heads = self.mca_config.linear_num_value_heads
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+
+        in_proj_weight = in_proj_weight.reshape(-1, hidden_size)
+        q, k, v, z, b, a = torch.split(in_proj_weight, [qk_dim, qk_dim, v_dim, v_dim, num_v_heads, num_v_heads], dim=0)
+        q, k, v, z, b, a = [weight.reshape(num_qk_heads, -1, hidden_size) for weight in [q, k, v, z, b, a]]
+        qkvz_weight = torch.cat([q, k, v, z], dim=1).reshape(-1, hidden_size)
+        ba_weight = torch.cat([b, a], dim=1).reshape(-1, hidden_size)
+        return [qkvz_weight, ba_weight]
 
 
-linear_attn_dist_config = DistParallelConfig(
-    # TODO: support tensor parallel
-    duplicated_weights=[
-        ".self_attention.in_proj_qkvz.weight",
-        ".self_attention.in_proj_ba.weight",
-        ".self_attention.conv1d.weight",
-        ".self_attention.dt_bias",
-        ".self_attention.A_log",
-        ".self_attention.norm.weight",
-        ".self_attention.out_proj.weight",
-        ".input_layernorm.weight",
-    ]
-)
+@dataclass
+class ZeroCenteredRMSNormConverOp(ConverOp):
+    def __post_init__(self):
+        super().__post_init__()
+        assert len(self.hf_names) == 1, f"ZeroCenteredRMSNormConverOp only support one name {self.hf_names}"
+        assert len(self.mca_names) == 1, f"ZeroCenteredRMSNormConverOp only support one name {self.mca_names}"
+
+    def _hf_to_mca(self, weights):
+        return weights[0].clone() - 1
+
+    def _mca_to_hf(self, weights):
+        return weights[0].clone() + 1
 
 
 register_dist_config(
-    "qwen3_next", default_dist_config.merge_configs(shared_moe_dist_config).merge_configs(linear_attn_dist_config)
+    "qwen3_next", default_dist_config.merge_configs(shared_moe_dist_config).merge_configs(gdn_dist_config)
 )
 
 
@@ -97,11 +110,11 @@ class Qwen3NextTemplate(Template):
         match = re.match(pattern, name)
         layer_idx = int(match.group(1)) if match else None
         if layer_idx is not None and self.mca_config.layer_types[layer_idx] == "linear_attention":
-            return {f"decoder.layers.{layer_idx}.input_layernorm.weight": weight}
+            return {f"decoder.layers.{layer_idx}.self_attention.in_proj.layer_norm_weight": weight}
         return super().add_hf_weight(name, weight)
 
     def add_mca_weight(self, name, weight, **kwargs):
-        pattern = r"^decoder\.layers\.(\d+)\.input_layernorm\.weight$"
+        pattern = r"^decoder\.layers\.(\d+)\.self_attention\.in_proj\.layer_norm_weight$"
         match = re.match(pattern, name)
         if not match:
             return super().add_mca_weight(name, weight, **kwargs)
@@ -121,8 +134,8 @@ class Qwen3NextTemplate(Template):
         elif isinstance(op, StackConverOp):
             op_class = StackConverOp
             kwargs = {"dim": op.dim}
-        elif isinstance(op, NextQKVConverOp):
-            op_class = NextQKVConverOp
+        elif isinstance(op, GatedQKVConverOp):
+            op_class = GatedQKVConverOp
             kwargs = {"hidden_size": lora_rank}
         else:
             raise ValueError(f"can not find lora conver op for {name} in {pattern_to_conver_ops}")
@@ -169,7 +182,7 @@ register_template(
         # other special configs
         # "mlp_only_layers": "mlp_only_layers",
         "layer_types": "layer_types",
-        "full_attention_interval": "full_attention_interval",
+        "full_attention_interval": "linear_attention_freq",
     },
     constant_mca_config={
         "swiglu": True,
@@ -181,9 +194,11 @@ register_template(
         "moe_router_load_balancing_type": "aux_loss",
         "moe_router_pre_softmax": False,
         "qk_layernorm": True,
-        "moe_use_shared_expert_gate": True,
+        "moe_shared_expert_gate": True,
         "layernorm_zero_centered_gamma": True,
         "hetereogenous_dist_checkpoint": True,
+        "attention_output_gate": True,
+        "experimental_attention_variant": "gated_delta_net",
     },
     weight_converters=[
         RenameConverOp(hf_names="lm_head.weight", mca_names="output_layer.weight"),
@@ -205,7 +220,7 @@ register_template(
             dim=0,
         ),
         # Multi-head attention
-        NextQKVConverOp(
+        GatedQKVConverOp(
             hf_names=[".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight"],
             mca_names=".self_attention.linear_qkv.weight",
         ),
@@ -213,17 +228,18 @@ register_template(
         RenameConverOp(hf_names=".self_attn.q_norm.weight", mca_names=".self_attention.q_layernorm.weight"),
         RenameConverOp(hf_names=".self_attn.k_norm.weight", mca_names=".self_attention.k_layernorm.weight"),
         # Linear attention
-        RenameConverOp(hf_names=".linear_attn.in_proj_qkvz.weight", mca_names=".self_attention.in_proj_qkvz.weight"),
-        RenameConverOp(hf_names=".linear_attn.in_proj_ba.weight", mca_names=".self_attention.in_proj_ba.weight"),
-        RenameConverOp(hf_names=".linear_attn.conv1d.weight", mca_names=".self_attention.conv1d.weight"),
+        NextGDNConverOp(
+            hf_names=[".linear_attn.in_proj_qkvz.weight", ".linear_attn.in_proj_ba.weight"],
+            mca_names=".self_attention.in_proj.weight",
+        ),
+        GDNConv1dConverOp(hf_names=".linear_attn.conv1d.weight", mca_names=".self_attention.conv1d.weight"),
         RenameConverOp(hf_names=".linear_attn.dt_bias", mca_names=".self_attention.dt_bias"),
         RenameConverOp(hf_names=".linear_attn.A_log", mca_names=".self_attention.A_log"),
-        RenameConverOp(hf_names=".linear_attn.norm.weight", mca_names=".self_attention.norm.weight"),
+        ZeroCenteredRMSNormConverOp(hf_names=".linear_attn.norm.weight", mca_names=".self_attention.out_norm.weight"),
         RenameConverOp(hf_names=".linear_attn.out_proj.weight", mca_names=".self_attention.out_proj.weight"),
         # MTP not support
         DropConverOp(hf_names="mtp.*", mca_names=[]),
     ],
 )
-
 
 __all__ = ["Qwen3NextConfig", "Qwen3NextModel"]

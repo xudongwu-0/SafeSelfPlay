@@ -2,7 +2,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
-from roll.configs.base_config import PPOConfig
+from roll.configs.base_config import PPOConfig, RouterArguments
 from roll.configs.worker_config import WorkerConfig
 from roll.utils.logging import get_logger
 
@@ -106,6 +106,10 @@ class RLVRConfig(PPOConfig):
         default_factory=dict,
         metadata={"help": "Configuration for the multi domain rewards."}
     )
+    reward_model: Optional[WorkerConfig] = field(
+        default=None,
+        metadata={"help": "Configuration for the shared reward model cluster (InferWorker + vLLM)."}
+    )
 
     # PPO related
     difficulty_loss_weight: bool = field(default=False, metadata={"help": "Use difficulty_loss_weight"})
@@ -147,6 +151,11 @@ class RLVRConfig(PPOConfig):
     error_max_len_threshold: int = field(default=9999999999)
 
     def __post_init__(self):
+        # Handle OPD mapping FIRST before any access to actor_train/actor_infer/reference
+        # This ensures student_train/student_infer/teacher are mapped correctly
+        self._handle_opd_mapping()
+
+        # Now safe to access actor_infer (may have been mapped from student_infer)
         self.actor_infer.generating_args.num_return_sequences = self.num_return_sequences_in_group
         super().__post_init__()
 
@@ -159,6 +168,12 @@ class RLVRConfig(PPOConfig):
             self.reference.worker_cls = "roll.pipeline.rlvr.actor_worker.ActorWorker"
         if self.critic.worker_cls is None:
             self.critic.worker_cls = "roll.pipeline.base_worker.CriticWorker"
+        if self.reward_model is not None and self.reward_model.worker_cls is None:
+            self.reward_model.worker_cls = "roll.pipeline.base_worker.InferWorker"
+
+        if self.router_args is None:
+            self.router_args = RouterArguments(router_name="PromptAffinityRouter", router_config=dict())
+            self.router_args.max_running_requests = self.max_running_requests
 
         logger.info(f"actor_train.worker_cls: {self.actor_train.worker_cls}")
 
@@ -219,6 +234,9 @@ class RLVRConfig(PPOConfig):
                 self.num_nodes = 1
             else:
                 self.num_nodes = (max_gpu_num + self.num_gpus_per_node - 1) // self.num_gpus_per_node
+
+        # Apply OPD configuration at the end (handles student_train/student_infer/teacher mapping)
+        self._apply_opd_config()
 
     def to_dict(self):
         return dataclasses.asdict(self)

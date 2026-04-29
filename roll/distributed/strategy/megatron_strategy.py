@@ -33,13 +33,13 @@ from megatron.core.transformer.moe.moe_utils import (
     reduce_aux_losses_tracker_across_ranks,
 )
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
-from megatron.core.packed_seq_params import PackedSeqParams
+from transformers.utils import is_peft_available
 
 from mcore_adapter import TrainingArguments
 from mcore_adapter.checkpointing import get_checkpoint_dir, load_state_dict_from_checkpoint
 from mcore_adapter.parallel_functions import context_parallel_gather, vocab_parallel_logprobs
 from mcore_adapter.patcher import patch_torch_find_nd_overlapping_shards, patch_torch_validate_global_plan
-from mcore_adapter.trainer.utils import get_megatron_lr_scheduler
+from mcore_adapter.trainer.utils import build_sharded_state_dict_metadata, get_megatron_lr_scheduler
 from roll.datasets.collator import collate_fn_to_dict_list
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto
@@ -64,7 +64,7 @@ from roll.utils.constants import (
 )
 from roll.utils.context_managers import disable_gradients
 from roll.utils.dynamic_batching import make_micro_batch_iter_for_dynamic_batching
-from roll.utils.functionals import append_to_dict, reduce_metrics, adjust_sequence_length
+from roll.utils.functionals import adjust_sequence_length, append_to_dict, reduce_metrics
 from roll.utils.logging import get_logger
 from roll.utils.offload_states import OffloadStateType
 from roll.utils.sequence_packing import make_micro_batch_iter_for_sequence_packing, restore_results_order
@@ -72,6 +72,11 @@ from roll.utils.sequence_packing import make_micro_batch_iter_for_sequence_packi
 
 if TYPE_CHECKING:
     from mcore_adapter.models.model_factory import VirtualModels
+
+
+if is_peft_available():
+    from peft import PeftModel, get_peft_model_state_dict
+
 
 logger = get_logger()
 
@@ -89,6 +94,7 @@ class MegatronInferStrategy(InferenceStrategy):
         # maybe put max_grad_norm into training_args as transformers do, rather
         # than in pipeline_config (PPOConfig)
         config_dict.update({"max_grad_norm": self.worker.pipeline_config.max_grad_norm})
+        config_dict.setdefault("lr_scheduler_kwargs", {})
         logger.info(f"training_args: {config_dict}")
         self.megatron_train_args = TrainingArguments(**config_dict)
         self.model = None
@@ -1052,6 +1058,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 mpu.get_data_parallel_group(with_context_parallel=True),
                 do_cache_distribution=True,
             )
+            self.ckpt_sharding_metadata = build_sharded_state_dict_metadata(self.megatron_train_args)
 
         if self.megatron_train_args.overlap_grad_reduce:
             model_config = self.model.config
@@ -1232,7 +1239,19 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         # save model and tokenizer
         if len(self.models_unwrapped) == 1:
-            self.models_unwrapped[0].save_pretrained(save_dir)
+            if is_peft_available() and isinstance(self.models_unwrapped[0], PeftModel):
+                for adapter_name, peft_config in self.models_unwrapped[0].peft_config.items():
+                    adapter_save_directory = os.path.join(save_dir, adapter_name)
+                    peft_config.save_pretrained(adapter_save_directory)
+                    peft_state_dict = get_peft_model_state_dict(
+                        self.models_unwrapped[0], self.models_unwrapped[0].state_dict_for_save_checkpoint(), adapter_name
+                    )
+                    self.models_unwrapped[0].base_model.model.save_pretrained(
+                        adapter_save_directory, state_dict={"model": peft_state_dict}
+                    )
+                self.models_unwrapped[0].config.save_pretrained(save_dir)
+            else:
+                self.models_unwrapped[0].save_pretrained(save_dir)
         else:
             state_dict = {f"model{i}": model.state_dict_for_save_checkpoint() for i, model in
                           enumerate(self.models_unwrapped)}
@@ -1251,8 +1270,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         os.makedirs(checkpoint_dir, exist_ok=True)
         if self.megatron_train_args.use_distributed_optimizer:
             model_shared_state_dict = self.model.sharded_state_dict()
-            optimizer_state_dict = self.optimizer.sharded_state_dict(model_shared_state_dict,
-                                                                     sharding_type="fully_sharded_model_space")
+            optimizer_state_dict = self.optimizer.sharded_state_dict(
+                model_shared_state_dict, metadata=self.ckpt_sharding_metadata
+            )
             dist_checkpointing.save(
                 optimizer_state_dict,
                 checkpoint_dir=checkpoint_dir,
@@ -1261,7 +1281,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 validate_access_integrity=self._validate_access_integrity,
             )
             self._validate_access_integrity = False
-        elif not dist.is_initialized() or mpu.get_data_modulo_expert_parallel_rank() == 0:
+        elif not dist.is_initialized() or mpu.get_expert_data_parallel_rank() == 0:
             torch.save(self.optimizer.state_dict(), os.path.join(checkpoint_dir, OPTIMIZER_NAME))
             logger.info(f"Saving optimizer state to {os.path.join(checkpoint_dir, OPTIMIZER_NAME)}")
 
@@ -1312,7 +1332,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         if self.megatron_train_args.use_distributed_optimizer:
             model_shared_state_dict = self.model.sharded_state_dict()
             sharded_state_dict = self.optimizer.sharded_state_dict(
-                model_shared_state_dict, is_loading=True, sharding_type="fully_sharded_model_space"
+                model_shared_state_dict, is_loading=True, metadata=self.ckpt_sharding_metadata
             )
             load_strategy = dist_checkpointing.serialization.get_default_load_sharded_strategy(optimizer_checkpoint)
             load_strategy = FullyParallelLoadStrategyWrapper(
