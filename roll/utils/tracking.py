@@ -114,7 +114,21 @@ class WandbTracker(BaseTracker):
         import wandb
         if api_key:
             wandb.login(key=api_key)
-        self.run = wandb.init(project=project, tags=tags, name=name, notes=notes, dir=log_dir, mode=mode, settings=settings)
+        # Retry wandb.init on transient CommError (90s default timeout can flake).
+        # Use a longer init_timeout and bounded retries with backoff.
+        if isinstance(settings, dict):
+            settings = {**settings, "init_timeout": 300}
+        import time
+        last_err = None
+        for attempt in range(5):
+            try:
+                self.run = wandb.init(project=project, tags=tags, name=name, notes=notes, dir=log_dir, mode=mode, settings=settings)
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(min(2 ** attempt * 5, 60))
+        else:
+            raise last_err
 
         self.run.config.update(config, allow_val_change=True)
 

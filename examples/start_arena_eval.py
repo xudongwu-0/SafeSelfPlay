@@ -77,7 +77,7 @@ def main():
     parser = argparse.ArgumentParser(description="Standalone arena evaluation for FSP models")
     parser.add_argument("--config_path", default="agentic_demo")
     parser.add_argument("--config_name", default="agent_kuhn_poker_fsp_train")
-    parser.add_argument("--checkpoint_dir", required=True, help="Dir to search for LoRA checkpoints")
+    parser.add_argument("--checkpoint_dir", default=None, help="Dir to search for LoRA checkpoints")
     parser.add_argument("--output_dir", default="./arena_eval_output")
     parser.add_argument("--episodes_per_pair", type=int, default=16)
     parser.add_argument("--max_concurrent", type=int, default=32)
@@ -86,6 +86,8 @@ def main():
     parser.add_argument("--save_trajectories", action="store_true")
     parser.add_argument("--env_tag", default=None, help="Override env tag (default: first in config)")
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--self_play", action="store_true",
+                        help="Run base model vs itself (diagnostic, no checkpoints needed)")
     args, overrides = parser.parse_known_args()
 
     # --- Load config ---
@@ -100,11 +102,19 @@ def main():
     pipeline_config.actor_infer.device_mapping = list(range(num_gpus))
     num_gpus_per_worker = pipeline_config.actor_infer.num_gpus_per_worker or 1
     pipeline_config.actor_infer.world_size = num_gpus // num_gpus_per_worker
+    # Arena eval is single-node and only uses actor_infer; ignore train device_mapping
+    pipeline_config.num_nodes = 1
 
     # --- Discover checkpoints ---
-    lora_paths = discover_checkpoints(
-        args.checkpoint_dir, include_base=not args.no_base_model, max_n=args.max_checkpoints,
-    )
+    if args.self_play:
+        lora_paths: List[Optional[str]] = [None, None]
+    else:
+        if not args.checkpoint_dir:
+            logger.error("--checkpoint_dir is required unless --self_play is set")
+            return
+        lora_paths = discover_checkpoints(
+            args.checkpoint_dir, include_base=not args.no_base_model, max_n=args.max_checkpoints,
+        )
     labels = ["base_model" if p is None else os.path.basename(p) for p in lora_paths]
     logger.info(f"Discovered {len(lora_paths)} models: {labels}")
     if len(lora_paths) < 2:

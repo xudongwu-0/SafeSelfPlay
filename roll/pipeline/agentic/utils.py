@@ -97,6 +97,56 @@ def compute_discounted_returns(batch: DataProto, adv_estimator, gamma=1.0) -> Da
 
 # TODO: 这里的功能性和rlvr比较接近，但因为后续agentic会有潜在的修改需求，所以就先拎出来
 @torch.no_grad()
+def _blended_baseline_norm(
+    scores: torch.Tensor,
+    opponent_ids: np.ndarray,
+    c: float = 3.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Empirical Bayesian Shrinkage normalization for multi-opponent GRPO.
+
+    Blends per-opponent statistics with global batch statistics. λ_k = n_k / (n_k + c).
+    High n_k → local baseline; low n_k → global baseline. Handles n_k == 1 without NaN.
+    """
+    eps = 1e-5
+    device = scores.device
+    s = scores.float()
+
+    mu_g = s.mean()
+    var_g = ((s - mu_g) ** 2).mean()
+
+    advantages = torch.zeros_like(s)
+    unique_opps = np.unique(opponent_ids)
+    lambdas: List[float] = []
+    n_ks: List[int] = []
+
+    for opp_id in unique_opps:
+        opp_mask = torch.from_numpy(opponent_ids == opp_id).to(device)
+        opp_scores = s[opp_mask]
+        n_k = opp_scores.numel()
+        n_ks.append(n_k)
+
+        mu_k = opp_scores.mean()
+        # n_k == 1: local variance is 0 by definition (single sample, no spread)
+        var_k = ((opp_scores - mu_k) ** 2).mean() if n_k > 1 else s.new_zeros(1).squeeze()
+
+        lambda_k = n_k / (n_k + c)
+        lambdas.append(lambda_k)
+
+        mu_hat = lambda_k * mu_k + (1 - lambda_k) * mu_g
+        var_hat = lambda_k * var_k + (1 - lambda_k) * var_g
+        sigma_hat = torch.sqrt(var_hat.clamp(min=0.0))
+
+        advantages[opp_mask] = (opp_scores - mu_hat) / (sigma_hat + eps)
+
+    metrics: Dict[str, float] = {
+        "critic/blended/unique_opponents": float(len(unique_opps)),
+        "critic/blended/mean_n_k": float(np.mean(n_ks)),
+        "critic/blended/mean_lambda": float(np.mean(lambdas)),
+    }
+    return advantages.to(dtype=scores.dtype), metrics
+
+
+@torch.no_grad()
 def agentic_reward_norm(
     batch: "DataProto",
     reward_normalization: RewardNormalizationConfig,
@@ -109,6 +159,25 @@ def agentic_reward_norm(
             members have the same score (std < 1e-6). This prevents GRPO from
             producing near-zero advantages that provide no learning signal.
     """
+    assert not (filter_zero_variance_groups and reward_normalization.grouping == "traj_group_id"), (
+        "filter_zero_variance_groups and grouping='traj_group_id' are mutually exclusive: "
+        "small traj_group_id groups will frequently be zero-variance by chance, "
+        "silently discarding most of the batch."
+    )
+    if reward_normalization.blended_baseline_c is not None:
+        if filter_zero_variance_groups:
+            raise ValueError(
+                "blended_baseline_c and filter_zero_variance_groups cannot both be set: "
+                "shrinkage already handles the zero-variance case via the global variance floor."
+            )
+        if "opponent_id" not in batch.non_tensor_batch:
+            raise ValueError(
+                "blended_baseline_c requires 'opponent_id' in non_tensor_batch. "
+                "Ensure TwoPlayerTrajEnvManager.formulate_rollouts() stores it."
+            )
+        scores = batch.batch["scores"]
+        opponent_ids = batch.non_tensor_batch["opponent_id"]
+        return _blended_baseline_norm(scores, opponent_ids, c=reward_normalization.blended_baseline_c)
     batch.batch["sample_order_placeholder"] = torch.arange(batch.batch.batch_size[0], device=batch.batch.device)
     grouping = reward_normalization.grouping
     norm_mean_type = reward_normalization.norm_mean_type

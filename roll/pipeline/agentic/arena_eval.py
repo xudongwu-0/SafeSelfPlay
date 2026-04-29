@@ -33,7 +33,7 @@ def _build_trajectory(
     player_i_lora: Optional[str],
     player_j_lora: Optional[str],
     seed: int,
-    win_rate: float,
+    payoff: float,
 ) -> dict:
     """Build trajectory dict from env_manager state after an episode, matching training log format."""
     history = env_manager.rollout_cache.history
@@ -58,7 +58,7 @@ def _build_trajectory(
         "player_i": _get_model_label(player_i_lora),
         "player_j": _get_model_label(player_j_lora),
         "seed": seed,
-        "win_rate": win_rate,
+        "payoff": payoff,
         "turns": turns,
         "episode_score": sum(scores),
         "step_scores": scores,
@@ -175,7 +175,7 @@ def play_episode(
     src_rank_base: int,
     save_trajectory: bool = False,
 ) -> Union[float, Tuple[float, dict]]:
-    """Play one episode between player_i and player_j. Returns win rate from player_i's perspective.
+    """Play one episode between player_i and player_j. Returns payoff (EV) from player_i's perspective.
 
     Reuses format_messages() and step() from TwoPlayerTrajEnvManager for identical
     prompt formatting and opponent generation logic as during rollout.
@@ -242,16 +242,12 @@ def play_episode(
         if rollout_cache.terminated:
             break
 
-    step_count = env_manager.env.step_count
-    if step_count == 0:
-        win_rate = 0.5
-    else:
-        win_rate = env_manager.env.wins / step_count
+    payoff = env_manager.env.final_reward if env_manager.env.step_count > 0 else 0.0
 
     if save_trajectory:
-        traj = _build_trajectory(env_manager, tokenizer, player_i_lora, player_j_lora, seed, win_rate)
-        return win_rate, traj
-    return win_rate
+        traj = _build_trajectory(env_manager, tokenizer, player_i_lora, player_j_lora, seed, payoff)
+        return payoff, traj
+    return payoff
 
 
 def run_arena_evaluation(
@@ -278,10 +274,10 @@ def run_arena_evaluation(
         seed_base: Base seed for reproducibility.
 
     Returns:
-        N×N numpy array where M[i][j] = win rate of model i over model j.
+        N×N numpy array where M[i][j] = payoff (expected chips won) of model i against model j.
     """
     n = len(lora_paths)
-    payoff_matrix = np.full((n, n), 0.5)  # diagonal = 0.5
+    payoff_matrix = np.full((n, n), 0.0)  # diagonal = 0.0 (self-play EV)
     worker_config = pipeline_config.train_env_manager
 
     # Pre-create env_managers (one per concurrent slot)
@@ -356,14 +352,14 @@ def run_arena_evaluation(
                 try:
                     result = future.result()
                     if save_trajectories:
-                        win_rate, traj = result
+                        payoff, traj = result
                         all_trajectories.append(traj)
                     else:
-                        win_rate = result
-                    results[(i, j)].append(win_rate)
+                        payoff = result
+                    results[(i, j)].append(payoff)
                 except Exception as e:
                     logger.error(f"Arena episode ({i},{j}) ep={ep} failed: {e}")
-                    results[(i, j)].append(0.5)  # fallback
+                    results[(i, j)].append(0.0)  # fallback
 
                 em_available.append(em_idx)
                 completed += 1
@@ -372,9 +368,9 @@ def run_arena_evaluation(
 
                 submit_batch()
 
-    # Compute mean win rates
-    for (i, j), win_rates in results.items():
-        payoff_matrix[i][j] = np.mean(win_rates) if win_rates else 0.5
+    # Compute mean payoffs
+    for (i, j), payoffs in results.items():
+        payoff_matrix[i][j] = np.mean(payoffs) if payoffs else 0.0
 
     if save_trajectories:
         return payoff_matrix, all_trajectories
@@ -395,7 +391,7 @@ def log_payoff_matrix(payoff_matrix: np.ndarray, lora_paths: List[Optional[str]]
 
     header = " " * col_width + "".join(f"{l:>{col_width}}" for l in labels)
     logger.info("=" * 60)
-    logger.info("Arena Evaluation Payoff Matrix (row i vs col j = win rate of i)")
+    logger.info("Arena Evaluation Payoff Matrix (row i vs col j = payoff EV of i)")
     logger.info("=" * 60)
     logger.info(header)
     for i, row in enumerate(payoff_matrix):
@@ -428,6 +424,32 @@ def save_payoff_matrix(
         json.dump(data, f, indent=2)
     logger.info(f"Arena payoff matrix saved to {filepath}")
     return filepath
+
+
+def tracker_log_payoff_matrix(
+    payoff_matrix: np.ndarray,
+    lora_paths: List[Optional[str]],
+    tracker,
+    step: int,
+) -> None:
+    """Log payoff matrix to tracker: scalars for all trackers, Table for wandb."""
+    from roll.utils.tracking import WandbTracker
+
+    n = len(lora_paths)
+    labels = [_get_model_label(p) for p in lora_paths]
+
+    metrics = {}
+    for i, label in enumerate(labels):
+        off_diag = [payoff_matrix[i][j] for j in range(n) if i != j]
+        metrics[f"arena/mean_payoff/{label}"] = float(np.mean(off_diag)) if off_diag else 0.0
+
+    if isinstance(tracker, WandbTracker):
+        import wandb
+        columns = ["model"] + labels
+        data = [[labels[i]] + [round(float(payoff_matrix[i][j]), 4) for j in range(n)] for i in range(n)]
+        metrics["arena/payoff_matrix"] = wandb.Table(columns=columns, data=data)
+
+    tracker.log(values=metrics, step=step)
 
 
 def save_trajectories_jsonl(trajectories: List[dict], output_dir: str) -> str:

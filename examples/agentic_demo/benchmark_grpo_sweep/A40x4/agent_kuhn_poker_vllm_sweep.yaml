@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - ../agent_kuhn_poker_single_rl
+  - ../../agent_kuhn_poker_single_rl
 
 # vLLM inference parameter sweep base config
 max_steps: 5

@@ -104,6 +104,10 @@ class TrajEnvManager(BaseEnvManager):
         assert "seed" in data.meta_info
         self.running = True
         self.group_seed = data.meta_info['seed'] + self.env_config['group_seed']
+        self.logger.debug(
+            f"[seed] group_id={self.env_config['group_id']} env_id={self.env_config['env_id']} "
+            f"group_seed={self.group_seed}"
+        )
         rollout_cache: RolloutCache = self.reset()
         start_step = self.current_step
 
@@ -120,6 +124,14 @@ class TrajEnvManager(BaseEnvManager):
             with Timer(name="step", logger=None) as step_timer:
                 if stop_reason == GenerateStopReason.FINISH:
                     rollout_cache: RolloutCache = self.step(lm_output)
+                    if getattr(self.pipeline_config, "debug_log_agent_response", False) and len(self.rollout_cache.history) >= 2:
+                        prev = self.rollout_cache.history[-2]
+                        self.logger.info(
+                            f"[agent_response] env_id={self.env_config['env_id']} step={self.rollout_cache.step}\n"
+                            f"=== OBSERVATION ===\n{prev.get('observation', '')}\n"
+                            f"=== RESPONSE ===\n{prev.get('llm_response', '')}\n"
+                            f"=== REWARD ===\n{prev.get('reward', 'N/A')}\n"
+                        )
             log_stats["step_time"].append(step_timer.last)
 
             if self.running and (rollout_cache.terminated or stop_reason == GenerateStopReason.MAX_LENGTH):
@@ -242,7 +254,9 @@ class TrajEnvManager(BaseEnvManager):
 
         messages = []
         user_content = ""
-        if content["actions_left"] == self.env_config.max_steps:
+        is_first_turn = content["actions_left"] == self.env_config.max_steps
+        fresh = content.get("fresh_conversation", False)
+        if is_first_turn or fresh:
             messages.append({"role": "system", "content": self.agent_system_template})
             if "env_instruction" in history.history[0]:
                 user_content =  f"{history.history[0]['env_instruction']}\n"
@@ -261,11 +275,12 @@ class TrajEnvManager(BaseEnvManager):
             user_content += self.agent_template.format(**render_dict)
             messages.append({"role": "user", "content": user_content})
 
-        prompt_ids = custom_apply_chat_template(messages=messages, tokenizer=self.tokenizer, add_generation_prompt=True, skip_mock_system_prompt=self.pipeline_config.skip_mock_system_prompt)
+        prompt_ids = custom_apply_chat_template(messages=messages, tokenizer=self.tokenizer, add_generation_prompt=True, template_name=self.pipeline_config.actor_infer.data_args.template)
         history_token_ids = []
-        for items in self.rollout_cache.history[:-1]:
-            history_token_ids.extend(items["prompt_ids"])
-            history_token_ids.extend(items["response_ids"])
+        if not fresh:
+            for items in self.rollout_cache.history[:-1]:
+                history_token_ids.extend(items["prompt_ids"])
+                history_token_ids.extend(items["response_ids"])
         if len(history_token_ids):
             prompt_ids = compute_conversation_end_token_id(self.tokenizer) + prompt_ids
         input_ids = history_token_ids + prompt_ids
@@ -315,6 +330,10 @@ class TrajEnvManager(BaseEnvManager):
             if "infer_logprobs" in items:
                 infer_logprobs.extend([0] * len(items["prompt_ids"]) + items["infer_logprobs"])
 
+        pre_pad_len = len(token_ids)
+        seq_len = self.pipeline_config.sequence_length
+        is_truncated = pre_pad_len > seq_len
+
         input_ids =torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
         attention_mask = torch.tensor([1] * len(token_ids), dtype=torch.long).unsqueeze(0)
         response_mask = torch.tensor(response_masks, dtype=torch.bool).unsqueeze(0)
@@ -323,7 +342,15 @@ class TrajEnvManager(BaseEnvManager):
         prompt_masks = [1] * first_response_idx + [0] * (len(token_ids) - first_response_idx)
         prompt_mask =torch.tensor(prompt_masks, dtype=torch.bool).unsqueeze(0)
         score_tensor = torch.tensor([0] * len(token_ids), dtype=torch.float).unsqueeze(0)
-        score_tensor[0][-1] = episode_score
+        if is_truncated:
+            # reward at [-1] would be cut by pad_to_length; place it at last response token in window
+            last_resp_in_window = next(
+                (i for i in range(min(pre_pad_len, seq_len) - 1, -1, -1) if response_masks[i] == 1),
+                seq_len - 1,
+            )
+            score_tensor[0][last_resp_in_window] = episode_score
+        else:
+            score_tensor[0][-1] = episode_score
         # Huggingface Transformers prefer position_ids to be 0-based.
         # Attn Mask: [1, 1, 1, ..., 1, 0, 0, ..., 0]
         # cumsum: [1, 2, 3, ..., n, n+1, n+1, ..., n+1]
@@ -374,8 +401,13 @@ class TrajEnvManager(BaseEnvManager):
         history_metrics = [item.get("metrics", {}) for item in self.rollout_cache.history]
         env_metric = aggregate_metrics(history_metrics=history_metrics, metrics_agg_mode=metrics_agg_mode)
         env_metric["num_actions"] = rollout_cache.step
+        env_metric["truncated"] = 1.0 if is_truncated else 0.0
+        env_metric["seq_len"] = float(pre_pad_len)
 
-        env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
+        env_metric = {
+            k if k.startswith("reasoning/") else f"env/{rollout_cache.tag}/{k}": v
+            for k, v in env_metric.items()
+        }
         env_metric["env/response_length"] = response_length
         lm_input.meta_info = {"metrics": env_metric}
         return lm_input

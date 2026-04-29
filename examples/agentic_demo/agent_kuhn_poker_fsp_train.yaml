@@ -10,7 +10,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "kuhn_fsp_5lora_klloss0p01_ga16_gs8_coldstart"
+exp_name: "kuhn_3b_acttag_fix"
 seed: 42
 logging_dir: /projects/bfoz/wchen11/kuhn_poker_output/logs
 output_dir: /projects/bfoz/wchen11/kuhn_poker_output
@@ -23,6 +23,9 @@ tracker_kwargs:
   tags:
     - kuhn_poker
     - fsp_train
+    - qwen2_5_3b
+    - cold_start
+    - async
     - auton
 
 checkpoint_config:
@@ -37,9 +40,15 @@ save_steps: 10000
 logging_steps: 1
 eval_steps: 50
 resume_from_checkpoint: false
-fsp_save_steps: 60
+fsp_save_steps: 50
+fsp_opponent_weight_mode: uniform
+fsp_win_rate_threshold: 0.6
+fsp_win_rate_window: 10
+fsp_win_rate_timeout: 150
+cold_start: true
+async_generation_ratio: 1
 
-rollout_batch_size: 128
+rollout_batch_size: 264
 val_batch_size: 8
 sequence_length: 1024
 
@@ -49,6 +58,7 @@ adv_estimator: "grpo"
 init_kl_coef: 0.01
 use_kl_loss: true
 kl_loss_coef: 0.01
+kl_loss_coef_end: -1.0
 whiten_advantages: true
 entropy_loss_coef: 0
 max_grad_norm: 1.0
@@ -58,9 +68,9 @@ reward_pretrain: Qwen/Qwen2.5-3B-Instruct
 
 actor_train:
   model_args:
-    flash_attn: sdpa
-    disable_gradient_checkpointing: true
-    dtype: fp16
+    flash_attn: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
     model_type: ~
     lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
     lora_rank: 32
@@ -69,7 +79,7 @@ actor_train:
     learning_rate: 2.0e-5
     weight_decay: 0
     per_device_train_batch_size: 4
-    gradient_accumulation_steps: 16
+    gradient_accumulation_steps: 11
     warmup_steps: 2
     lr_scheduler_type: cosine
   data_args:
@@ -77,14 +87,18 @@ actor_train:
   strategy_args:
     strategy_name: deepspeed_train
     strategy_config: ${deepspeed_zero2}
-  device_mapping: "[0]"
-  infer_batch_size: 1
+  device_mapping: "[0,1,2]"
+  infer_batch_size: 4
+  use_dynamic_batching_in_train: false
+  max_tokens_per_microbatch_in_train: 0
+  sequence_length_round_in_train: 4
+  use_inner_dynamic_batching_in_train: false
 
 actor_infer:
   model_args:
     flash_attn: sdpa
     disable_gradient_checkpointing: true
-    dtype: fp16
+    dtype: bf16
     lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
     lora_rank: 32
     lora_alpha: 32
@@ -103,23 +117,22 @@ actor_infer:
       gpu_memory_utilization: 0.92
       block_size: 16
       load_format: auto
-      max_loras: 6
+      max_loras: 7  # ceil(max_steps/fsp_save_steps) + 1 = 300/50 + 1
       enforce_eager: false
-      max_num_batched_tokens: 16384
-  device_mapping: list(range(1,4))
-  infer_batch_size: 1
+      max_num_batched_tokens: 4096
+  device_mapping: "[3]"
+  infer_batch_size: 4
 
-reward_normalization:
-  grouping: tags
-  method: identity
+reward_normalization: {}
 
 train_env_manager:
   format_penalty: -0.01
   max_env_num_per_worker: 64
-  num_env_groups: 32
+  num_env_groups: 33
   group_size: 8
   tags: [KuhnPokerLLMThink]
-  num_groups_partition: [32]
+  num_groups_partition: [33]
+  include_opponent_reasoning: false
 
 val_env_manager:
   max_env_num_per_worker: 4
@@ -134,3 +147,5 @@ max_actions_per_traj: 2
 custom_envs:
   KuhnPokerLLMThink:
     ${custom_env.KuhnPokerLLMThink}
+  KuhnPokerLLMThinkStochastic:
+    ${custom_env.KuhnPokerLLMThinkStochastic}

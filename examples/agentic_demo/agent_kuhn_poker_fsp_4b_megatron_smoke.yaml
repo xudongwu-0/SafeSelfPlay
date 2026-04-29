@@ -1,0 +1,31 @@
+defaults:
+  - agent_kuhn_poker_fsp_4b_smoke
+
+exp_name: "kuhn_fsp_4b_megatron_smoke"
+tracker_kwargs:
+  project: self-play-debug
+  name: ${exp_name}
+  tags:
+    - kuhn_poker
+    - smoke
+    - qwen3_5_4b
+    - megatron
+    - auton
+
+# Swap DeepSpeed ZeRO-2 for Megatron on the training side only.
+# Keeps vLLM on actor_infer and all pipeline knobs from the parent.
+actor_train:
+  model_args:
+    attn_implementation: fa2
+  strategy_args:
+    strategy_name: megatron_train
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+      use_distributed_optimizer: true
+      recompute_granularity: full
+  # Dynamic batching — the whole point of trying Megatron. At seq=1536 with mean
+  # total length ~670, padded mode wastes ~56% of train compute.
+  use_dynamic_batching_in_train: true
+  max_tokens_per_microbatch_in_train: 6144

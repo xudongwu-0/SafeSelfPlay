@@ -137,8 +137,8 @@ class BaseConfig(ScheduleConfig):
         metadata={"help": "Number of steps between logging information."}
     )
     eval_steps: int = field(
-        default=10,
-        metadata={"help": "Run an evaluation every X steps."},
+        default=0,
+        metadata={"help": "Run an evaluation every X steps. 0 disables evaluation."},
     )
     rollout_batch_size: int = field(
         default=128, metadata={"help": "The number of samples to rollout in each inference batch."}
@@ -527,7 +527,8 @@ class PPOConfig(BaseConfig):
         metadata={"help": "Pre-training step for critic model"},
     )
     use_kl_loss: bool = field(default=False, metadata={"help": "Use kl loss"})
-    kl_loss_coef: float = field(default=0, metadata={"help": "Loss coefficient for kl loss"})
+    kl_loss_coef: float = field(default=0, metadata={"help": "Loss coefficient for kl loss (starting value if kl_loss_coef_end is set, else constant)"})
+    kl_loss_coef_end: float = field(default=-1.0, metadata={"help": "If >=0, linearly decay kl_loss_coef from start to this value over max_steps. -1 disables the schedule."})
     entropy_loss_coef: float = field(default=0, metadata={"help": "Loss coefficient for entropy loss"})
     loss_agg_mode: Literal["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm"] = (
         field(default="seq-mean-token-mean", metadata={"help": "Loss aggregation mode"})

@@ -25,6 +25,7 @@ from roll.third_party.deepspeed.offload_states_patch import bind_deepspeed_offlo
 from roll.utils.collective import collective
 from roll.utils.context_parallel import get_ulysses_group, set_upg_manager
 from roll.utils.deepspeed_utils import get_optimizer_grouped_parameters
+from roll.utils.dynamic_batching import split_mini_batch_sorted_chunks_narrowed
 from roll.utils.functionals import append_to_dict, entropy_from_logits, log_probs_from_logits
 from roll.utils.constants import IGNORE_INDEX
 from roll.utils.logging import get_logger
@@ -399,6 +400,27 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         )
         bind_deepspeed_offload_states_func(self.model)
 
+        # torch 2.10+ LR scheduler uses strict=True zip on (param_groups, base_lrs).
+        # After DeepSpeed wraps optimizer, the scheduler's captured base_lrs may
+        # mismatch the live optimizer.param_groups. Rebuild the scheduler against
+        # whichever optimizer object the scheduler now refers to, so get_lr() and
+        # param_groups always have equal length at step time.
+        try:
+            sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
+            new_scheduler = get_scheduler(
+                self.worker_config.training_args.lr_scheduler_type,
+                sched_opt,
+                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(
+                    self.worker_config.training_args.max_steps
+                ),
+                num_training_steps=self.worker_config.training_args.max_steps,
+            )
+            self.scheduler = new_scheduler
+            if hasattr(self.model, "lr_scheduler"):
+                self.model.lr_scheduler = new_scheduler
+        except Exception as _lr_rebuild_err:
+            logger.warning(f"lr scheduler rebuild skipped: {_lr_rebuild_err}")
+
         logger.info(f"{self.model}")
         dist.barrier()
 
@@ -447,7 +469,23 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         loss_scale = mini_steps * self.worker.rank_info.dp_size
         batch.meta_info['micro_batch_size'] = mini_batch_size
 
-        data_iter = batch.make_iterator(mini_batch_size=mini_batch_size, epochs=1)
+        if self.worker_config.use_inner_dynamic_batching_in_train:
+            # Sort samples in this mini-batch by length and split into exactly
+            # mini_steps (= gradient_accumulation_steps) sorted chunks, narrowed to
+            # per-chunk max seq length. num_microbatches is unchanged so DS's grad
+            # accumulator state stays correct.
+            ga_steps = self.worker_config.training_args.gradient_accumulation_steps
+            assert mini_steps == ga_steps, (
+                f"expected mini_steps == gradient_accumulation_steps for inner dynbatch, "
+                f"got mini_steps={mini_steps} ga={ga_steps}"
+            )
+            data_iter = split_mini_batch_sorted_chunks_narrowed(
+                batch,
+                num_chunks=ga_steps,
+                sequence_length_round=self.worker_config.sequence_length_round_in_train,
+            )  # generator — yields one chunk at a time for lazy allocation
+        else:
+            data_iter = batch.make_iterator(mini_batch_size=mini_batch_size, epochs=1)
         metrics = {}
 
         for step in range(mini_steps):
@@ -504,10 +542,14 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         return metrics
 
     @torch.no_grad()
-    def reset_lora_weights(self):
+    def reset_lora_weights(self, num_training_steps: int):
         """Reset LoRA A/B params to PEFT default init (A=kaiming_uniform(a=sqrt(5)), B=0)
         and clear Adam optimizer state for trainable params (LoRA-only in this config).
         Base model weights are untouched.
+
+        Also rebuilds the LR scheduler from step 0 with num_training_steps as the new
+        generation length, so each FSP generation gets a fresh LR curve instead of
+        inheriting the decayed tail of the global schedule.
         """
         import math
         import torch.nn.init as nn_init
@@ -530,15 +572,18 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
                     nn_init.zeros_(param.data)
                 num_b += 1
 
-        # ZeRO-3: sync fp32 master <- bf16 so optimizer.step() won't revert
-        # bf16 from stale fp32 via _reassign_or_swap_out_partitioned_parameters
-        # (stage3.py:2069-2072). All trainable params are LoRA, so syncing the
-        # whole partitioned group is correct.
+        # ZeRO (stage 1/2/3) + bf16: sync fp32 master <- bf16 so optimizer.step()
+        # won't revert bf16 from stale fp32. Both DeepSpeedZeroOptimizer (stage 1/2,
+        # stage_1_and_2.py:2216) and DeepSpeedZeroOptimizer_Stage3 (stage3.py:2602)
+        # expose refresh_fp32_params(). All trainable params are LoRA, so syncing
+        # the whole partitioned groups is correct.
         num_fp32_synced = 0
-        if is_zero3 and hasattr(self.optimizer, "refresh_fp32_params"):
+        if hasattr(self.optimizer, "refresh_fp32_params"):
             try:
                 self.optimizer.refresh_fp32_params()
-                num_fp32_synced = len(self.optimizer.fp32_partitioned_groups_flat)
+                fp32_groups = getattr(self.optimizer, "fp32_partitioned_groups_flat",
+                                       getattr(self.optimizer, "single_partition_of_fp32_groups", []))
+                num_fp32_synced = len(fp32_groups)
             except Exception as e:
                 logger.warning(f"reset_lora_weights: refresh_fp32_params failed: {e}")
 
@@ -550,8 +595,26 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         except Exception as e:
             logger.warning(f"reset_lora_weights: failed to clear optimizer state: {e}")
 
+        # Rebuild LR scheduler from step 0. num_training_steps is in pipeline-step units;
+        # divide by dp_size the same way setup() does to get the per-rank step count.
+        per_rank_steps = max(1, num_training_steps // self.worker.rank_info.dp_size)
+        try:
+            sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
+            new_scheduler = get_scheduler(
+                self.worker_config.training_args.lr_scheduler_type,
+                sched_opt,
+                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(per_rank_steps),
+                num_training_steps=per_rank_steps,
+            )
+            self.scheduler = new_scheduler
+            if hasattr(self.model, "lr_scheduler"):
+                self.model.lr_scheduler = new_scheduler
+        except Exception as e:
+            logger.warning(f"reset_lora_weights: scheduler rebuild failed: {e}")
+
         logger.info(f"reset_lora_weights: reinit {num_a} lora_A + {num_b} lora_B params; "
-                    f"synced {num_fp32_synced} fp32 master groups; Adam state cleared")
+                    f"synced {num_fp32_synced} fp32 master groups; Adam state cleared; "
+                    f"LR scheduler rebuilt for {per_rank_steps} per-rank steps")
         return {"lora_A_reset": num_a, "lora_B_reset": num_b}
 
     def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", local_state_path=None, is_last_step=None, **kwargs):

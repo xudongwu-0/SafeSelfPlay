@@ -1,0 +1,20 @@
+defaults:
+  - agent_kuhn_poker_fsp_train
+
+exp_name: "kuhn_fsp_sync_smoke"
+tracker_kwargs:
+  project: self-play-debug
+  name: ${exp_name}
+  tags:
+    - kuhn_poker
+    - fsp_sync
+    - smoke
+    - auton
+
+async_generation_ratio: 0
+
+max_steps: 5
+fsp_save_steps: 2
+eval_steps: 100
+save_steps: 10000
+rollout_batch_size: 16

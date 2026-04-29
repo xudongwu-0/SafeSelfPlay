@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - ../agent_kuhn_poker_single_rl
+  - ../../agent_kuhn_poker_single_rl
 
 # Batch size sweep base config
 # Sweep per_device_train_batch_size while keeping effective batch = 32

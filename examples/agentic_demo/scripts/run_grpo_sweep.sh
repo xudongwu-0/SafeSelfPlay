@@ -33,6 +33,6 @@ ray stop --force 2>/dev/null || true
 sleep 2
 
 python examples/start_agentic_pipeline.py \
-    --config_path agentic_demo/benchmark_grpo_sweep \
+    --config_path agentic_demo/benchmark_grpo_sweep/A40x4 \
     --config_name agent_kuhn_poker_grpo_gs${GROUP_SIZE} \
     2>&1
