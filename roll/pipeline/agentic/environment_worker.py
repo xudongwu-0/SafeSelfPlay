@@ -78,7 +78,8 @@ class EnvironmentWorker(Worker):
                 mode=mode,
                 extra_data_provider=extra_data_provider,
             )
-        with ThreadPoolExecutor(max_workers=min(len(self.env_configs), 64)) as executor:
+        # cap at 8: concurrent deepcopy of Rust-backed fast tokenizers segfaults at high counts
+        with ThreadPoolExecutor(max_workers=min(len(self.env_configs), 8)) as executor:
             futures = [
                 executor.submit(create_env_manager, env_id, env_config)
                 for env_id, env_config in self.env_configs.items()
