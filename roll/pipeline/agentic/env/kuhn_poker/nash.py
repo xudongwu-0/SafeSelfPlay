@@ -15,6 +15,7 @@ For each info set we publish the Nash Bet probability as a reference.
 
 from __future__ import annotations
 
+import math
 from itertools import product
 from typing import Dict, Optional
 
@@ -202,12 +203,16 @@ def compute_derived_metrics(
         derived[f"nash/l1/{iset}"] = delta
         total_l1 += delta
         n += 1
+        _eps = 1e-9
+        entropy = -p_bet * math.log(p_bet + _eps) - (1 - p_bet) * math.log(1 - p_bet + _eps)
+        derived[f"kuhn/entropy/{iset}"] = entropy
 
     if n > 0:
         avg_l1 = total_l1 / n
         derived["nash/l1_per_infoset"] = avg_l1
         derived["nash/tv_per_infoset"] = avg_l1 / 2.0  # TV distance for binary action
         derived["nash/infoset_coverage"] = n / float(len(ALL_INFO_SETS))
+        derived["kuhn/entropy/mean"] = sum(derived[f"kuhn/entropy/{k}"] for k in policy) / n
 
     # Exploitability: needs all 12 info sets with defined probabilities.
     # For missing info sets fall back to Nash reference (best-case assumption).
