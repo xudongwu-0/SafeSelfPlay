@@ -145,12 +145,15 @@
 
 | Variant | infer_batch_size | tok/s | step_time_s | gpu_util_% | winner |
 |---------|-----------------|-------|-------------|------------|--------|
-| ibs4 | 4 | — | — | — | |
-| ibs8 | 8 | — | — | — | |
-| ibs16 | 16 | — | — | — | |
-| ibs32 | 32 | — | — | — | |
+| ibs4 | 4 | 2232 | — | — | |
+| ibs8 | 8 | 2245 | — | — | ✓ |
+| ibs16 | 16 | OOM | — | — | |
+| ibs32 | 32 | — (not run) | — | — | |
 
-**Winner:** TBD
+*ibs16 OOM: tried to allocate 9.27 GiB with only 8.77 GiB free (gmu=0.95 leaves less headroom for training).*
+
+**Winner:** ibs8 (2245 tok/s)  
+**Locked baseline update:** `infer_batch_size=8`
 
 ---
 
@@ -168,7 +171,8 @@
 | `enforce_eager` | `false` | R5 |
 | `max_num_batched_tokens` | `32768` | R6 |
 | `gpu_memory_utilization` | `0.95` | R7 |
-| **tok/s** | **2322** | R7 best |
+| `infer_batch_size` | `8` | R8 |
+| **tok/s** | **2245** | R8 best |
 
 ---
 

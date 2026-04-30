@@ -36,7 +36,7 @@ BASELINE_OVERRIDES=(
     "actor_infer.device_mapping='[3]'"                  # R1 winner
     "actor_train.training_args.per_device_train_batch_size=4"   # R2 winner (update after round2)
     "actor_train.training_args.gradient_accumulation_steps=1"   # full batch (ga=1)
-    "actor_train.infer_batch_size=4"
+    "actor_train.infer_batch_size=8"                                               # R8 winner
     "actor_infer.strategy_args.strategy_config.enforce_eager=false"             # R5 winner
     "actor_infer.strategy_args.strategy_config.max_num_batched_tokens=32768"   # R6 winner
     "actor_infer.strategy_args.strategy_config.gpu_memory_utilization=0.95"    # R7 winner
