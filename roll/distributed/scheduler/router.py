@@ -592,6 +592,10 @@ class RouterClient:
                 payload["sampling_params"] = sampling_params
             case _:
                 raise NotImplementedError(f"strategy {self.strategy_name} is not supported")
+        # If "lora_name" key is absent (actor's own generation), default to
+        # "training_lora" sentinel so inference uses the training LoRA.
+        # If explicitly set to None (opponent = base model), None is preserved.
+        payload["lora_name"] = req.meta_info.get("lora_name", "training_lora")
         return payload, request_id
 
     def _postprocess_generate(self, req, response):

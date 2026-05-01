@@ -213,6 +213,21 @@ class VllmStrategy(InferenceStrategy):
             lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora",
         )
 
+    async def _resolve_lora_request_from_name(self, lora_name):
+        if not self.is_lora:
+            return None
+        if lora_name is None:
+            return None  # base model (opponent with current_opponent_lora=None)
+        if lora_name == "training_lora":
+            return LoRARequest(
+                lora_name="training_lora",
+                lora_int_id=_TRAINING_LORA_INT_ID,
+                lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora",
+            )
+        import hashlib
+        lora_int_id = int(hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
+        return LoRARequest(lora_name=lora_name, lora_int_id=lora_int_id, lora_path=lora_name)
+
     async def _generate_standard(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:
         """Standard generate method for non-beam search cases."""
         sampling_params = SamplingParams(**create_sampling_params_for_vllm(gen_kwargs=generation_config))
@@ -327,11 +342,8 @@ class VllmStrategy(InferenceStrategy):
                                 if "multi_modal_data" in multi_modal_data else None)
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids, multi_modal_data=multi_modal_data)
         else:
-            assert input_ids.size(0) == 1, f"data['input_ids'] must have exactly one batch dimension"
-            prompt_token_ids = gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
-            assert len(prompt_token_ids) == 1
-            prompt = TokensPrompt(prompt_token_ids=prompt_token_ids[0])
-        lora_request = await self._resolve_lora_request(data)
+            prompt = TokensPrompt(prompt_token_ids=payload["input_ids"])
+        lora_request = await self._resolve_lora_request_from_name(payload.get("lora_name"))
 
         result_generator = self.model.generate(
             prompt=prompt,
@@ -458,7 +470,7 @@ def gather_outputs_to_pad_tensor(request_outputs: List["RequestOutput"], pad_tok
     return output_tensor
 
 
-def create_sampling_params_for_vllm(gen_kwargs):
+def create_sampling_params_for_vllm(gen_kwargs, collect_unfinished=False):
     # TODO vllm 0.10.2 support partial rollout, and do not need to set RequestOutputKind to CUMULATIVE
     output_kind = gen_kwargs.get("output_kind", RequestOutputKind.FINAL_ONLY)
     if output_kind != RequestOutputKind.FINAL_ONLY:
@@ -487,4 +499,4 @@ def create_sampling_params_for_vllm(gen_kwargs):
     thinking_token_budget = gen_kwargs.get("thinking_token_budget")
     if thinking_token_budget is not None:
         sampling_kwargs["thinking_token_budget"] = thinking_token_budget
-    return SamplingParams(**sampling_kwargs)
+    return sampling_kwargs

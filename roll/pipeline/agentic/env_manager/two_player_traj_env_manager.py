@@ -128,12 +128,10 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             generation_config = self.worker_config.generating_args.to_dict()
             generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
             opponent_lm_input.meta_info["src_rank"] = self.env_config["env_id"] + 100000
-            opponent_lm_input.meta_info["generation_config"] = generation_config
-            opponent_lm_input.meta_info["pad_to_seq_len"] = False
             opponent_lm_input.meta_info["lora_name"] = self.current_opponent_lora
 
-            opponent_output: DataProto = ray.get(
-                self.generate_scheduler.generate_one_request.remote(data=opponent_lm_input)
+            opponent_output: DataProto = self.llm_proxy.generate(
+                messages=None, lm_input=opponent_lm_input, generation_config=generation_config
             )
 
             if opponent_output is None:
@@ -226,12 +224,10 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             generation_config = self.worker_config.generating_args.to_dict()
             generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
             opponent_lm_input.meta_info["src_rank"] = self.env_config["env_id"] + 100000  # distinct src_rank
-            opponent_lm_input.meta_info["generation_config"] = generation_config
-            opponent_lm_input.meta_info["pad_to_seq_len"] = False
             opponent_lm_input.meta_info["lora_name"] = self.current_opponent_lora  # None=base, str=checkpoint path
 
-            opponent_output: DataProto = ray.get(
-                self.generate_scheduler.generate_one_request.remote(data=opponent_lm_input)
+            opponent_output: DataProto = self.llm_proxy.generate(
+                messages=None, lm_input=opponent_lm_input, generation_config=generation_config
             )
 
             if opponent_output is None:

@@ -128,12 +128,10 @@ def _handle_arena_opponent_first(
     generation_config = worker_config.generating_args.to_dict()
     generation_config["max_new_tokens"] = min(max_new_tokens, pipeline_config.sequence_length)
     opponent_lm_input.meta_info["src_rank"] = src_rank_base + 1
-    opponent_lm_input.meta_info["generation_config"] = generation_config
-    opponent_lm_input.meta_info["pad_to_seq_len"] = False
     opponent_lm_input.meta_info["lora_name"] = opponent_lora
 
-    opponent_output: DataProto = ray.get(
-        generate_scheduler.generate_one_request.remote(data=opponent_lm_input)
+    opponent_output: DataProto = env_manager.llm_proxy.generate(
+        messages=None, lm_input=opponent_lm_input, generation_config=generation_config
     )
 
     if opponent_output is None:
@@ -215,12 +213,10 @@ def play_episode(
         generation_config["max_new_tokens"] = min(max_new_tokens, pipeline_config.sequence_length)
 
         lm_input.meta_info["src_rank"] = src_rank_base
-        lm_input.meta_info["generation_config"] = generation_config
-        lm_input.meta_info["pad_to_seq_len"] = False
         lm_input.meta_info["lora_name"] = player_i_lora  # KEY: explicit LoRA for agent 0
 
-        lm_output: DataProto = ray.get(
-            generate_scheduler.generate_one_request.remote(data=lm_input)
+        lm_output: DataProto = env_manager.llm_proxy.generate(
+            messages=None, lm_input=lm_input, generation_config=generation_config
         )
 
         if lm_output is None:
@@ -289,6 +285,14 @@ def run_arena_evaluation(
         )
         env_managers.append(em)
 
+    # Assert full state coverage if env exposes NUM_START_STATES
+    _num_start_states = getattr(env_managers[0].env, "NUM_START_STATES", None)
+    if _num_start_states is not None:
+        assert episodes_per_pair % _num_start_states == 0, (
+            f"episodes_per_pair ({episodes_per_pair}) must be divisible by "
+            f"NUM_START_STATES ({_num_start_states}) to ensure full state coverage per pair."
+        )
+
     # Build task list: (i, j, episode_idx)
     tasks = []
     for i in range(n):
@@ -320,7 +324,7 @@ def run_arena_evaluation(
             while pending_tasks and em_available:
                 i, j, ep = pending_tasks.pop(0)
                 em_idx = em_available.pop(0)
-                seed = seed_base + i * n * episodes_per_pair + j * episodes_per_pair + ep
+                seed = seed_base + ep
                 src_rank = ARENA_SRC_RANK_BASE + em_idx * 2
                 future = executor.submit(
                     play_episode,
