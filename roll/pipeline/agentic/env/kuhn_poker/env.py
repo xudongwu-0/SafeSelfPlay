@@ -32,6 +32,7 @@ class KuhnPokerEnv(Env):
     """
 
     ACTION_LOOKUP = {0: "Pass", 1: "Bet"}
+    NUM_START_STATES = 12  # 6 card pairs × 2 agent positions
 
     # Game states
     P0_ACTING = "p0_acting"
@@ -49,6 +50,7 @@ class KuhnPokerEnv(Env):
         env_instruction: Optional[str] = None,
         opponent_strategy: str = "llm",
         stochastic_policy: bool = False,
+        debug_mode: bool = False,
         **kwargs,
     ):
         self.max_steps = max_steps
@@ -59,6 +61,7 @@ class KuhnPokerEnv(Env):
         self.opponent_strategy = opponent_strategy
         self.two_player = opponent_strategy == "llm"
         self.stochastic_policy = stochastic_policy
+        self.debug_mode = debug_mode
 
         import re
         self.think_mode = re.compile(action_pattern).groups > 1
@@ -132,18 +135,31 @@ class KuhnPokerEnv(Env):
         action_str = "\nYour available actions are:\n" + ", ".join(self.ACTION_LOOKUP.values())
         return self.env_instruction + action_str
 
+    # All 12 start states: (p0_card, p1_card, agent_is_p0)
+    _ALL_STATES = [
+        (p0, p1, pos)
+        for pos in [True, False]
+        for p0, p1 in [(0,1),(0,2),(1,0),(1,2),(2,0),(2,1)]
+    ]
+
     def reset(self, seed: Optional[int] = None):
         Env.reset(self, seed)
-        self.rng = random.Random(seed)
         self._init_game_state()
 
-        # Deal cards: sample 2 from {0,1,2} without replacement
-        deck = [0, 1, 2]
-        self.rng.shuffle(deck)
-        self.cards = {0: deck[0], 1: deck[1]}  # poker-P0, poker-P1
-
-        # Randomly assign agent position
-        self.agent_is_p0 = self.rng.choice([True, False])
+        if self.debug_mode and seed is not None:
+            # Cycle deterministically through all 12 start states
+            state = self._ALL_STATES[seed % self.NUM_START_STATES]
+            self.cards = {0: state[0], 1: state[1]}
+            self.agent_is_p0 = state[2]
+            self.rng = random.Random(seed)
+        else:
+            self.rng = random.Random(seed)
+            # Deal cards: sample 2 from {0,1,2} without replacement
+            deck = [0, 1, 2]
+            self.rng.shuffle(deck)
+            self.cards = {0: deck[0], 1: deck[1]}  # poker-P0, poker-P1
+            # Randomly assign agent position
+            self.agent_is_p0 = self.rng.choice([True, False])
 
         info = {"env_instruction": self.get_instructions()}
 
@@ -370,17 +386,27 @@ class KuhnPokerEnv(Env):
         # Concepts absent from Kuhn Poker: multi-card community games, compound raise types, blinds
         wrong_poker_rules = 1.0 if bool(re.search(
             r'\b(river|flop|turn|community\s+card|straight|flush|full\s+house|two\s+pair'
-            r'|three\s+of\s+a\s+kind|royal\s+flush|re.?raise|big\s+blind|small\s+blind)\b',
+            r'|three\s+of\s+a\s+kind|royal\s+flush|re.?raise|big\s+blind|small\s+blind'
+            r'|second\s+card|kicker)\b',
             think, re.IGNORECASE,
         )) else 0.0
 
         # Opponent action visible: P1 always sees P0's action; P0 sees P1's bet when responding
         _opp_action = getattr(self, "_opponent_action_at_think", None)
+        hallucinated_opponent_action = 0.0
         if _opp_action is not None:
             _opp_word = _opp_action.lower()
             _general = bool(re.search(r'\b(opponent|they|enemy|player\s*(?:1|2|one|two))\b', think, re.IGNORECASE))
             _action_ref = bool(re.search(rf'\b{re.escape(_opp_word)}\b', think, re.IGNORECASE))
             mentions_opp_action = 1.0 if (_general or _action_ref) else 0.0
+            # Detect claims that opponent did the opposite of what actually happened
+            _wrong_verbs = r'(?:pass(?:ed)?|fold(?:ed)?|check(?:ed)?)' if _opp_action == "Bet" else r'(?:bet(?:s|ted)?)'
+            _subj = r'(?:opponent|player\s*(?:1|2|one|two)|they)'
+            _m = re.search(rf'\b{_subj}\b.{{0,30}}\b{_wrong_verbs}\b', think, re.IGNORECASE)
+            if _m:
+                _pre = think[max(0, _m.start() - 60):_m.start()]
+                if not re.search(r'\b(?:if|when|would|could|might|should|suppose|imagine|assuming)\b', _pre, re.IGNORECASE):
+                    hallucinated_opponent_action = 1.0
 
         # Reasoning-action consistency: only scored when think contains an unambiguous directive
         _action_taken = getattr(self, "_last_action_taken", None)
@@ -433,6 +459,7 @@ class KuhnPokerEnv(Env):
         }
         if _opp_action is not None:
             base_metrics["reasoning/mentions_opponent_action"] = mentions_opp_action
+            base_metrics["reasoning/hallucinated_opponent_action"] = hallucinated_opponent_action
         if _action_taken is not None and (_concludes_bet ^ _concludes_pass):
             base_metrics["reasoning/action_consistent"] = 1.0 if (
                 (_concludes_bet and _action_taken == "Bet") or
@@ -468,13 +495,14 @@ class KuhnPokerEnv(Env):
             "reasoning/card_rank_error":          "mean",
             "reasoning/impossible_opponent_card": "mean",
             "reasoning/wrong_poker_rules":        "mean",
-            "reasoning/mentions_opponent_action": "mean",
-            "reasoning/action_consistent":        "mean",
+            "reasoning/mentions_opponent_action":      "mean",
+            "reasoning/hallucinated_opponent_action":   "mean",
+            "reasoning/action_consistent":              "mean",
         }
         base_agg.update({k: "mean" for k in info_set_metrics})
 
         # reasoning_step_penalty: sum of all reasoning error counts × per-error penalty weight
-        num_errors = card_strength_error + card_rank_error + impossible_opponent_card + wrong_poker_rules
+        num_errors = card_strength_error + card_rank_error + impossible_opponent_card + wrong_poker_rules + hallucinated_opponent_action
         reasoning_step_penalty = self.reasoning_penalty * num_errors
 
         return {

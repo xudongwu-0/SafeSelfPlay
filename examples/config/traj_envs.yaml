@@ -135,6 +135,7 @@ custom_env:
       reasoning_penalty: 0.0
       opponent_strategy: "llm"
       stochastic_policy: false
+      debug_mode: false
   KuhnPokerLLMThinkStochastic:
     env_type: kuhn_poker
     max_steps: 2
