@@ -104,19 +104,17 @@ class PayoffMatrix:
 
         seed_k = self._seed_base + self._iteration * _SEED_STRIDE
 
-        # Build tasks: (i_idx, j_idx, ep, matchup_pos).
-        # matchup_pos drives seed derivation and must be stable within the call.
-        tasks: List[Tuple[int, int, int, int]] = []
-        matchup_pos = 0
+        # Build tasks: (i_idx, j_idx, ep).
+        # Both (n,j) and (j,n) share seeds keyed by existing policy index j,
+        # so they play identical game states and positional/card variance cancels.
+        tasks: List[Tuple[int, int, int]] = []
         for j in range(n):
             # new (row n) vs existing[j]
             for ep in range(self._episodes_per_pair):
-                tasks.append((n, j, ep, matchup_pos))
+                tasks.append((n, j, ep))
             # existing[j] vs new (col n)
-            matchup_pos += 1
             for ep in range(self._episodes_per_pair):
-                tasks.append((j, n, ep, matchup_pos))
-            matchup_pos += 1
+                tasks.append((j, n, ep))
 
         results: Dict[Tuple[int, int], List[float]] = {}
         for j in range(n):
@@ -136,9 +134,11 @@ class PayoffMatrix:
 
             def _submit_batch() -> None:
                 while pending and em_available:
-                    i_idx, j_idx, ep, mpos = pending.pop(0)
+                    i_idx, j_idx, ep = pending.pop(0)
                     em_idx = em_available.pop(0)
-                    seed = seed_k + mpos * self._episodes_per_pair + ep
+                    # Shared seed for (n,j) and (j,n): keyed by existing policy index
+                    existing_idx = j_idx if i_idx == n else i_idx
+                    seed = seed_k + existing_idx * self._episodes_per_pair + ep
                     src_rank = ARENA_SRC_RANK_BASE + em_idx * 2
 
                     lora_i = new_policy if i_idx == n else self.policies[i_idx]
@@ -156,7 +156,7 @@ class PayoffMatrix:
                         seed,
                         src_rank,
                     )
-                    future_to_info[future] = (i_idx, j_idx, ep, em_idx)
+                    future_to_info[future] = (i_idx, j_idx, em_idx)
 
             _submit_batch()
             completed = 0
@@ -164,11 +164,11 @@ class PayoffMatrix:
 
             while future_to_info:
                 for future in as_completed(future_to_info):
-                    i_idx, j_idx, ep, em_idx = future_to_info.pop(future)
+                    i_idx, j_idx, em_idx = future_to_info.pop(future)
                     try:
                         payoff: float = future.result()
                     except Exception as exc:
-                        logger.error(f"PayoffMatrix: episode ({i_idx},{j_idx}) ep={ep} failed: {exc}")
+                        logger.error(f"PayoffMatrix: episode ({i_idx},{j_idx}) failed: {exc}")
                         payoff = 0.0
                     results[(i_idx, j_idx)].append(payoff)
                     em_available.append(em_idx)

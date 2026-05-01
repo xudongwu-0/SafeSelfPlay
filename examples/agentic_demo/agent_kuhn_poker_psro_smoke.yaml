@@ -43,7 +43,7 @@ cold_start: true
 
 # PSRO: expand payoff matrix + compute Nash after each FSP generation
 psro_mode: true
-psro_episodes_per_pair: 1   # 1 episode per pair keeps smoke test fast
+psro_episodes_per_pair: 12   # 1 full cycle of 12 start states
 psro_max_concurrent_eval: 4
 psro_seed_base: 12345
 

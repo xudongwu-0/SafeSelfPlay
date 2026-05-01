@@ -50,6 +50,8 @@ class PSROLoop:
             f"episodes_per_pair={pipeline_config.psro_episodes_per_pair}, "
             f"max_concurrent={pipeline_config.psro_max_concurrent_eval}"
         )
+        # Pre-seed base model as policy 0 (n=0 path runs no arena episodes)
+        self.payoff_matrix.expand_matrix(None, [])
 
     def on_policy_added(
         self,
@@ -93,7 +95,9 @@ class PSROLoop:
             logger.info("PSROLoop: single policy, skipping Nash computation.")
             return None
 
-        _, p2_strategy = compute_nash(updated_matrix)
+        # Antisymmetrize: raw M[i][j]+M[j][i] != 0 due to positional bias (P1 disadvantage in Kuhn Poker)
+        M_meta = 0.5 * (updated_matrix - updated_matrix.T)
+        _, p2_strategy = compute_nash(M_meta)
         logger.info(
             "PSROLoop iter %d: Nash p2_strategy = [%s]",
             self._iteration,
