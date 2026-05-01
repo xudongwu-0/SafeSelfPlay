@@ -42,9 +42,9 @@ eval_steps: 50
 resume_from_checkpoint: false
 fsp_save_steps: 50
 fsp_opponent_weight_mode: uniform
-fsp_win_rate_threshold: 0.6
-fsp_win_rate_window: 10
-fsp_win_rate_timeout: 150
+fsp_score_threshold: 0.3
+fsp_score_window: 10
+fsp_score_timeout: 150
 cold_start: true
 async_generation_ratio: 1
 

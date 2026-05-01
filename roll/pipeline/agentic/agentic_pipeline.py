@@ -238,7 +238,7 @@ class AgenticPipeline(BasePipeline):
 
         # Track FSP checkpoints for arena evaluation: None = base model
         self.fsp_checkpoints: list = [None]
-        self._fsp_win_rate_history: list[float] = []
+        self._fsp_score_history: list[float] = []
 
         self._psro_loop: Optional[PSROLoop] = None
         if self.pipeline_config.psro_mode and self.pipeline_config.fsp_save_steps > 0:
@@ -374,9 +374,9 @@ class AgenticPipeline(BasePipeline):
                         metrics["time/step_rollout"] = rollout_timer.last
                         metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
                         metrics.update(_kuhn_derived_metrics(metrics))
-                        _wr = next((v for k, v in metrics.items() if k.endswith("/win_rate") and not k.startswith("val/")), None)
-                        if _wr is not None:
-                            self._fsp_win_rate_history.append(float(_wr))
+                        _score = metrics.get("rollout/score/mean")
+                        if _score is not None:
+                            self._fsp_score_history.append(float(_score))
                         batch.meta_info["global_step"] = global_step
                         batch.meta_info["_broadcast_non_tensor_batch"] = True
                         batch.meta_info["loss_mask_keys"] = ["response_mask"]
@@ -616,15 +616,15 @@ class AgenticPipeline(BasePipeline):
 
                 # Fictitious self-play: save LoRA to enemy pool.
                 # Two trigger modes (mutually exclusive):
-                #   fsp_win_rate_threshold > 0 → switch when rolling avg win rate >= threshold
-                #                                OR when stuck below threshold for fsp_win_rate_timeout steps
-                #   otherwise                  → switch every fsp_save_steps steps
+                #   fsp_score_threshold > 0 → switch when rolling avg rollout/score/mean >= threshold
+                #                             OR when stuck below threshold for fsp_score_timeout steps
+                #   otherwise               → switch every fsp_save_steps steps
                 fsp_save_steps = self.pipeline_config.fsp_save_steps
-                _wr_threshold = self.pipeline_config.fsp_win_rate_threshold
-                _wr_window = self.pipeline_config.fsp_win_rate_window
+                _wr_threshold = self.pipeline_config.fsp_score_threshold
+                _wr_window = self.pipeline_config.fsp_score_window
                 if _wr_threshold > 0:
-                    _history = self._fsp_win_rate_history
-                    _wr_timeout = self.pipeline_config.fsp_win_rate_timeout
+                    _history = self._fsp_score_history
+                    _wr_timeout = self.pipeline_config.fsp_score_timeout
                     _win_trigger = len(_history) >= _wr_window and sum(_history[-_wr_window:]) / _wr_window >= _wr_threshold
                     _timeout_trigger = _wr_timeout > 0 and len(_history) >= _wr_timeout
                     _should_switch = _win_trigger or _timeout_trigger
@@ -634,7 +634,7 @@ class AgenticPipeline(BasePipeline):
                 metrics["fsp/turn"] = len(self.fsp_checkpoints) - 1
 
                 if _should_switch:
-                    self._fsp_win_rate_history = []
+                    self._fsp_score_history = []
                     fsp_ckpt_dir = self._save_fsp_checkpoint(global_step, is_last_step=False)
                     if fsp_ckpt_dir is not None:
                         logger.info(f"FSP: adding LoRA checkpoint to enemy pool: {fsp_ckpt_dir}")
@@ -670,7 +670,7 @@ class AgenticPipeline(BasePipeline):
                         # The LR scheduler is rebuilt with this as its num_training_steps
                         # so each generation gets a fresh curve rather than inheriting the
                         # decayed tail of the global schedule.
-                        _wr_timeout = self.pipeline_config.fsp_win_rate_timeout
+                        _wr_timeout = self.pipeline_config.fsp_score_timeout
                         if _wr_threshold > 0 and _wr_timeout > 0:
                             _generation_steps = _wr_timeout
                         elif fsp_save_steps > 0:
