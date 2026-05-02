@@ -47,7 +47,7 @@ psro_episodes_per_pair: 12   # 1 full cycle of 12 start states
 psro_max_concurrent_eval: 4
 psro_seed_base: 12345
 
-rollout_batch_size: 8
+rollout_batch_size: 26
 val_batch_size: 4
 sequence_length: 1024
 
@@ -122,10 +122,10 @@ reward_normalization:
 train_env_manager:
   format_penalty: -0.01
   max_env_num_per_worker: 8
-  num_env_groups: 4
+  num_env_groups: 13
   group_size: 2
   tags: [KuhnPokerLLMThink]
-  num_groups_partition: [4]
+  num_groups_partition: [13]
 
 val_env_manager:
   max_env_num_per_worker: 2
