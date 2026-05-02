@@ -24,9 +24,9 @@ from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from roll.distributed.executor.cluster import Cluster
-from roll.distributed.scheduler.generate_scheduler import RequestScheduler
 from roll.distributed.scheduler.initialize import init
 from roll.distributed.scheduler.resource_manager import ResourceManager
+from roll.distributed.scheduler.router import RouterManager
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.agentic.agentic_config import AgenticConfig
 from roll.pipeline.agentic.arena_eval import (
@@ -154,9 +154,9 @@ def main():
     logger.info("Initializing vLLM inference workers...")
     ray.get(actor_infer.initialize(pipeline_config=pipeline_config, blocking=False))
 
-    # Create RequestScheduler directly (no RolloutScheduler needed)
-    generate_scheduler = RequestScheduler.options(
-        name="RequestScheduler-arena-eval",
+    # Create RouterManager directly (generate_scheduler for arena env managers)
+    generate_scheduler = ray.remote(RouterManager).options(
+        name="RouterManager-arena-eval",
         get_if_exists=True,
         namespace=RAY_NAMESPACE,
         scheduling_strategy=NodeAffinitySchedulingStrategy(
@@ -164,10 +164,11 @@ def main():
         ),
         max_concurrency=args.max_concurrent + 1,
     ).remote(
-        infer_cluster=actor_infer,
-        pipeline_config=pipeline_config,
-        resource_manager=resource_manager,
+        actor_cluster=actor_infer,
+        router_args=pipeline_config.router_args,
+        num_gpus_per_node=num_gpus,
     )
+    ray.get(generate_scheduler.initialize.remote())
     ray.get(generate_scheduler.resume.remote())
 
     # Load tokenizer
