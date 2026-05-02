@@ -23,6 +23,10 @@ try:
     from vllm.inputs.data import TokensPrompt
 except ImportError:
     from vllm.inputs import TokensPrompt
+try:
+    from vllm.inputs.engine import tokens_input as _tokens_input
+except ImportError:
+    _tokens_input = None
 from vllm.utils import random_uuid
 
 from roll.distributed.executor.worker import Worker
@@ -342,7 +346,13 @@ class VllmStrategy(InferenceStrategy):
                                 if "multi_modal_data" in multi_modal_data else None)
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids, multi_modal_data=multi_modal_data)
         else:
-            prompt = TokensPrompt(prompt_token_ids=payload["input_ids"])
+            ids = payload["input_ids"]
+            if hasattr(ids, "tolist"):
+                ids = ids.tolist()
+            if _tokens_input is not None:
+                prompt = _tokens_input(prompt_token_ids=ids)
+            else:
+                prompt = TokensPrompt(prompt_token_ids=ids)
         lora_request = await self._resolve_lora_request_from_name(payload.get("lora_name"))
 
         result_generator = self.model.generate(
