@@ -147,6 +147,10 @@ class TrajEnvManager(BaseEnvManager):
                 traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
                 rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id] * rollout.batch.batch_size[0], dtype=object)
                 rollout.non_tensor_batch["traj_id"] = np.array([traj_id] * rollout.batch.batch_size[0], dtype=object)
+                if self.rollout_cache.init_state_id is not None:
+                    rollout.non_tensor_batch["init_state_id"] = np.array(
+                        [self.rollout_cache.init_state_id] * rollout.batch.batch_size[0], dtype=object
+                    )
                 ray.get(self.output_queue.put.remote(self.env_config['group_id'], self.episode_id, start_step, rollout, self.env_config['env_id']))
 
                 rollout_cache = self.reset()
@@ -174,6 +178,8 @@ class TrajEnvManager(BaseEnvManager):
             observation, info = self.env.reset(seed=seed)
             if observation is None:
                 return None
+        if hasattr(self.env, 'get_init_state_id'):
+            self.rollout_cache.init_state_id = self.env.get_init_state_id()
         self.rollout_cache.history.append({
             "observation": observation,
             "actions_left": self.env_config.max_steps - self.rollout_cache.step,

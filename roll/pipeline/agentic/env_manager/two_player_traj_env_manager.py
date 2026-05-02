@@ -96,6 +96,13 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             return f"{match.group(0)}\n{observation}"
         return observation
 
+    def _normalize_opponent_action(self, action: str) -> str:
+        """If opponent's action has invalid format, default to Pass."""
+        action_info = self.env.parse_action(action)
+        if action_info["action"] is None:
+            return "<action>Pass</action>"
+        return action
+
     def _get_opponent_action_override(self) -> Optional[str]:
         """Return a fixed action string for smoke testing, or None to use vLLM."""
         strategy = getattr(self.worker_config, "smoke_opponent_strategy", None)
@@ -152,7 +159,8 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
                     "content": self.tokenizer.decode(opponent_response_ids, skip_special_tokens=True),
                 })
 
-        # Step env with opponent's first action
+        # Step env with opponent's first action (default to Pass if invalid format)
+        opponent_action = self._normalize_opponent_action(opponent_action)
         with self.thread_lock, self.env_step_limiter:
             obs_for_agent, reward, terminated, truncated, info = self.env.step(action=opponent_action)
 
@@ -247,7 +255,8 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
                     "content": self.tokenizer.decode(opponent_response_ids, skip_special_tokens=True),
                 })
 
-        # --- Resolve round: env.step with opponent's action ---
+        # --- Resolve round: env.step with opponent's action (default to Pass if invalid format) ---
+        opponent_action = self._normalize_opponent_action(opponent_action)
         with self.thread_lock, self.env_step_limiter:
             obs_for_agent, reward, terminated, truncated, info = self.env.step(action=opponent_action)
 
