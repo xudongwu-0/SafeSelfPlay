@@ -135,6 +135,15 @@ class KuhnPokerEnv(Env):
         action_str = "\nYour available actions are:\n" + ", ".join(self.ACTION_LOOKUP.values())
         return self.env_instruction + action_str
 
+    def get_init_state_id(self) -> str:
+        """Return canonical ID for the initial game state.
+
+        Based only on env-visible state at reset (card deal + agent position),
+        not on opponent actions. Call only after reset().
+        """
+        assert len(self.cards) == 2, "get_init_state_id() must be called after reset()"
+        return f"p0card={self.cards[0]}_p1card={self.cards[1]}_agentisP0={self.agent_is_p0}"
+
     # All 12 start states: (p0_card, p1_card, agent_is_p0)
     _ALL_STATES = [
         (p0, p1, pos)
@@ -192,9 +201,14 @@ class KuhnPokerEnv(Env):
         self._last_think = action_info.get("think_content") or ""
         self._last_action_probs = action_info.get("action_probs", {})
 
-        # Invalid action → default to Pass (fold/check) + penalty
+        # Invalid action → terminate with lowest reward (-2)
         if not is_valid:
-            action_info["action"] = 0  # Pass
+            self.game_state = self.GAME_OVER
+            self.final_reward = -2.0
+            self.wins = 0
+            info = self._make_info(False, metrics_agg_mode, "Invalid action format. Reward: -2")
+            info.update(action_info)
+            return "", self.final_reward, True, False, info
 
         action_name = self.ACTION_LOOKUP[action_info["action"]]
         self._last_action_taken = action_name
