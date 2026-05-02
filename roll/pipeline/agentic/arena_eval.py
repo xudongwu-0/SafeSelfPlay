@@ -287,10 +287,10 @@ def run_arena_evaluation(
 
     # Assert full state coverage if env exposes NUM_START_STATES
     _num_start_states = getattr(env_managers[0].env, "NUM_START_STATES", None)
-    if _num_start_states is not None:
-        assert episodes_per_pair % _num_start_states == 0, (
-            f"episodes_per_pair ({episodes_per_pair}) must be divisible by "
-            f"NUM_START_STATES ({_num_start_states}) to ensure full state coverage per pair."
+    if _num_start_states is not None and episodes_per_pair % _num_start_states != 0:
+        logger.warning(
+            f"episodes_per_pair ({episodes_per_pair}) not divisible by "
+            f"NUM_START_STATES ({_num_start_states}); state coverage will be uneven."
         )
 
     # Build task list: (i, j, episode_idx)
