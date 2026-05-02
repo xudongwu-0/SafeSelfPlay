@@ -198,6 +198,14 @@ def agentic_reward_norm(
     num_total_groups = 0
     batch_grouped: Dict[str, DataProto] = {"default": batch}
     if grouping != "batch":
+        if "init_state_id" in batch.non_tensor_batch:
+            tgids = batch.non_tensor_batch["traj_group_id"]
+            sids = batch.non_tensor_batch["init_state_id"]
+            for tgid in np.unique(tgids):
+                unique_sids = np.unique(sids[tgids == tgid])
+                assert len(unique_sids) == 1, \
+                    f"traj_group_id {tgid} has multiple init_state_ids: {unique_sids}"
+            grouping = "init_state_id"
         batch_grouped = batch.group_by(keys=grouping)
     for group_name, group_batch in batch_grouped.items():
         scores = group_batch.batch["scores"]
