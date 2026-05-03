@@ -1,6 +1,7 @@
 import json
 import os.path
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -240,6 +241,8 @@ class AgenticPipeline(BasePipeline):
         self.fsp_checkpoints: list = [None]
         self._fsp_score_history: list[float] = []
 
+        self._bubble_future: Optional[object] = None
+        self._bubble_stop: threading.Event = threading.Event()
         self._psro_loop: Optional[PSROLoop] = None
         if self.pipeline_config.psro_mode and self.pipeline_config.fsp_save_steps > 0:
             _generate_scheduler = ray.get(
@@ -372,6 +375,18 @@ class AgenticPipeline(BasePipeline):
                             dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_step, batch)
 
                         metrics["time/step_rollout"] = rollout_timer.last
+                        if (self.pipeline_config.psro_bubble_eval_episodes > 0
+                                and self._psro_loop is not None
+                                and len(self._psro_loop.payoff_matrix.policies) >= 2):
+                            if self._bubble_future is None or self._bubble_future.done():
+                                self._bubble_stop = threading.Event()
+                                self._bubble_future = self.executor.submit(
+                                    self._psro_loop.payoff_matrix.run_bubble_eval,
+                                    self._bubble_stop,
+                                    self.pipeline_config.psro_bubble_eval_episodes,
+                                )
+                            else:
+                                logger.info("bubble_eval: previous step still running, skipping this step")
                         metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
                         metrics.update(_kuhn_derived_metrics(metrics))
                         _score = metrics.get("rollout/score/mean")
@@ -592,6 +607,27 @@ class AgenticPipeline(BasePipeline):
                             metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
                         tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
                     metrics["time/step_train"] = train_timer.last
+
+                _bubble_results = None
+                if self._bubble_future is not None and self._bubble_future.done():
+                    try:
+                        _bubble_results = self._bubble_future.result()
+                    except Exception:
+                        pass
+                    self._bubble_future = None
+                    if _bubble_results is not None:
+                        self._psro_loop.payoff_matrix.commit_bubble_eval(_bubble_results)
+                        nash_probs = self._psro_loop.recompute_nash()
+                        if nash_probs is not None:
+                            nash_list = nash_probs.tolist()
+                            ray.get(self.train_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+                            ray.get(self.val_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+                if self.pipeline_config.psro_bubble_eval_episodes > 0 and self._psro_loop is not None:
+                    metrics["psro/bubble_eval/completed"] = int(_bubble_results is not None)
+                    metrics["psro/bubble_eval/total_online"] = int(np.sum(self._psro_loop.payoff_matrix._online_count))
+                    if _bubble_results is not None:
+                        all_payoffs = [p for payoffs in _bubble_results.values() for p in payoffs]
+                        metrics["psro/bubble_eval/payoff_std"] = float(np.std(all_payoffs)) if all_payoffs else 0.0
 
                 with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
                     data_metrics = compute_train_data_metrics(batch=batch)

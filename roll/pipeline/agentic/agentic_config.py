@@ -41,7 +41,7 @@ def _resolve_reward_norm_defaults(method: str, grouping: str) -> Dict[str, Optio
 
 @dataclass
 class RewardNormalizationConfig:
-    grouping: str = field(default="traj_group_id", metadata={"help": "state / batch / inductive / traj_group_id"})
+    grouping: str = field(default="traj_group_id", metadata={"help": "state / batch / inductive / traj_group_id. Auto-upgrades to init_state_id if env provides get_init_state_id()."})
     method: str = field(
         default="identity",
         metadata={
@@ -215,8 +215,16 @@ class AgenticConfig(PPOConfig):
     fsp_score_timeout: int = field(default=150, metadata={"help": "If fsp_score_threshold > 0, also trigger FSP switch when score fails to reach threshold for this many steps. 0 = disabled."})
     psro_mode: bool = field(default=False, metadata={"help": "Enable PSRO: expand PayoffMatrix and compute Nash after each FSP generation."})
     psro_episodes_per_pair: int = field(default=32, metadata={"help": "PSRO: episodes per (i,j) policy pair during payoff matrix expansion."})
-    psro_max_concurrent_eval: int = field(default=256, metadata={"help": "PSRO: max concurrent arena episodes during expand_matrix."})
+    psro_max_concurrent_eval: Optional[int] = field(default=None, metadata={"help": "PSRO: max concurrent arena episodes during expand_matrix. Defaults to psro_bubble_eval_episodes if set, else 256."})
     psro_seed_base: int = field(default=12345, metadata={"help": "PSRO: base seed for PayoffMatrix episode reproducibility."})
+    psro_bubble_eval_episodes: int = field(
+        default=144,
+        metadata={"help": "PSRO: episodes per bubble-eval step (0 or -1 = disabled). "
+                  "Each step runs this many parallel envs divided into groups of 12 "
+                  "(one full Kuhn Poker start-state cycle), assigned to the least-visited "
+                  "off-diagonal matrix pairs. Results discarded if training finishes before "
+                  "mandatory 36 episodes complete."},
+    )
     render_save_dir: str = field(default=None, metadata={"help": "Directory to save rendered frames."})
     reward: RewardConfig = field(default=None, metadata={"help": "Configuration for reward inference."})
     reward_normalization: RewardNormalizationConfig = field(
@@ -283,6 +291,9 @@ class AgenticConfig(PPOConfig):
     )
 
     def __post_init__(self):
+        if self.psro_max_concurrent_eval is None:
+            self.psro_max_concurrent_eval = self.psro_bubble_eval_episodes if self.psro_bubble_eval_episodes > 0 else 256
+
         # Handle OPD mapping FIRST before any access to actor_train/actor_infer/reference
         # This ensures student_train/student_infer/teacher are mapped correctly
         self._handle_opd_mapping()

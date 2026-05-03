@@ -104,3 +104,13 @@ class PSROLoop:
             ", ".join(f"{p:.4f}" for p in p2_strategy),
         )
         return p2_strategy
+
+    def recompute_nash(self) -> Optional[np.ndarray]:
+        """Recompute Nash from the current online payoff matrix estimate."""
+        if len(self.payoff_matrix.policies) <= 1:
+            return None
+        M = self.payoff_matrix.get_online_matrix()
+        M_meta = 0.5 * (M - M.T)
+        _, p2_strategy = compute_nash(M_meta)
+        logger.info("PSROLoop bubble Nash: [%s]", ", ".join(f"{p:.4f}" for p in p2_strategy))
+        return p2_strategy

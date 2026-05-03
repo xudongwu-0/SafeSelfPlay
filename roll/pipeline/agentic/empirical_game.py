@@ -58,12 +58,22 @@ class PayoffMatrix:
         self._max_concurrent = max_concurrent
         self._seed_base = seed_base
         self._worker_config = pipeline_config.train_env_manager
+        if self._pipeline_config.psro_bubble_eval_episodes > 0:
+            self._online_sum: np.ndarray = np.zeros((1, 1))
+            self._online_count: np.ndarray = np.zeros((1, 1), dtype=int)
+            self._bubble_episode_counter: int = 0
 
         logger.info(f"PayoffMatrix: creating {max_concurrent} env managers...")
         self._env_managers = [
             _create_arena_env_manager(pipeline_config, env_tag, tokenizer, generate_scheduler, env_id=idx)
             for idx in range(max_concurrent)
         ]
+        if self._pipeline_config.psro_bubble_eval_episodes > 0:
+            logger.info(f"PayoffMatrix: creating {max_concurrent} dedicated bubble eval env managers...")
+            self._bubble_env_managers = [
+                _create_arena_env_manager(pipeline_config, env_tag, tokenizer, generate_scheduler, env_id=max_concurrent + idx)
+                for idx in range(max_concurrent)
+            ]
 
     def expand_matrix(
         self,
@@ -117,6 +127,7 @@ class PayoffMatrix:
                 tasks.append((j, n, ep))
 
         results: Dict[Tuple[int, int], List[float]] = {}
+        episode_log: List[Tuple[int, int, int, float]] = []  # (i, j, seed, payoff)
         for j in range(n):
             results[(n, j)] = []
             results[(j, n)] = []
@@ -156,7 +167,7 @@ class PayoffMatrix:
                         seed,
                         src_rank,
                     )
-                    future_to_info[future] = (i_idx, j_idx, em_idx)
+                    future_to_info[future] = (i_idx, j_idx, em_idx, seed)
 
             _submit_batch()
             completed = 0
@@ -164,13 +175,14 @@ class PayoffMatrix:
 
             while future_to_info:
                 for future in as_completed(future_to_info):
-                    i_idx, j_idx, em_idx = future_to_info.pop(future)
+                    i_idx, j_idx, em_idx, seed = future_to_info.pop(future)
                     try:
                         payoff: float = future.result()
                     except Exception as exc:
                         logger.error(f"PayoffMatrix: episode ({i_idx},{j_idx}) failed: {exc}")
                         payoff = 0.0
                     results[(i_idx, j_idx)].append(payoff)
+                    episode_log.append((i_idx, j_idx, seed, payoff))
                     em_available.append(em_idx)
                     completed += 1
                     if completed % 10 == 0:
@@ -187,9 +199,161 @@ class PayoffMatrix:
         self._matrix = new_matrix
         self.policies.append(new_policy)
         self._iteration += 1
+        if self._pipeline_config.psro_bubble_eval_episodes > 0:
+            new_sum = np.zeros((n + 1, n + 1))
+            new_sum[:n, :n] = self._online_sum
+            self._online_sum = new_sum
+            new_count = np.zeros((n + 1, n + 1), dtype=int)
+            new_count[:n, :n] = self._online_count
+            self._online_count = new_count
 
         logger.info(f"PayoffMatrix: expansion complete, matrix is now {n+1}×{n+1}.")
+        self._log_per_state_breakdown(episode_log, n, new_policy)
         return self._matrix.copy()
+
+    def _log_per_state_breakdown(
+        self,
+        episode_log: List[Tuple[int, int, int, float]],
+        n: int,
+        new_policy: Optional[str],
+    ) -> None:
+        """Log per-state payoff breakdown when debug_mode is enabled on the env."""
+        env = self._env_managers[0].env
+        if not getattr(env, "debug_mode", False):
+            return
+        num_states = getattr(env, "NUM_START_STATES", None)
+        state_names = getattr(env, "_ALL_STATES", None)
+        if num_states is None or state_names is None:
+            return
+
+        card_name = {0: "J", 1: "Q", 2: "K"}
+        per_state: Dict[Tuple[int, int, int], List[float]] = {}
+        for ii, jj, seed, pv in episode_log:
+            key = (ii, jj, seed % num_states)
+            per_state.setdefault(key, []).append(pv)
+
+        new_label = _get_model_label(new_policy)
+        for j in range(n):
+            j_label = _get_model_label(self.policies[j])
+            for agent_idx, opp_idx in [(n, j), (j, n)]:
+                agent_label = new_label if agent_idx == n else j_label
+                opp_label = j_label if agent_idx == n else new_label
+                rows = []
+                for si in range(num_states):
+                    p0c, p1c, is_p0 = state_names[si]
+                    vals = per_state.get((agent_idx, opp_idx, si), [])
+                    mean_str = f"{np.mean(vals):.3f}" if vals else "N/A"
+                    rows.append(
+                        f"  state{si:2d} p0={card_name[p0c]} p1={card_name[p1c]}"
+                        f" agentIsP0={is_p0}: {mean_str} {vals}"
+                    )
+                logger.info(
+                    f"PerState [{agent_label} vs {opp_label}]:\n" + "\n".join(rows)
+                )
+
+    def get_online_matrix(self) -> np.ndarray:
+        """Return payoff matrix with online estimates overlaid where available."""
+        result = self._matrix.copy()
+        mask = self._online_count > 0
+        result[mask] = self._online_sum[mask] / self._online_count[mask]
+        return result
+
+    def run_bubble_eval(
+        self,
+        stop_event: threading.Event,
+        episodes_per_step: int,
+    ) -> Optional[Dict[Tuple[int, int], List[float]]]:
+        """Run background eval episodes during training idle time.
+
+        Args:
+            stop_event: Set by the main thread when training finishes.
+            episodes_per_step: Total episodes; groups of 12 assigned to least-visited pairs.
+
+        Returns:
+            Dict of results keyed by (i,j) pair, or None if interrupted early.
+        """
+        n = len(self.policies)
+        if n < 2:
+            return None
+
+        n_groups = max(1, episodes_per_step // 12)
+        pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
+
+        # Greedy selection: pick least-visited pair for each group.
+        local_counts = self._online_count.copy()
+        group_targets: List[Tuple[int, int]] = []
+        for _ in range(n_groups):
+            best = min(pairs, key=lambda p: (local_counts[p[0], p[1]], p[0], p[1]))
+            group_targets.append(best)
+            local_counts[best[0], best[1]] += 12
+
+        # Build all tasks; seed uniquely per (group, ep).
+        counter_base = self._bubble_episode_counter
+        self._bubble_episode_counter += n_groups
+        tasks: List[Tuple[int, int, int, int]] = []  # (i, j, ep, group_idx)
+        for g, (i, j) in enumerate(group_targets):
+            for ep in range(12):
+                seed = self._seed_base + 2_000_000_000 + (counter_base + g) * 13 + ep
+                tasks.append((i, j, ep, seed))
+
+        results: Dict[Tuple[int, int], List[float]] = {}
+        for (i, j) in set(group_targets):
+            results[(i, j)] = []
+
+        with ThreadPoolExecutor(max_workers=self._max_concurrent) as executor:
+            em_available = list(range(self._max_concurrent))
+            pending = list(tasks)
+            future_to_info: Dict = {}
+
+            def _submit_batch() -> None:
+                while pending and em_available:
+                    i_idx, j_idx, _ep, seed = pending.pop(0)
+                    em_idx = em_available.pop(0)
+                    src_rank = ARENA_SRC_RANK_BASE + (self._max_concurrent + em_idx) * 2
+                    future = executor.submit(
+                        play_episode,
+                        self._bubble_env_managers[em_idx],
+                        self.policies[i_idx],
+                        self.policies[j_idx],
+                        self._generate_scheduler,
+                        self._tokenizer,
+                        self._pipeline_config,
+                        self._worker_config,
+                        seed,
+                        src_rank,
+                    )
+                    future_to_info[future] = (i_idx, j_idx, em_idx)
+
+            _submit_batch()
+            n_completed = 0
+            total = len(tasks)
+
+            while future_to_info:
+                for future in as_completed(future_to_info):
+                    i_idx, j_idx, em_idx = future_to_info.pop(future)
+                    try:
+                        payoff: float = future.result()
+                    except Exception as exc:
+                        logger.debug(f"PayoffMatrix bubble_eval ({i_idx},{j_idx}) aborted/failed: {exc}")
+                        payoff = None
+                    if payoff is not None:
+                        results[(i_idx, j_idx)].append(payoff)
+                    em_available.append(em_idx)
+                    n_completed += 1
+                    _submit_batch()
+                    if n_completed >= 36 and stop_event.is_set():
+                        logger.info("PayoffMatrix bubble_eval: stop_event set, interrupting after %d/%d.", n_completed, total)
+                        return None
+                    break  # re-enter as_completed with updated future_to_info
+
+        logger.info("PayoffMatrix bubble_eval: all %d episodes complete.", total)
+        return results
+
+    def commit_bubble_eval(self, results: Dict[Tuple[int, int], List[float]]) -> None:
+        """Accumulate bubble eval results into online estimator."""
+        for (i, j), payoffs in results.items():
+            self._online_sum[i, j] += sum(payoffs)
+            self._online_count[i, j] += len(payoffs)
 
     def log(self) -> None:
         """Pretty-print the current payoff matrix."""
