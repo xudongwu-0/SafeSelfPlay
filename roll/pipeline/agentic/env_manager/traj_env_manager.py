@@ -416,4 +416,12 @@ class TrajEnvManager(BaseEnvManager):
         }
         env_metric["env/response_length"] = response_length
         lm_input.meta_info = {"metrics": env_metric}
+
+        if self.pipeline_config.enable_reasoning_filter:
+            from roll.pipeline.agentic.utils import _REASONING_BUG_KEYS, _REASONING_GOOD_KEYS
+            for key in _REASONING_BUG_KEYS + _REASONING_GOOD_KEYS:
+                # Default to 0.0 for keys the env didn't emit (e.g. conditional metrics).
+                # dtype=object is required by DataProto.check_consistency.
+                lm_input.non_tensor_batch[key] = np.array([float(env_metric.get(key, 0.0))], dtype=object)
+
         return lm_input

@@ -669,3 +669,67 @@ def agentic_compute_advantage(
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns
     return data
+
+
+_REASONING_BUG_KEYS = [
+    "reasoning/card_strength_error",
+    "reasoning/card_rank_error",
+    "reasoning/impossible_opponent_card",
+    "reasoning/wrong_poker_rules",
+    "reasoning/hallucinated_opponent_action",
+]
+_REASONING_GOOD_KEYS = [
+    "reasoning/think_present",
+    "reasoning/mentions_card",
+    "reasoning/action_consistent",
+    "reasoning/mentions_opponent_action",
+]
+
+
+def compute_reasoning_scores(
+    batch: DataProto,
+    bug_weight: float,
+    good_weight: float,
+    length_weight: float,
+) -> np.ndarray:
+    """Return a per-sample reasoning quality score (higher = better)."""
+    n = len(batch)
+    scores = np.zeros(n, dtype=np.float32)
+    for key in _REASONING_BUG_KEYS:
+        if key in batch.non_tensor_batch:
+            scores += bug_weight * batch.non_tensor_batch[key].astype(np.float32)
+    for key in _REASONING_GOOD_KEYS:
+        if key in batch.non_tensor_batch:
+            scores += good_weight * batch.non_tensor_batch[key].astype(np.float32)
+    if length_weight != 0.0:
+        lengths = batch.batch["response_mask"].sum(dim=-1).float().cpu().numpy()
+        scores += length_weight * lengths
+    return scores
+
+
+def filter_by_reasoning_score(
+    batch: DataProto,
+    keep_n: int,
+    bug_weight: float,
+    good_weight: float,
+    length_weight: float,
+) -> tuple[DataProto, np.ndarray]:
+    """Keep top-keep_n samples by reasoning score; break ties randomly.
+
+    Returns the filtered batch and the scores array for the *full* batch.
+    """
+    scores = compute_reasoning_scores(batch, bug_weight, good_weight, length_weight)
+    noisy = scores + np.random.rand(len(scores)) * 1e-8
+    top_idxs = np.argsort(noisy)[::-1][:keep_n]
+    top_idxs = np.sort(top_idxs)
+    return batch.select_idxs(top_idxs), scores
+
+
+def compute_reasoning_filter_metrics(scores: np.ndarray) -> dict:
+    """Score-distribution metrics logged under reasoning/filter/."""
+    return {
+        "reasoning/filter/score_mean": float(scores.mean()),
+        "reasoning/filter/score_max": float(scores.max()),
+        "reasoning/filter/score_min": float(scores.min()),
+        "reasoning/filter/score_std": float(scores.std()),
+    }

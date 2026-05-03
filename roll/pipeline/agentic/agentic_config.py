@@ -241,6 +241,14 @@ class AgenticConfig(PPOConfig):
         default=False,
         metadata={"help": "Smoke test only. Log each agent observation+response at INFO level."},
     )
+    enable_reasoning_filter: bool = field(
+        default=False,
+        metadata={"help": "Attach per-step reasoning quality metrics to the batch for logging."},
+    )
+    reasoning_filter_n: int = field(
+        default=0,
+        metadata={"help": "Keep top-N samples by reasoning score per batch (0 = disabled)."},
+    )
     dirty_data_mask: bool = field(default=False, metadata={"help": "if dirty data mask is True, will mask dirty data"})
     open_feedback_turn: bool = field(default=False, metadata={"help": "open feedback turn"})
     use_token_reward: bool = field(default=False, metadata={"help": "use token reward"})
