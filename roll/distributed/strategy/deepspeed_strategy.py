@@ -376,18 +376,29 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         )
 
         logger.info(f"max steps pipeline {self.worker_config.training_args.max_steps}")
-        self.worker_config.training_args.max_steps = (
-            self.worker_config.training_args.max_steps // self.worker.rank_info.dp_size
-        )
-        logger.info(f"max steps worker train {self.worker_config.training_args.max_steps}")
+        # Match the per-generation budget used by PSRO resets: prefer fsp_score_timeout
+        # (the per-generation cap) over max_steps (the full training budget) so the
+        # initial LR curve is identical to every subsequent cold-start reset.
+        _pc = self.worker.pipeline_config
+        _fsp_timeout = getattr(_pc, 'fsp_score_timeout', 0)
+        _fsp_threshold = getattr(_pc, 'fsp_score_threshold', 0)
+        _fsp_save_steps = getattr(_pc, 'fsp_save_steps', 0)
+        if _fsp_threshold > 0 and _fsp_timeout > 0:
+            _generation_steps = _fsp_timeout
+        elif _fsp_save_steps > 0:
+            _generation_steps = _fsp_save_steps
+        else:
+            _generation_steps = self.worker_config.training_args.max_steps
+        total_scheduler_steps = self._compute_scheduler_steps(_generation_steps)
+        self.worker_config.training_args.max_steps = total_scheduler_steps
+        logger.info(f"max steps worker train (scheduler steps) {self.worker_config.training_args.max_steps} "
+                    f"from generation_steps={_generation_steps}")
 
         scheduler = get_scheduler(
             self.worker_config.training_args.lr_scheduler_type,
             optimizer,
-            num_warmup_steps=self.worker_config.training_args.get_warmup_steps(
-                self.worker_config.training_args.max_steps
-            ),
-            num_training_steps=self.worker_config.training_args.max_steps,
+            num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
+            num_training_steps=total_scheduler_steps,
         )
 
         self.model, self.optimizer, _, self.scheduler = deepspeed.initialize(
@@ -410,10 +421,8 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             new_scheduler = get_scheduler(
                 self.worker_config.training_args.lr_scheduler_type,
                 sched_opt,
-                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(
-                    self.worker_config.training_args.max_steps
-                ),
-                num_training_steps=self.worker_config.training_args.max_steps,
+                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
+                num_training_steps=total_scheduler_steps,
             )
             self.scheduler = new_scheduler
             if hasattr(self.model, "lr_scheduler"):
@@ -423,6 +432,20 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
 
         logger.info(f"{self.model}")
         dist.barrier()
+
+    def _compute_scheduler_steps(self, num_pipeline_steps: int) -> int:
+        """Convert global pipeline steps to LR scheduler steps.
+
+        The scheduler is stepped once per strategy.train_step call, and there can be
+        multiple such calls per pipeline step depending on batch size / grad accumulation.
+        """
+        backward_batch_size = (
+            self.worker_config.training_args.per_device_train_batch_size
+            * self.worker_config.training_args.gradient_accumulation_steps
+        )
+        rollout_per_rank = self.worker.pipeline_config.rollout_batch_size // self.worker.rank_info.dp_size
+        backward_steps_per_global = max(1, rollout_per_rank * self.worker.pipeline_config.ppo_epochs // backward_batch_size)
+        return max(1, num_pipeline_steps * backward_steps_per_global)
 
     def op_compute_language_loss(self, logits: torch.Tensor, labels: torch.Tensor):
         """
@@ -595,16 +618,16 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         except Exception as e:
             logger.warning(f"reset_lora_weights: failed to clear optimizer state: {e}")
 
-        # Rebuild LR scheduler from step 0. num_training_steps is in pipeline-step units;
-        # divide by dp_size the same way setup() does to get the per-rank step count.
-        per_rank_steps = max(1, num_training_steps // self.worker.rank_info.dp_size)
+        # Rebuild LR scheduler from step 0. num_training_steps is in global pipeline-step
+        # units; convert to actual scheduler steps (multiple per pipeline step).
+        total_scheduler_steps = self._compute_scheduler_steps(num_training_steps)
         try:
             sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
             new_scheduler = get_scheduler(
                 self.worker_config.training_args.lr_scheduler_type,
                 sched_opt,
-                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(per_rank_steps),
-                num_training_steps=per_rank_steps,
+                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
+                num_training_steps=total_scheduler_steps,
             )
             self.scheduler = new_scheduler
             if hasattr(self.model, "lr_scheduler"):
@@ -614,7 +637,8 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
 
         logger.info(f"reset_lora_weights: reinit {num_a} lora_A + {num_b} lora_B params; "
                     f"synced {num_fp32_synced} fp32 master groups; Adam state cleared; "
-                    f"LR scheduler rebuilt for {per_rank_steps} per-rank steps")
+                    f"LR scheduler rebuilt for {total_scheduler_steps} scheduler steps "
+                    f"(= {num_training_steps} pipeline steps)")
         return {"lora_A_reset": num_a, "lora_B_reset": num_b}
 
     def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", local_state_path=None, is_last_step=None, **kwargs):
