@@ -72,15 +72,19 @@ def _create_arena_env_manager(
     tokenizer: PreTrainedTokenizer,
     generate_scheduler,
     env_id: int = 0,
+    env_config_overrides: Optional[Dict] = None,
 ) -> TwoPlayerTrajEnvManager:
     """Create a lightweight TwoPlayerTrajEnvManager for arena evaluation."""
     cfg_template = pipeline_config.custom_envs[env_tag]
+    config = dict(cfg_template.get("env_config", {}))
+    if env_config_overrides:
+        config.update(env_config_overrides)
     env_config = DictConfig({
         **cfg_template,
         "tag": env_tag,
         "group_id": 0,
         "env_id": env_id,
-        "config": dict(cfg_template.get("env_config", {})),
+        "config": config,
         "env_class": cfg_template.env_type,
         "env_manager_cls": cfg_template.get(
             "env_manager_cls",
@@ -452,6 +456,35 @@ def tracker_log_payoff_matrix(
         columns = ["model"] + labels
         data = [[labels[i]] + [round(float(payoff_matrix[i][j]), 4) for j in range(n)] for i in range(n)]
         metrics["arena/payoff_matrix"] = wandb.Table(columns=columns, data=data)
+
+    tracker.log(values=metrics, step=step)
+
+
+def tracker_log_psro(
+    payoff_matrix: np.ndarray,
+    lora_paths: List[Optional[str]],
+    nash_probs: Optional[np.ndarray],
+    tracker,
+    step: int,
+) -> None:
+    """Log PSRO payoff matrix and Nash opponent sampling probabilities to wandb as Tables."""
+    from roll.utils.tracking import WandbTracker
+
+    if not isinstance(tracker, WandbTracker):
+        return
+
+    import wandb
+    n = len(lora_paths)
+    labels = [_get_model_label(p) for p in lora_paths]
+
+    metrics = {}
+    columns = ["model"] + labels
+    data = [[labels[i]] + [round(float(payoff_matrix[i][j]), 4) for j in range(n)] for i in range(n)]
+    metrics["psro/payoff_matrix"] = wandb.Table(columns=columns, data=data)
+
+    if nash_probs is not None and len(nash_probs) == n:
+        prob_data = [[labels[i], round(float(nash_probs[i]), 4)] for i in range(n)]
+        metrics["psro/opponent_prob"] = wandb.Table(columns=["policy", "prob"], data=prob_data)
 
     tracker.log(values=metrics, step=step)
 

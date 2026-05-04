@@ -71,7 +71,11 @@ class PayoffMatrix:
         if self._pipeline_config.psro_bubble_eval_episodes > 0:
             logger.info(f"PayoffMatrix: creating {max_concurrent} dedicated bubble eval env managers...")
             self._bubble_env_managers = [
-                _create_arena_env_manager(pipeline_config, env_tag, tokenizer, generate_scheduler, env_id=max_concurrent + idx)
+                _create_arena_env_manager(
+                    pipeline_config, env_tag, tokenizer, generate_scheduler,
+                    env_id=max_concurrent + idx,
+                    env_config_overrides={"debug_mode": True},
+                )
                 for idx in range(max_concurrent)
             ]
 
