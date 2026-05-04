@@ -10,7 +10,7 @@ Setup:
 Optional overrides via env:
     FSP_CONFIG_NAME   -- hydra config name (default: agent_kuhn_poker_fsp_async_smoke)
     FSP_MAX_STEPS     -- override max_steps
-    FSP_GPU           -- Modal GPU spec (default: A10G:4)
+    FSP_GPU           -- Modal GPU spec (default: A100-40GB:4)
 """
 import os
 import modal
@@ -118,8 +118,8 @@ app = modal.App("roll-fsp-demo", image=image)
 
 
 @app.function(
-    gpu=os.environ.get("FSP_GPU", "A10G:4"),
-    timeout=7200,  # 2 h ceiling; smoke test finishes in ~20 min
+    gpu=os.environ.get("FSP_GPU", "A100-40GB:4"),
+    timeout=86400,  # 24 h ceiling for full 1k-step runs
     memory=65536,  # 64 GB RAM
     volumes={
         "/root/.cache/huggingface": hf_cache,
@@ -170,4 +170,7 @@ def run_fsp_async_demo(
 @app.local_entrypoint()
 def main() -> None:
     config_name = os.environ.get("FSP_CONFIG_NAME", "agent_kuhn_poker_fsp_async_smoke")
-    run_fsp_async_demo.remote(config_name=config_name)
+    extra_raw = os.environ.get("FSP_EXTRA_OVERRIDES", "")
+    # Prefix each override with ++ so Hydra allows keys not already in the YAML schema.
+    extra_overrides = [f"++{o.strip()}" for o in extra_raw.split(",") if o.strip()] or None
+    run_fsp_async_demo.remote(config_name=config_name, extra_overrides=extra_overrides)
