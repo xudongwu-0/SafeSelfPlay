@@ -1,18 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=kuhn_psro_3b_ev
-#SBATCH --output=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_psro_3b_ev_%j.out
-#SBATCH --error=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_psro_3b_ev_%j.err
-#SBATCH --partition=preempt
+#SBATCH --job-name=kuhn_psro_3b_1k_fixLR
+#SBATCH --output=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_psro_3b_1k_fixLR_%j.out
+#SBATCH --error=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_psro_3b_1k_fixLR_%j.err
+#SBATCH --partition=general
+#SBATCH --qos=qos_general
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=192G
-#SBATCH --time=7-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --gres=gpu:a6000:4
 
 set -ex
 
 CONDA_ROOT=/zfsauton/scratch/wentsec/miniconda3
-ENV_PATH=/zfsauton/scratch/wentsec/envs/roll2
+ENV_PATH=/zfsauton/scratch/wentsec/envs/roll3
 ROLL_DIR=/zfsauton/scratch/wentsec/ROLL
 
 RUN_ID="${SLURM_JOB_ID:-$(date +%s)}_$(hostname -s)_$$"
@@ -47,15 +48,11 @@ sleep 2
 cd $ROLL_DIR
 python examples/start_agentic_pipeline.py \
     --config_path agentic_demo \
-    --config_name agent_kuhn_poker_psro_3b \
-    exp_name=kuhn_psro_3b_ev \
-    'tracker_kwargs.tags=[kuhn_poker,psro,qwen2_5_3b,cold_start,async,auton,ev_payoff]' \
+    --config_name agent_kuhn_poker_psro_3b_1k_fixLR \
     logging_dir=${FSP_OUTPUT_ROOT}/logs \
     output_dir=${FSP_OUTPUT_ROOT} \
     checkpoint_config.output_dir=${FSP_OUTPUT_ROOT}/render \
-    enable_reasoning_filter=true \
-    reasoning_filter_n=132 \
     2>&1
 
 rm -rf $TMPDIR
-echo "===== PSRO 3B EV DONE (RUN_ID=${RUN_ID}) ====="
+echo "===== kuhn_psro_3b_1k_fixLR DONE (RUN_ID=${RUN_ID}) ====="
