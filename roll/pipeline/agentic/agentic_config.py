@@ -241,6 +241,10 @@ class AgenticConfig(PPOConfig):
         default=False,
         metadata={"help": "Smoke test only. Log each agent observation+response at INFO level."},
     )
+    response_log_steps: int = field(
+        default=0,
+        metadata={"help": "Log sample rollout responses to wandb every N steps (0 = disabled)."},
+    )
     enable_reasoning_filter: bool = field(
         default=False,
         metadata={"help": "Attach per-step reasoning quality metrics to the batch for logging."},
@@ -248,6 +252,14 @@ class AgenticConfig(PPOConfig):
     reasoning_filter_n: int = field(
         default=0,
         metadata={"help": "Keep top-N samples by reasoning score per batch (0 = disabled)."},
+    )
+    reasoning_bug_weight: float = field(
+        default=-1.0,
+        metadata={"help": "Weight applied to each bug key when computing reasoning/score (negative = penalty)."},
+    )
+    reasoning_good_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight applied to each good key when computing reasoning/score."},
     )
     dirty_data_mask: bool = field(default=False, metadata={"help": "if dirty data mask is True, will mask dirty data"})
     open_feedback_turn: bool = field(default=False, metadata={"help": "open feedback turn"})

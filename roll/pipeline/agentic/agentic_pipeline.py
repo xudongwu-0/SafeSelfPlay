@@ -75,7 +75,12 @@ def _kuhn_derived_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
                 break
     if env_tag is None:
         return {}
-    return compute_derived_metrics(metrics, env_tag=env_tag)
+    derived = compute_derived_metrics(metrics, env_tag=env_tag)
+    # Drop raw visit/bet indicators — redundant with kuhn/entropy/* and nash/p_bet/*
+    for k in list(metrics.keys()):
+        if f"env/{env_tag}/kuhn_visit/" in k or f"env/{env_tag}/kuhn_bet/" in k:
+            del metrics[k]
+    return derived
 
 class AgenticPipeline(BasePipeline):
     def __init__(self, pipeline_config: AgenticConfig):
@@ -627,7 +632,12 @@ class AgenticPipeline(BasePipeline):
                     metrics["psro/bubble_eval/total_online"] = int(np.sum(self._psro_loop.payoff_matrix._online_count))
                     if _bubble_results is not None:
                         all_payoffs = [p for payoffs in _bubble_results.values() for p in payoffs]
-                        metrics["psro/bubble_eval/payoff_std"] = float(np.std(all_payoffs)) if all_payoffs else 0.0
+                        if all_payoffs:
+                            n = len(all_payoffs)
+                            sem = float(np.std(all_payoffs, ddof=1) / np.sqrt(n))
+                            metrics["psro/bubble_eval/payoff_ci95"] = 2 * 1.96 * sem
+                        else:
+                            metrics["psro/bubble_eval/payoff_ci95"] = 0.0
 
                 with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
                     data_metrics = compute_train_data_metrics(batch=batch)
@@ -694,6 +704,15 @@ class AgenticPipeline(BasePipeline):
                                 ray.get(self.train_rollout_scheduler.update_nash_probabilities.remote(nash_list))
                                 ray.get(self.val_rollout_scheduler.update_nash_probabilities.remote(nash_list))
                             metrics["psro/iteration"] = self._psro_loop._iteration
+
+                            from roll.pipeline.agentic.arena_eval import tracker_log_psro
+                            tracker_log_psro(
+                                payoff_matrix=self._psro_loop.payoff_matrix._matrix,
+                                lora_paths=self._psro_loop.payoff_matrix.policies,
+                                nash_probs=nash_probs,
+                                tracker=self.tracker,
+                                step=global_step,
+                            )
 
                     # Cold-start: reset training LoRA to initial weights so the next
                     # generation trains from scratch against the enemy pool.
@@ -764,6 +783,21 @@ class AgenticPipeline(BasePipeline):
                                 break
                         logger.info(json.dumps(log_res, ensure_ascii=False))
                         logger.info(json.dumps(metrics, ensure_ascii=False))
+
+                        rls = self.pipeline_config.response_log_steps
+                        if rls > 0 and global_step % rls == 0:
+                            from roll.utils.tracking import WandbTracker
+                            if isinstance(self.tracker, WandbTracker):
+                                import wandb
+                                parts = []
+                                for traj_idx, traj in enumerate(log_res):
+                                    parts.append(f"=== traj {traj_idx} ===")
+                                    for step_idx, item in enumerate(traj):
+                                        parts.append(f"[step {step_idx}] score={item['episode_score']}")
+                                        parts.append(f"PROMPT: {item['prompt']}")
+                                        parts.append(f"RESPONSE: {item['response']}")
+                                text = "\n".join(parts)
+                                metrics["rollout/responses"] = wandb.Html(f"<pre>{text}</pre>")
 
                 metrics["time/step_log"] = log_timer.last
 

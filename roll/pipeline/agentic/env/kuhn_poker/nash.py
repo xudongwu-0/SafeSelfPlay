@@ -199,7 +199,6 @@ def compute_derived_metrics(
     for iset, p_bet in policy.items():
         nash_p = NASH_BET[iset]
         delta = abs(p_bet - nash_p)
-        derived[f"nash/p_bet/{iset}"] = p_bet
         derived[f"nash/l1/{iset}"] = delta
         total_l1 += delta
         n += 1
