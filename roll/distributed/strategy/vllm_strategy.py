@@ -1,10 +1,25 @@
 import asyncio
 import copy
 import gc
+import hashlib as _hashlib
+import inspect
 import os
 from collections import deque
 from typing import Dict, List, Optional
 from packaging.version import Version
+
+# Must match _TRAINING_LORA_INT_ID in roll/third_party/vllm/worker.py.
+_TRAINING_LORA_INT_ID: int = int(_hashlib.sha256(b"roll_training_lora_v1").hexdigest(), 16) % 0x7FFFFFFF
+
+# Default sentinel path for the training LoRA slot. vLLM caches the adapter by
+# lora_int_id so the directory is not actually read; the value just needs to be
+# stable. Users can override via pipeline_config.training_lora_path.
+_DEFAULT_TRAINING_LORA_PATH: str = os.path.join(os.path.expanduser("~"), ".cache", "roll", "training_lora_v1")
+
+
+def _resolve_training_lora_path(pipeline_config) -> str:
+    """Return the training LoRA sentinel path: pipeline_config override or per-user default."""
+    return getattr(pipeline_config, "training_lora_path", None) or _DEFAULT_TRAINING_LORA_PATH
 
 import torch
 import torch.distributed as dist
@@ -14,7 +29,14 @@ import vllm
 from vllm import RequestOutput, SamplingParams
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, BeamSearchParams
-from vllm.inputs.data import TokensPrompt
+try:
+    from vllm.inputs.data import TokensPrompt
+except ImportError:
+    from vllm.inputs import TokensPrompt
+try:
+    from vllm.inputs.engine import tokens_input as _tokens_input
+except ImportError:
+    _tokens_input = None
 from vllm.utils import random_uuid
 
 from roll.distributed.executor.worker import Worker
@@ -51,6 +73,10 @@ class VllmStrategy(InferenceStrategy):
         # Must explicitly set VLLM_USE_V1 to pass this check: https://github.com/vllm-project/vllm/pull/14972
         os.environ["VLLM_USE_V1"] = str(vllm_config.pop("VLLM_USE_V1", 1))
         self.sleep_level = vllm_config.pop("sleep_level", 1)
+
+        # Push the training LoRA sentinel path to env so vLLM workers (subprocess) see it.
+        self._training_lora_path = _resolve_training_lora_path(self.worker.pipeline_config)
+        os.environ["ROLL_TRAINING_LORA_PATH"] = self._training_lora_path
 
         data_parallel_size = vllm_config.get("data_parallel_size", 1)
         if data_parallel_size > 1:
@@ -91,11 +117,18 @@ class VllmStrategy(InferenceStrategy):
             }
         )
 
+        # Materialize reasoning_config dict into ReasoningConfig so vLLM's
+        # thinking_token_budget path (SamplingParams → logits_processors) is active.
+        # Accepts: {} (defaults: <think>/</think>) or a dict of overrides.
+        if isinstance(vllm_config.get("reasoning_config"), dict):
+            from vllm.config.reasoning import ReasoningConfig
+            vllm_config["reasoning_config"] = ReasoningConfig(**vllm_config["reasoning_config"])
+
         self.is_lora = self.worker_config.model_args.lora_target is not None
         if self.is_lora:
             lora_kwargs = {
                 "enable_lora": True,
-                "max_loras": 1,
+                "max_loras": vllm_config.get("max_loras", 1),
                 "max_lora_rank": self.worker_config.model_args.lora_rank,
             }
             vllm_config.update(lora_kwargs)
@@ -114,6 +147,30 @@ class VllmStrategy(InferenceStrategy):
 
         self.model = await create_async_llm(resource_placement_groups=self.worker_config.resource_placement_groups, **vllm_config)
 
+        _tok = self.model.get_tokenizer()
+        self.tokenizer = await _tok if inspect.iscoroutine(_tok) else _tok
+        additional_special_tokens = (
+            getattr(self.tokenizer, "additional_special_tokens", None)
+            or getattr(self.tokenizer, "extra_special_tokens", None)
+            or []
+        )
+        special_tokens = [
+            add_token
+            for add_token in self.tokenizer.added_tokens_decoder.values()
+            if add_token.special and add_token.content not in additional_special_tokens
+        ]
+        try:
+            self.tokenizer.add_special_tokens(
+                {"additional_special_tokens": special_tokens}, replace_additional_special_tokens=False
+            )
+        except TypeError:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+        _current = (
+            getattr(self.tokenizer, "additional_special_tokens", None)
+            or getattr(self.tokenizer, "extra_special_tokens", None)
+            or []
+        )
+        logger.info(f"add {special_tokens} to additional_special_tokens: {_current}")
 
         if Version("0.15.0") <= Version(vllm.__version__):
             self.tokenizer = self.model.get_tokenizer()
@@ -148,6 +205,45 @@ class VllmStrategy(InferenceStrategy):
         """Check if beam search should be used based on generation_config."""
         return generation_config.get("num_beams", 1) > 1 or generation_config.get("use_beam_search", False)
 
+    async def _resolve_lora_request(self, batch: DataProto):
+        """Resolve LoRA request from batch meta_info.
+
+        If lora_name is explicitly set in meta_info:
+          - None → base model (no LoRA)
+          - str (path) → file-based LoRA from checkpoint on disk
+        If lora_name not in meta_info: default to first registered LoRA (backward compat).
+        """
+        if not self.is_lora:
+            return None
+        if "lora_name" in batch.meta_info:
+            lora_name = batch.meta_info["lora_name"]
+            if lora_name is None:
+                return None
+            # File-based LoRA from enemy pool checkpoint
+            lora_int_id = int(_hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
+            return LoRARequest(lora_name=lora_name, lora_int_id=lora_int_id, lora_path=lora_name)
+        # Training agent: use the fixed slot loaded by model_update / custom_add_lora.
+        # model_update (PHASE 3) always runs before rollout (PHASE 7) each step.
+        return LoRARequest(
+            lora_name="training_lora",
+            lora_int_id=_TRAINING_LORA_INT_ID,
+            lora_path=self._training_lora_path,
+        )
+
+    async def _resolve_lora_request_from_name(self, lora_name):
+        if not self.is_lora:
+            return None
+        if lora_name is None:
+            return None  # base model (opponent with current_opponent_lora=None)
+        if lora_name == "training_lora":
+            return LoRARequest(
+                lora_name="training_lora",
+                lora_int_id=_TRAINING_LORA_INT_ID,
+                lora_path=self._training_lora_path,
+            )
+        lora_int_id = int(_hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
+        return LoRARequest(lora_name=lora_name, lora_int_id=lora_int_id, lora_path=lora_name)
+
     async def _generate_standard(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:
         """Standard generate method for non-beam search cases."""
         sampling_params = SamplingParams(**create_sampling_params_for_vllm(gen_kwargs=generation_config))
@@ -162,12 +258,7 @@ class VllmStrategy(InferenceStrategy):
                 for prompt in gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
             ]
 
-        lora_request = None
-        if self.is_lora:
-            lora_int_ids = list(await self.model.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
-                lora_request = LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="dummy_lora_path")
+        lora_request = await self._resolve_lora_request(batch)
 
         async def _generate(prompt):
             request_id = random_uuid()
@@ -267,14 +358,14 @@ class VllmStrategy(InferenceStrategy):
                                 if "multi_modal_data" in multi_modal_data else None)
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids, multi_modal_data=multi_modal_data)
         else:
-            prompt = TokensPrompt(prompt_token_ids=payload["input_ids"])
-
-        lora_request = None
-        if self.is_lora:
-            lora_int_ids = list(await self.model.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
-                lora_request = LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="dummy_lora_path")
+            ids = payload["input_ids"]
+            if hasattr(ids, "tolist"):
+                ids = ids.tolist()
+            if _tokens_input is not None:
+                prompt = _tokens_input(prompt_token_ids=ids)
+            else:
+                prompt = TokensPrompt(prompt_token_ids=ids)
+        lora_request = await self._resolve_lora_request_from_name(payload.get("lora_name"))
 
         result_generator = self.model.generate(
             prompt=prompt,
@@ -402,9 +493,17 @@ def gather_outputs_to_pad_tensor(request_outputs: List["RequestOutput"], pad_tok
 
 
 def create_sampling_params_for_vllm(gen_kwargs, collect_unfinished=False):
-    # TODO vLLM support partial rollout in v1 from 0.10.1, and do not need to set RequestOutputKind to CUMULATIVE
-    output_kind = RequestOutputKind.CUMULATIVE if collect_unfinished else RequestOutputKind.FINAL_ONLY
-    return dict(
+    # TODO vllm 0.10.2 support partial rollout, and do not need to set RequestOutputKind to CUMULATIVE
+    output_kind = gen_kwargs.get("output_kind", RequestOutputKind.FINAL_ONLY)
+    if output_kind != RequestOutputKind.FINAL_ONLY:
+        assert gen_kwargs["num_return_sequences"] == 1, (
+            "fetch_output only supports num_return_sequences=1 or output_kind=FINAL"
+        )
+    structured_outputs = None
+    if gen_kwargs.get("structured_outputs_regex"):
+        from vllm.sampling_params import StructuredOutputsParams
+        structured_outputs = StructuredOutputsParams(regex=gen_kwargs["structured_outputs_regex"])
+    sampling_kwargs = dict(
         max_tokens=gen_kwargs["max_new_tokens"],
         temperature=gen_kwargs["temperature"],
         top_p=gen_kwargs["top_p"],
@@ -417,3 +516,9 @@ def create_sampling_params_for_vllm(gen_kwargs, collect_unfinished=False):
         output_kind=output_kind,
         include_stop_str_in_output=gen_kwargs.get("include_stop_str_in_output", True),
     )
+    if structured_outputs is not None:
+        sampling_kwargs["structured_outputs"] = structured_outputs
+    thinking_token_budget = gen_kwargs.get("thinking_token_budget")
+    if thinking_token_budget is not None:
+        sampling_kwargs["thinking_token_budget"] = thinking_token_budget
+    return sampling_kwargs

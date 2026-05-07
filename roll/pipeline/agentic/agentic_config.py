@@ -41,7 +41,7 @@ def _resolve_reward_norm_defaults(method: str, grouping: str) -> Dict[str, Optio
 
 @dataclass
 class RewardNormalizationConfig:
-    grouping: str = field(default="batch", metadata={"help": "state / batch / inductive / global"})
+    grouping: str = field(default="traj_group_id", metadata={"help": "state / batch / inductive / traj_group_id. Auto-upgrades to init_state_id if env provides get_init_state_id()."})
     method: str = field(
         default="identity",
         metadata={
@@ -50,13 +50,13 @@ class RewardNormalizationConfig:
         },
     )
     norm_mean_type: Optional[Literal["batch", "group"]] = field(
-        default=None,
+        default="group",
         metadata={
             "help": "Mean type for reward normalization: 'batch' (normalize across batch), 'group' (normalize within groups), None (without subtracting mean)"
         },
     )
     norm_std_type: Optional[Literal["batch", "group"]] = field(
-        default=None,
+        default="group",
         metadata={
             "help": "Std type for reward normalization: 'batch' (normalize across batch), 'group' (normalize within groups), None (without dividing by std)"
         },
@@ -70,6 +70,29 @@ class RewardNormalizationConfig:
     global_shift_value: Optional[float] = field(
         default=None,
         metadata={"help": "Shift value for global reward transformation. Applied after scaling if specified."},
+    )
+    blended_baseline_c: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set, enables Empirical Bayesian Shrinkage advantage normalization for multi-opponent GRPO. "
+                "c is the smoothing hyperparameter (default 3.0 when enabled). "
+                "Requires 'opponent_id' in non_tensor_batch (stored by TwoPlayerTrajEnvManager). "
+                "When active, grouping/norm_mean_type/norm_std_type are ignored."
+            )
+        },
+    )
+    stratified_baseline: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Re-weighted stratified mean baseline for multi-opponent GRPO. "
+                "Within each GRPO group: baseline = Σ_k(w_k * mu_k) / Σ_k(w_k) over sampled opponents, "
+                "correcting selection bias when empirical sampling deviates from Nash weights. "
+                "Requires 'opponent_id' in non_tensor_batch and opponent_prob_map at runtime (psro_mode=True). "
+                "Mutually exclusive with blended_baseline_c. When active, norm_mean_type/norm_std_type are ignored."
+            )
+        },
     )
 
     def __post_init__(self):
@@ -134,6 +157,14 @@ class EnvManagerConfig(WorkerConfig):
         default=-1, metadata={"help": "The maximum number of trajectories that each environment can rollout."}
     )
     format_penalty: float = field(default=0, metadata={"help": "Format penalty value."})
+    smoke_opponent_strategy: Optional[str] = field(
+        default=None,
+        metadata={"help": "Smoke test only. 'always_bet' bypasses vLLM opponent and returns Bet every turn."},
+    )
+    include_opponent_reasoning: bool = field(
+        default=False,
+        metadata={"help": "If True, prepend opponent's <think>...</think> block to the agent's observation so the agent trains on the opponent's reasoning path."},
+    )
     worker_cls: Optional[str] = field(
         default="roll.pipeline.agentic.environment_worker.EnvironmentWorker",
         metadata={"help": "The class of the worker."},
@@ -188,6 +219,27 @@ class AgenticConfig(PPOConfig):
     custom_envs: Dict[str, Any] = field(default_factory=dict, metadata={"help": "List of environment configurations."})
     train_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     val_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
+    fsp_save_steps: int = field(default=0, metadata={"help": "Fictitious self-play: save LoRA to enemy pool every N steps. 0 = disabled."})
+    cold_start: bool = field(default=True, metadata={"help": "FSP cold-start: after each fsp_save_steps snapshot, reset training LoRA to initial (PEFT default) weights so the next generation trains from scratch."})
+    fsp_opponent_weight_mode: str = field(default="uniform", metadata={"help": "FSP enemy-pool sampling weights. 'uniform' = equal probability (default, preserves original behavior). 'linear' = weight proportional to (index+1); newer checkpoints are more likely. 'exponential' = weight 2**index, stronger recency bias."})
+    fsp_score_threshold: float = field(default=0.0, metadata={"help": "If > 0, trigger FSP switch when rolling avg rollout/score/mean >= this value instead of fsp_save_steps. 0 = disabled (use fsp_save_steps)."})
+    fsp_score_window: int = field(default=10, metadata={"help": "Number of recent steps to average score over for fsp_score_threshold check."})
+    fsp_score_timeout: int = field(default=150, metadata={"help": "If fsp_score_threshold > 0, also trigger FSP switch when score fails to reach threshold for this many steps. 0 = disabled."})
+    fsp_score_threshold_start: float = field(default=0.0, metadata={"help": "If > 0, linearly decay fsp_score_threshold from this value down to fsp_score_threshold_end over fsp_score_timeout steps per generation. Overrides fsp_score_threshold when set."})
+    fsp_score_threshold_end: float = field(default=0.0, metadata={"help": "End value for linear threshold decay (used when fsp_score_threshold_start > 0)."})
+    psro_mode: bool = field(default=False, metadata={"help": "Enable PSRO: expand PayoffMatrix and compute Nash after each FSP generation."})
+    psro_episodes_per_pair: int = field(default=32, metadata={"help": "PSRO: episodes per (i,j) policy pair during payoff matrix expansion."})
+    psro_max_concurrent_eval: Optional[int] = field(default=None, metadata={"help": "PSRO: max concurrent arena episodes during expand_matrix. Defaults to psro_bubble_eval_episodes if set, else 256."})
+    psro_seed_base: int = field(default=12345, metadata={"help": "PSRO: base seed for PayoffMatrix episode reproducibility."})
+    arena_log_ci_table: bool = field(default=True, metadata={"help": "Log per-pair 95% CI table after arena evaluation."})
+    psro_bubble_eval_episodes: int = field(
+        default=144,
+        metadata={"help": "PSRO: episodes per bubble-eval step (0 or -1 = disabled). "
+                  "Each step runs this many parallel envs divided into groups of 12 "
+                  "(one full Kuhn Poker start-state cycle), assigned to the least-visited "
+                  "off-diagonal matrix pairs. Results discarded if training finishes before "
+                  "mandatory 36 episodes complete."},
+    )
     render_save_dir: str = field(default=None, metadata={"help": "Directory to save rendered frames."})
     reward: RewardConfig = field(default=None, metadata={"help": "Configuration for reward inference."})
     reward_normalization: RewardNormalizationConfig = field(
@@ -195,6 +247,34 @@ class AgenticConfig(PPOConfig):
     )
     env_monitor: EnvMonitorConfig = field(
         default_factory=EnvMonitorConfig, metadata={"help": "Environment monitoring configuration."}
+    )
+    debug_log_group_rewards: bool = field(
+        default=False,
+        metadata={"help": "Smoke test only. Log per-trajectory rewards after reward computation."},
+    )
+    debug_log_agent_response: bool = field(
+        default=False,
+        metadata={"help": "Smoke test only. Log each agent observation+response at INFO level."},
+    )
+    response_log_steps: int = field(
+        default=10,
+        metadata={"help": "Log sample rollout responses to wandb every N steps (0 = disabled)."},
+    )
+    enable_reasoning_filter: bool = field(
+        default=False,
+        metadata={"help": "Attach per-step reasoning quality metrics to the batch for logging."},
+    )
+    reasoning_filter_n: int = field(
+        default=0,
+        metadata={"help": "Keep top-N samples by reasoning score per batch (0 = disabled)."},
+    )
+    reasoning_bug_weight: float = field(
+        default=-1.0,
+        metadata={"help": "Weight applied to each bug key when computing reasoning/score (negative = penalty)."},
+    )
+    reasoning_good_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight applied to each good key when computing reasoning/score."},
     )
     dirty_data_mask: bool = field(default=False, metadata={"help": "if dirty data mask is True, will mask dirty data"})
     open_feedback_turn: bool = field(default=False, metadata={"help": "open feedback turn"})
@@ -221,6 +301,20 @@ class AgenticConfig(PPOConfig):
                     "partial_gpu_mode from device_mapping; when False, partial GPU logic is disabled."
         },
     )
+    filter_zero_variance_groups: bool = field(
+        default=False,
+        metadata={"help": "Zero out rewards for GRPO groups where all members got the same score. "
+                          "Prevents near-zero advantages from producing noisy gradients."},
+    )
+    early_stop_group_std_threshold: float = field(
+        default=0.0,
+        metadata={"help": "Early stop when mean per-group reward std falls below this threshold "
+                          "and mean reward > 0. Set 0 to disable."},
+    )
+    early_stop_group_std_patience: int = field(
+        default=10,
+        metadata={"help": "Number of consecutive steps below threshold before early stopping."},
+    )
 
     parse_tool_call_parameter_to_dict: bool = field(default=False, metadata={"help": "Parse tool call parameter to dict. for https://github.com/QwenLM/Qwen3-Coder/issues/444"})
 
@@ -232,6 +326,9 @@ class AgenticConfig(PPOConfig):
     )
 
     def __post_init__(self):
+        if self.psro_max_concurrent_eval is None:
+            self.psro_max_concurrent_eval = self.psro_bubble_eval_episodes if self.psro_bubble_eval_episodes > 0 else 256
+
         # Handle OPD mapping FIRST before any access to actor_train/actor_infer/reference
         # This ensures student_train/student_infer/teacher are mapped correctly
         self._handle_opd_mapping()
@@ -315,6 +412,15 @@ class AgenticConfig(PPOConfig):
                 f"The scheduler collects trajectories in complete groups, so batch_size must be divisible by group_size. "
                 f"Suggested values: rollout_batch_size={self.rollout_batch_size} with group_size in {[i for i in [1, 2, 4, 8, 16] if self.rollout_batch_size % i == 0]}, "
                 f"or group_size={self.train_env_manager.group_size} with rollout_batch_size as a multiple of {self.train_env_manager.group_size}."
+            )
+            # Enforce 1 trajectory per env per rollout: rollout_batch_size == num_env_groups * group_size.
+            # Multi-traj-per-env setups force long-lived workers to replay seeds and can skew GRPO
+            # group composition; the 1-traj path maps cleanly to one group sample per env group.
+            assert self.rollout_batch_size == train_env_num, (
+                f"rollout_batch_size ({self.rollout_batch_size}) must equal "
+                f"num_env_groups * group_size ({self.train_env_manager.num_env_groups} * "
+                f"{self.train_env_manager.group_size} = {train_env_num}). "
+                f"This guarantees exactly 1 trajectory per env per rollout (traj_per_env={traj_per_env})."
             )
 
         val_env_num = self.val_env_manager.num_env_groups * self.val_env_manager.group_size

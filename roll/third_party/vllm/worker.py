@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import json
+import os
 import time
 from collections import OrderedDict
 from typing import Iterable, Tuple
@@ -18,35 +19,37 @@ from roll.utils.send_recv_utils import monkey_patch_torch_reductions, named_tens
 
 logger = get_logger()
 
+# Fixed slot ID for the current training adapter.  All TP-ranks derive the
+# same value; it never changes between steps so the LRU cache holds exactly
+# one training-LoRA slot regardless of how many training steps are run.
+_TRAINING_LORA_INT_ID: int = int(hashlib.sha256(b"roll_training_lora_v1").hexdigest(), 16) % 0x7FFFFFFF
+
+# Default sentinel path; matches _DEFAULT_TRAINING_LORA_PATH in vllm_strategy.py.
+# Set via env var ROLL_TRAINING_LORA_PATH by the parent strategy from pipeline config.
+_DEFAULT_TRAINING_LORA_PATH: str = os.path.join(os.path.expanduser("~"), ".cache", "roll", "training_lora_v1")
+
+
+def _training_lora_path() -> str:
+    """Return the training LoRA sentinel path set by the parent strategy."""
+    return os.environ.get("ROLL_TRAINING_LORA_PATH", _DEFAULT_TRAINING_LORA_PATH)
+
 
 class TensorLoraManager:
     def __init__(self):
         self.lora_params = OrderedDict()
-        self.add_lora_count = 0
 
     def add_weight(self, name: str, weight: torch.Tensor):
         self.lora_params[name] = weight
 
     def build_request(self, peft_config: dict) -> TensorLoRARequest:
-        """
-        Generate a unique LoRA ID based on the PEFT configuration rather than
-        using a timestamp to assert all tp-ranks get the same LoRA ID.
-        """
-        self.add_lora_count += 1
-        peft_config["add_lora_count"] = self.add_lora_count
-        peft_config_str = json.dumps(peft_config, sort_keys=True)
-        hash_obj = hashlib.sha256(peft_config_str.encode("utf-8"))
-        hex_dig = hash_obj.hexdigest()
-        lora_int_id = int(hex_dig, 16) % 0x7FFFFFFF
-
+        """Build LoRA request using the fixed training slot ID."""
         lora_request = TensorLoRARequest(
-            lora_name=f"{lora_int_id}",
-            lora_int_id=lora_int_id,
-            lora_path="dummy_lora_path",
+            lora_name="training_lora",
+            lora_int_id=_TRAINING_LORA_INT_ID,
+            lora_path=_training_lora_path(),
             peft_config=peft_config,
             lora_tensors=self.lora_params,
         )
-        del self.lora_params
         self.lora_params = OrderedDict()
         return lora_request
 
@@ -166,4 +169,8 @@ class WorkerV1(WorkerBase):
     def custom_add_lora(self, peft_config) -> bool:
         lora_request = self.tensor_lora_manager.build_request(peft_config)
         super().reload_model()
+        # Evict the previous training adapter so vLLM loads fresh weights.
+        # add_adapter() skips _load_adapter when the ID is already in the LRU
+        # cache; remove_lora returns False (no-op) on the very first call.
+        self.model_runner.remove_lora(lora_request.lora_int_id)
         return self.model_runner.add_lora(lora_request)

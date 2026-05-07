@@ -248,6 +248,17 @@ class GroupQueue:
         self.progress = asyncio.Event()
         self.complete = asyncio.Event()
 
+    def flush_in_place(self) -> None:
+        """Drop queued groups but keep Event identity so existing awaiters wake up.
+        clear() replaces Events, which strands any task already inside
+        `await self.progress.wait()` on the old event (new .set() never reaches them).
+        """
+        self.current_step = None
+        self.next_episode_id = 0
+        self.groups.clear()
+        self.progress.set()
+        self.complete.set()
+
     def shutdown(self):
         self.quit = True
         self.groups.clear()
@@ -419,6 +430,15 @@ class GroupQueueManager:
         self.pending_gets = set()
         for group_queue in self.group_queue.values():
             group_queue.clear()
+
+    def flush_in_place(self) -> None:
+        """Drop queued rollouts while preserving Event identity (see GroupQueue.flush_in_place)."""
+        self.rollout_complete = {}
+        for get_task in self.pending_gets:
+            get_task.cancel()
+        self.pending_gets = set()
+        for group_queue in self.group_queue.values():
+            group_queue.flush_in_place()
 
     def advance_step(self, step):
         for group_queue in self.group_queue.values():
@@ -622,6 +642,22 @@ class RolloutScheduler(RolloutMockMixin):
         await self.router_manager.suspend.remote()
         await self.router_manager.abort_all.remote()
         await self.router_manager.wait_complete.remote()
+
+    async def flush_pending(self):
+        # FSP cold-start force-sync: drop pre-reset rollouts so the post-reset
+        # trainer never trains on data produced by the pre-reset model.
+        # Uses flush_in_place (not clear) to preserve Event identity — awaiters
+        # inside the es_manager rollout loop are bound to the existing Events.
+        await self.env_output_queue.flush_in_place.remote()
+
+    async def get_generate_scheduler(self):
+        return self.router_manager
+
+    async def update_enemy_pool(self, lora_path: str):
+        await asyncio.gather(*self.es_manager.update_enemy_pool(lora_path, blocking=False))
+
+    async def update_nash_probabilities(self, probs) -> None:
+        await asyncio.gather(*self.es_manager.update_nash_probabilities(probs, blocking=False))
 
     async def _run_rollout_loop(self, seed):
         await asyncio.gather(*self.es_manager.run_rollout_loop(seed, blocking=False))

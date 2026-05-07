@@ -1,8 +1,9 @@
 import json
 import os.path
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import ray
@@ -19,6 +20,7 @@ from roll.distributed.scheduler.rollout_scheduler import RolloutScheduler
 from roll.configs.base_config import RouterArguments
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.agentic.agentic_config import AgenticConfig, EnvManagerConfig
+from roll.pipeline.agentic.psro_loop import PSROLoop
 from roll.pipeline.agentic.utils import (
     agentic_compute_advantage,
     compute_discounted_returns,
@@ -48,6 +50,37 @@ logger = get_logger()
 
 def is_lora_training(pipeline_config: AgenticConfig) -> bool:
     return pipeline_config.actor_train.model_args.lora_target is not None
+
+
+def _kuhn_derived_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
+    """Compute Kuhn Poker Nash distance + exploitability from aggregated env metrics.
+
+    No-op if no Kuhn info-set indicators are present (other envs unaffected).
+    """
+    try:
+        from roll.pipeline.agentic.env.kuhn_poker.nash import (
+            compute_derived_metrics,
+            ALL_INFO_SETS,
+        )
+    except ImportError:
+        return {}
+    # Autodetect env tag from any kuhn_visit/ key.
+    env_tag = None
+    for k in metrics.keys():
+        if "kuhn_visit/" in k and k.startswith("env/"):
+            # Key looks like 'env/<tag>/kuhn_visit/<info_set>'
+            parts = k.split("/")
+            if len(parts) >= 3:
+                env_tag = parts[1]
+                break
+    if env_tag is None:
+        return {}
+    derived = compute_derived_metrics(metrics, env_tag=env_tag)
+    # Drop raw visit/bet indicators — redundant with kuhn/entropy/* and nash/p_bet/*
+    for k in list(metrics.keys()):
+        if f"env/{env_tag}/kuhn_visit/" in k or f"env/{env_tag}/kuhn_bet/" in k:
+            del metrics[k]
+    return derived
 
 class AgenticPipeline(BasePipeline):
     def __init__(self, pipeline_config: AgenticConfig):
@@ -209,6 +242,57 @@ class AgenticPipeline(BasePipeline):
         # Calculate tokens-per-second system throughput
         tps_timer = _Timer(window_size=5)
 
+        # Track FSP checkpoints for arena evaluation: None = base model
+        self.fsp_checkpoints: list = [None]
+        self._fsp_score_history: list[float] = []
+
+        self._bubble_future: Optional[object] = None
+        self._bubble_stop: threading.Event = threading.Event()
+        self._psro_loop: Optional[PSROLoop] = None
+        self._latest_nash_probs: Optional[np.ndarray] = None
+        if self.pipeline_config.psro_mode and self.pipeline_config.fsp_save_steps > 0:
+            _generate_scheduler = ray.get(
+                self.train_rollout_scheduler.get_generate_scheduler.remote()
+            )
+            _env_tag = list(self.pipeline_config.custom_envs.keys())[0]
+            self._psro_loop = PSROLoop(
+                generate_scheduler=_generate_scheduler,
+                pipeline_config=self.pipeline_config,
+                tokenizer=self.tokenizer,
+                env_tag=_env_tag,
+            )
+            logger.info("PSROLoop initialized (psro_mode=True).")
+
+        try:
+            self._run_impl(tps_timer)
+        finally:
+            # Clean up FSP LoRA weight directories at end of run (preserves logs/tensorboard/wandb/arena outputs)
+            if self.pipeline_config.fsp_save_steps > 0:
+                weight_dirs = [p for p in getattr(self, "fsp_checkpoints", []) if p]
+                if weight_dirs:
+                    try:
+                        import shutil as _shutil
+                        du_before = _shutil.disk_usage("/zfsauton/scratch")
+                        logger.info(f"FSP cleanup: scratch free before = {du_before.free // (1024**3)}G")
+                    except (FileNotFoundError, OSError) as e:
+                        logger.warning(f"FSP cleanup: disk_usage probe (before) failed: {e}")
+                    from roll.utils.fsp_ckpt import cleanup_fsp_weights
+                    cleanup_fsp_weights(weight_dirs)
+                    try:
+                        import shutil as _shutil
+                        du_after = _shutil.disk_usage("/zfsauton/scratch")
+                        logger.info(f"FSP cleanup: scratch free after = {du_after.free // (1024**3)}G")
+                    except (FileNotFoundError, OSError) as e:
+                        logger.warning(f"FSP cleanup: disk_usage probe (after) failed: {e}")
+
+    @torch.no_grad()
+    def _run_impl(self, tps_timer):
+        """Inner training loop; called from run() so finalizers fire on exception."""
+        early_stop_counter = 0
+        # FSP force-sync flag: set at cold-start, consumed on the next step
+        # after model_update has pushed the reset LoRA to vLLM.
+        self._pending_fsp_flush = False
+
         for global_step in range(self.pipeline_config.max_steps):
             if global_step <= self.state.step:
                 global_step += 1
@@ -267,6 +351,15 @@ class AgenticPipeline(BasePipeline):
                     batch: DataProto = DataProto()
                     batch.meta_info = {"global_step": global_step}
 
+                    # FSP force-sync consumption: model_update above just pushed
+                    # the reset LoRA to vLLM, so drain any pre-reset rollouts
+                    # still queued before the next get_batch.
+                    if self._pending_fsp_flush and self.pipeline_config.async_pipeline:
+                        logger.info(f"FSP force-sync: flushing pre-reset rollouts at step {global_step}")
+                        ray.get(self.train_rollout_scheduler.flush_pending.remote())
+                        ray.get(self.val_rollout_scheduler.flush_pending.remote())
+                        self._pending_fsp_flush = False
+
                     # PHASE 6: Validation (every eval_steps) - Async
                     val_future = None
                     val_metrics = {}
@@ -289,7 +382,23 @@ class AgenticPipeline(BasePipeline):
                             dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_step, batch)
 
                         metrics["time/step_rollout"] = rollout_timer.last
+                        if (self.pipeline_config.psro_bubble_eval_episodes > 0
+                                and self._psro_loop is not None
+                                and len(self._psro_loop.payoff_matrix.policies) >= 2):
+                            if self._bubble_future is None or self._bubble_future.done():
+                                self._bubble_stop = threading.Event()
+                                self._bubble_future = self.executor.submit(
+                                    self._psro_loop.payoff_matrix.run_bubble_eval,
+                                    self._bubble_stop,
+                                    self.pipeline_config.psro_bubble_eval_episodes,
+                                )
+                            else:
+                                logger.info("bubble_eval: previous step still running, skipping this step")
                         metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                        metrics.update(_kuhn_derived_metrics(metrics))
+                        _score = metrics.get("rollout/score/mean")
+                        if _score is not None:
+                            self._fsp_score_history.append(float(_score))
                         batch.meta_info["global_step"] = global_step
                         batch.meta_info["_broadcast_non_tensor_batch"] = True
                         batch.meta_info["loss_mask_keys"] = ["response_mask"]
@@ -433,11 +542,26 @@ class AgenticPipeline(BasePipeline):
                     metrics["time/step_cal_response_level_mask"] = timer.last
 
                     # PHASE 13: Advantage Computation
+                    opponent_prob_map = None
+                    if (
+                        self.pipeline_config.reward_normalization.stratified_baseline
+                        and self._latest_nash_probs is not None
+                    ):
+                        opponent_prob_map = {
+                            ("base" if entry is None else str(entry)): float(self._latest_nash_probs[i])
+                            for i, entry in enumerate(self.fsp_checkpoints)
+                            if i < len(self._latest_nash_probs)
+                        }
                     with Timer(name="cal_response_norm_rewards", logger=None) as timer:
                         # Rewards need to be processed after grouping
                         # We can group by tag(env_type)/traj_group_id(group)/batch(rollout_batch)... to compute rewards / advantages
                         # The compute_response_level_rewards function injects a response_level_rewards key into batch.batch.
-                        batch, reward_metrics = compute_response_level_rewards(batch=batch, pipeline_config=self.pipeline_config)
+                        batch, reward_metrics = compute_response_level_rewards(
+                            batch=batch, pipeline_config=self.pipeline_config, opponent_prob_map=opponent_prob_map
+                        )
+                        if self.pipeline_config.debug_log_group_rewards:
+                            _scores = get_episode_scores(batch).tolist()
+                            logger.info(f"[smoke] episode rewards ({len(_scores)} trajs): {_scores}")
                         metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
                         metrics.update(reward_metrics)
                     metrics["time/step_cal_norm_rewards"] = timer.last
@@ -503,6 +627,42 @@ class AgenticPipeline(BasePipeline):
                         tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
                     metrics["time/step_train"] = train_timer.last
 
+                _bubble_results = None
+                if self._bubble_future is not None and self._bubble_future.done():
+                    try:
+                        _bubble_results = self._bubble_future.result()
+                    except Exception as e:
+                        logger.warning(f"PSRO bubble_eval future raised; skipping commit: {e}", exc_info=True)
+                    self._bubble_future = None
+                    if _bubble_results is not None:
+                        self._psro_loop.payoff_matrix.commit_bubble_eval(_bubble_results)
+                        nash_probs = self._psro_loop.recompute_nash()
+                        if nash_probs is not None:
+                            self._latest_nash_probs = nash_probs
+                            nash_list = nash_probs.tolist()
+                            ray.get(self.train_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+                            ray.get(self.val_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+                if (self.pipeline_config.psro_bubble_eval_episodes > 0
+                        and self._psro_loop is not None
+                        and len(self._psro_loop.payoff_matrix.policies) >= 2):
+                    from roll.pipeline.agentic.arena_eval import tracker_log_psro
+                    tracker_log_psro(
+                        payoff_matrix=self._psro_loop.payoff_matrix.get_online_matrix(),
+                        lora_paths=self._psro_loop.payoff_matrix.policies,
+                        nash_probs=self._latest_nash_probs,
+                        tracker=self.tracker,
+                        step=global_step,
+                    )
+                if self._psro_loop is not None and self._latest_nash_probs is not None:
+                    for policy, prob in zip(self._psro_loop.payoff_matrix.policies, self._latest_nash_probs):
+                        label = "base_model" if policy is None else os.path.basename(policy)
+                        metrics[f"psro/opponent_prob/{label}"] = float(prob)
+
+                if self.pipeline_config.psro_bubble_eval_episodes > 0 and self._psro_loop is not None:
+                    metrics["psro/bubble_eval/completed"] = int(_bubble_results is not None)
+                    metrics["psro/bubble_eval/total_online"] = int(np.sum(self._psro_loop.payoff_matrix._online_count))
+                    metrics["psro/bubble_eval/payoff_ci95"] = self._psro_loop.payoff_matrix.get_online_ci95()
+
                 with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
                     data_metrics = compute_train_data_metrics(batch=batch)
 
@@ -510,12 +670,113 @@ class AgenticPipeline(BasePipeline):
                 metrics.update(data_metrics)
                 metrics["system/tps"] = tps_timer.mean_throughput
                 metrics["system/samples"] = (global_step + 1) * self.pipeline_config.rollout_batch_size
+                total_tokens = torch.sum(batch.batch["attention_mask"]).detach().item()
+                if metrics.get("time/step_rollout", 0) > 0:
+                    metrics["system/tps_rollout"] = total_tokens / metrics["time/step_rollout"]
+                if metrics.get("time/step_old_log_probs_values", 0) > 0:
+                    metrics["system/tps_old_log_probs"] = total_tokens / metrics["time/step_old_log_probs_values"]
+                if metrics.get("time/step_train", 0) > 0:
+                    metrics["system/tps_train"] = total_tokens / metrics["time/step_train"]
 
                 # do ckpt
                 self.state.step = global_step
-                self.state.log_history.append(metrics)
+                self.state.log_history.append(
+                    {k: v for k, v in metrics.items() if isinstance(v, (int, float, str, bool, type(None)))}
+                )
 
                 self.do_checkpoint(global_step=global_step)
+
+                # Fictitious self-play: save LoRA to enemy pool.
+                # Two trigger modes (mutually exclusive):
+                #   fsp_score_threshold > 0 → switch when rolling avg rollout/score/mean >= threshold
+                #                             OR when stuck below threshold for fsp_score_timeout steps
+                #   otherwise               → switch every fsp_save_steps steps
+                fsp_save_steps = self.pipeline_config.fsp_save_steps
+                _wr_window = self.pipeline_config.fsp_score_window
+                _wr_timeout = self.pipeline_config.fsp_score_timeout
+                _history = self._fsp_score_history
+                _gen_step = len(_history)
+
+                _threshold_start = self.pipeline_config.fsp_score_threshold_start
+                if _threshold_start > 0:
+                    _threshold_end = self.pipeline_config.fsp_score_threshold_end
+                    _decay_steps = max(_wr_timeout, 1)
+                    _alpha = min(_gen_step, _decay_steps) / _decay_steps
+                    _wr_threshold = _threshold_start + (_threshold_end - _threshold_start) * _alpha
+                else:
+                    _wr_threshold = self.pipeline_config.fsp_score_threshold
+
+                metrics["fsp/score_threshold"] = _wr_threshold
+
+                if _wr_threshold > 0:
+                    _win_trigger = _gen_step >= _wr_window and sum(_history[-_wr_window:]) / _wr_window >= _wr_threshold
+                    _timeout_trigger = _wr_timeout > 0 and _gen_step >= _wr_timeout
+                    _should_switch = _win_trigger or _timeout_trigger
+                else:
+                    _should_switch = fsp_save_steps > 0 and global_step > 0 and global_step % fsp_save_steps == 0
+
+                metrics["fsp/turn"] = len(self.fsp_checkpoints) - 1
+
+                if _should_switch:
+                    self._fsp_score_history = []
+                    fsp_ckpt_dir = self._save_fsp_checkpoint(global_step, is_last_step=False)
+                    if fsp_ckpt_dir is not None:
+                        logger.info(f"FSP: adding LoRA checkpoint to enemy pool: {fsp_ckpt_dir}")
+                        ray.get(self.train_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
+                        ray.get(self.val_rollout_scheduler.update_enemy_pool.remote(fsp_ckpt_dir))
+                        self.fsp_checkpoints.append(fsp_ckpt_dir)
+
+                        # PSRO: expand payoff matrix, compute Nash, propagate sampling weights.
+                        if self._psro_loop is not None:
+                            _gs = ray.get(
+                                self.train_rollout_scheduler.get_generate_scheduler.remote()
+                            )
+                            ray.get(_gs.resume.remote())
+                            nash_probs = self._psro_loop.on_policy_added(
+                                new_policy=fsp_ckpt_dir,
+                                output_dir=self.pipeline_config.output_dir,
+                            )
+                            ray.get(_gs.suspend.remote())
+                            if nash_probs is not None:
+                                self._latest_nash_probs = nash_probs
+                                nash_list = nash_probs.tolist()
+                                ray.get(self.train_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+                                ray.get(self.val_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+                            metrics["psro/iteration"] = self._psro_loop._iteration
+
+                            if self.pipeline_config.psro_bubble_eval_episodes == 0:
+                                from roll.pipeline.agentic.arena_eval import tracker_log_psro
+                                tracker_log_psro(
+                                    payoff_matrix=self._psro_loop.payoff_matrix.get_online_matrix(),
+                                    lora_paths=self._psro_loop.payoff_matrix.policies,
+                                    nash_probs=nash_probs,
+                                    tracker=self.tracker,
+                                    step=global_step,
+                                )
+
+                    # Cold-start: reset training LoRA to initial weights so the next
+                    # generation trains from scratch against the enemy pool.
+                    # In async mode, arm a flag so the next step — after model_update
+                    # has pushed the reset LoRA to vLLM — flushes pre-reset rollouts
+                    # still in the queue. Flushing here would race with vLLM's
+                    # request-abort cleanup and deadlock the next step's model_update.
+                    if self.pipeline_config.cold_start:
+                        # Determine how many pipeline steps the next generation can run.
+                        # The LR scheduler is rebuilt with this as its num_training_steps
+                        # so each generation gets a fresh curve rather than inheriting the
+                        # decayed tail of the global schedule.
+                        _wr_timeout = self.pipeline_config.fsp_score_timeout
+                        if _wr_threshold > 0 and _wr_timeout > 0:
+                            _generation_steps = _wr_timeout
+                        elif fsp_save_steps > 0:
+                            _generation_steps = fsp_save_steps
+                        else:
+                            _generation_steps = max(1, self.pipeline_config.max_steps - global_step)
+                        logger.info(f"FSP cold_start: resetting training LoRA weights at step {global_step} "
+                                    f"(next generation = {_generation_steps} steps)")
+                        self.actor_train.reset_lora_weights(_generation_steps, blocking=True)
+                        if self.pipeline_config.async_pipeline:
+                            self._pending_fsp_flush = True
 
                 with Timer(name="log", logger=None) as log_timer:
                     if self.pipeline_config.logging_steps > 0 and global_step % self.pipeline_config.logging_steps == 0:
@@ -563,22 +824,161 @@ class AgenticPipeline(BasePipeline):
                         logger.info(json.dumps(log_res, ensure_ascii=False))
                         logger.info(json.dumps(metrics, ensure_ascii=False))
 
+                        rls = self.pipeline_config.response_log_steps
+                        if rls > 0 and global_step % rls == 0:
+                            from roll.utils.tracking import WandbTracker
+                            if isinstance(self.tracker, WandbTracker):
+                                import wandb
+                                parts = []
+                                for traj_idx, traj in enumerate(log_res):
+                                    parts.append(f"=== traj {traj_idx} ===")
+                                    for step_idx, item in enumerate(traj):
+                                        parts.append(f"[step {step_idx}] score={item['episode_score']}")
+                                        parts.append(f"PROMPT: {item['prompt']}")
+                                        parts.append(f"RESPONSE: {item['response']}")
+                                text = "\n".join(parts)
+                                metrics["rollout/responses"] = wandb.Html(f"<pre>{text}</pre>")
+
                 metrics["time/step_log"] = log_timer.last
 
             metrics["time/step_total"] = step_timer.last
             self.tracker.log(values=metrics, step=global_step)
 
+            # Early stopping: stop when per-group reward std is consistently low (model converged)
+            es_threshold = self.pipeline_config.early_stop_group_std_threshold
+            if es_threshold > 0:
+                group_std_mean = metrics.get("critic/group_reward_std/mean", float("inf"))
+                reward_mean = metrics.get("critic/rewards/mean", 0)
+                if group_std_mean < es_threshold and reward_mean > 0:
+                    early_stop_counter += 1
+                    logger.info(
+                        f"Early stop: group_reward_std={group_std_mean:.4f} < {es_threshold}, "
+                        f"reward_mean={reward_mean:.3f} > 0, count={early_stop_counter}/"
+                        f"{self.pipeline_config.early_stop_group_std_patience}"
+                    )
+                else:
+                    early_stop_counter = 0
+                if early_stop_counter >= self.pipeline_config.early_stop_group_std_patience:
+                    logger.info(
+                        f"Early stopping triggered at step {global_step}: group_reward_std below "
+                        f"{es_threshold} for {early_stop_counter} consecutive steps"
+                    )
+                    break
+
             logger.info(f"pipeline step {global_step} finished")
             global_step += 1
             logger.info(f"epoch {global_step} finished")
+
+        # Final checkpoint: save the end-of-training model and add to arena pool
+        # so arena eval includes the most recent generation (not just FSP snapshots).
+        # Cleaned up on pipeline exit by run()'s finally block (same path as FSP snapshots).
+        if self.pipeline_config.fsp_save_steps > 0:
+            final_step = self.pipeline_config.max_steps
+            fsp_ckpt_dir = self._save_fsp_checkpoint(final_step, is_last_step=True)
+            if fsp_ckpt_dir is not None:
+                logger.info(f"Final: added end-of-training checkpoint to arena pool: {fsp_ckpt_dir}")
+                self.fsp_checkpoints.append(fsp_ckpt_dir)
+                if self._psro_loop is not None:
+                    _gs_final = ray.get(
+                        self.train_rollout_scheduler.get_generate_scheduler.remote()
+                    )
+                    ray.get(_gs_final.resume.remote())
+                    self._psro_loop.on_policy_added(
+                        new_policy=fsp_ckpt_dir,
+                        output_dir=self.pipeline_config.output_dir,
+                    )
+                    ray.get(_gs_final.suspend.remote())
+
+        # Arena evaluation: pairwise payoff matrix for all FSP checkpoints.
+        # In PSRO mode, the matrix is already built incrementally — just log and save.
+        if self.pipeline_config.psro_mode and self._psro_loop is not None:
+            self._psro_loop.payoff_matrix.log()
+            self._psro_loop.payoff_matrix.save(
+                os.path.join(self.pipeline_config.output_dir, "psro"),
+                "payoff_matrix_final.json",
+            )
+        elif self.pipeline_config.fsp_save_steps > 0 and len(self.fsp_checkpoints) > 1:
+            from roll.pipeline.agentic.arena_eval import (
+                run_arena_evaluation, log_payoff_matrix, save_payoff_matrix, tracker_log_payoff_matrix,
+            )
+            try:
+                generate_scheduler = ray.get(
+                    self.train_rollout_scheduler.get_generate_scheduler.remote()
+                )
+                ray.get(generate_scheduler.resume.remote())
+                env_tag = list(self.pipeline_config.custom_envs.keys())[0]
+                logger.info(f"Arena: starting evaluation with {len(self.fsp_checkpoints)} models")
+                payoff_matrix = run_arena_evaluation(
+                    lora_paths=self.fsp_checkpoints,
+                    generate_scheduler=generate_scheduler,
+                    pipeline_config=self.pipeline_config,
+                    tokenizer=self.tokenizer,
+                    env_tag=env_tag,
+                    episodes_per_pair=4,
+                    max_concurrent=32,
+                )
+                log_payoff_matrix(payoff_matrix, self.fsp_checkpoints)
+                save_payoff_matrix(payoff_matrix, self.fsp_checkpoints, self.pipeline_config.output_dir)
+                tracker_log_payoff_matrix(payoff_matrix, self.fsp_checkpoints, self.tracker, self.pipeline_config.max_steps)
+            except Exception as e:
+                logger.error(f"Arena evaluation failed: {e}", exc_info=True)
 
         ray.get([
             self.train_rollout_scheduler.shutdown.remote(),
             self.val_rollout_scheduler.shutdown.remote(),
         ])
 
-
         logger.info("pipeline complete!")
+
+
+    def _save_fsp_checkpoint(self, global_step: int, is_last_step: bool = False) -> Optional[str]:
+        """Save actor_train LoRA and export it as a PEFT adapter for FSP/arena use.
+
+        Returns the absolute path to the checkpoint dir on success, None on failure.
+        Caller is responsible for pool registration and any post-save actions.
+        """
+        self.actor_train.do_checkpoint(
+            global_step=global_step, is_last_step=is_last_step, blocking=True,
+        )
+        # Upload destination (checkpoint_config.output_dir) persists reliably; the
+        # worker-level save_dir may be cleaned up after async upload.
+        ckpt_id = f"checkpoint-{global_step}"
+        upload_dir = self.pipeline_config.checkpoint_config.get("output_dir")
+        if upload_dir:
+            fsp_ckpt_dir = os.path.abspath(os.path.join(upload_dir, ckpt_id))
+        else:
+            worker_name = f"{self.pipeline_config.actor_train.name}-0-G{self.pipeline_config.actor_train.device_mapping[0]}"
+            fsp_ckpt_dir = os.path.abspath(os.path.join(self.pipeline_config.output_dir, worker_name, ckpt_id))
+        # Wait for adapter_config.json and DeepSpeed state pt (async upload may still
+        # be in progress). File size must be stable for 2 consecutive samples to
+        # confirm the write has flushed — otherwise torch.load hits
+        # `PytorchStreamReader failed reading zip archive`.
+        adapter_cfg = os.path.join(fsp_ckpt_dir, "adapter_config.json")
+        ds_state = os.path.join(fsp_ckpt_dir, "checkpoint", "mp_rank_00_model_states.pt")
+        last_size = -1
+        stable_hits = 0
+        for _ in range(120):
+            if os.path.exists(adapter_cfg) and os.path.exists(ds_state):
+                try:
+                    cur_size = os.path.getsize(ds_state)
+                except OSError:
+                    cur_size = -1
+                if cur_size > 0 and cur_size == last_size:
+                    stable_hits += 1
+                    if stable_hits >= 2:
+                        break
+                else:
+                    stable_hits = 0
+                last_size = cur_size
+            time.sleep(1)
+        # Convert DeepSpeed .pt → PEFT adapter_model.safetensors so vLLM can load it.
+        from roll.utils.fsp_ckpt import export_peft_adapter
+        try:
+            export_peft_adapter(fsp_ckpt_dir)
+            return fsp_ckpt_dir
+        except Exception as e:
+            logger.error(f"FSP: export_peft_adapter failed for {fsp_ckpt_dir}: {e}", exc_info=True)
+            return None
 
 
     def val(self, global_step):
@@ -594,6 +994,7 @@ class AgenticPipeline(BasePipeline):
 
         dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_step, eval_batch)
         eval_metrics = reduce_metrics(eval_batch.meta_info.get("metrics", {}))
+        eval_metrics.update(_kuhn_derived_metrics(eval_metrics))
         eval_score = get_episode_scores(eval_batch)
         eval_metrics["score/mean"] = torch.mean(eval_score).detach().item()
         eval_metrics["score/max"] = torch.max(eval_score).detach().item()
@@ -639,6 +1040,22 @@ class AgenticPipeline(BasePipeline):
 
         if threshold == 0:
             return data
+
+        # Warn when LCM-padding duplicates a significant fraction of the batch: every
+        # duplicate runs through fwd/bwd as if real, so it's wasted compute. Pick
+        # rollout_batch_size as a multiple of size_divide, or tune per_device_train_batch_size
+        # / gradient_accumulation_steps / infer_batch_size so their LCM divides the rollout.
+        pad_amount = (size_divide - threshold) if batch_size < size_divide else (size_divide - threshold)
+        waste_frac = pad_amount / (batch_size + pad_amount)
+        if waste_frac >= 0.1:
+            logger.warning(
+                f"adjust_batch: padding {pad_amount} duplicate samples onto a real batch of {batch_size} "
+                f"(size_divide=LCM({actor_train_train_bsz},{actor_train_infer_bsz},"
+                f"{ref_infer_bsz},{critic_train_bsz},{critic_infer_bsz})={size_divide}). "
+                f"{waste_frac:.0%} of the training batch will be duplicated filler — wasted fwd/bwd compute. "
+                f"Fix: set rollout_batch_size to a multiple of {size_divide}, or reduce the LCM by aligning "
+                f"actor_train.infer_batch_size with per_device_train_batch_size * gradient_accumulation_steps."
+            )
 
         if mode == "auto":
             if threshold >= 0.5 * batch_size or  batch_size // size_divide == 0:
@@ -713,7 +1130,7 @@ class AgenticPipeline(BasePipeline):
         train_devices = set(self.actor_train.worker_config.device_mapping)
         infer_devices = set(self.actor_infer.worker_config.device_mapping)
         critic_devices = set(self.critic.worker_config.device_mapping) if hasattr(self, 'critic') and self.critic else set()
-        ref_devices = set(self.reference.worker_config.device_mapping) if self.pipeline_config.enable_reference else set()
+        ref_devices = set(self.reference.worker_config.device_mapping) if self.pipeline_config.enable_reference and hasattr(self, 'reference') else set()
         reward_devices = set(self.reward.worker_config.device_mapping) if self.reward else set()
 
         # VAL: VAL_NON_EMPTY - ensure device_mapping not empty
@@ -725,7 +1142,7 @@ class AgenticPipeline(BasePipeline):
 
         # Universal validation: Reference must always colocate with actor_train (both Model A and B)
         # VAL: VAL_SUBSET (exact match) - reference colocation
-        if self.pipeline_config.enable_reference:
+        if self.pipeline_config.enable_reference and hasattr(self, 'reference'):
             assert ref_devices == train_devices, (
                 f"Reference device_mapping must match actor_train exactly: "
                 f"ref={list(ref_devices)}, train={list(train_devices)}"

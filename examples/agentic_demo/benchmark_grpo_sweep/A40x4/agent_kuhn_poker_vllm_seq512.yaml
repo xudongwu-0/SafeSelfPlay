@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - agent_kuhn_poker_vllm_sweep
+
+exp_name: "kuhn_vllm_seq512"
+
+sequence_length: 512
+
+output_dir: /projects/bfoz/wchen11/kuhn_vllm_sweep/seq512
+logging_dir: /projects/bfoz/wchen11/kuhn_vllm_sweep/seq512/logs
+tracker_kwargs:
+  project: kuhn-vllm-sweep
+checkpoint_config:
+  type: file_system
+  output_dir: /projects/bfoz/wchen11/kuhn_vllm_sweep/seq512/render

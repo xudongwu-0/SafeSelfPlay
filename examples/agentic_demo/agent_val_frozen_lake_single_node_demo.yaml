@@ -31,7 +31,7 @@ system_envs:
 
 track_with: tensorboard
 tracker_kwargs:
-  log_dir: /data/tensorboard/roll_exp/agentic_frozen_lake
+  log_dir: ./output/tensorboard/agentic_frozen_lake
 
 checkpoint_config:
   type: file_system
@@ -64,7 +64,7 @@ reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
 
 actor_train:
   model_args:
-    flash_attn: fa2
+    flash_attn: sdpa
     disable_gradient_checkpointing: false
     dtype: fp16
     model_type: ~
@@ -78,21 +78,14 @@ actor_train:
   data_args:
     template: qwen2_5
   strategy_args:
-    #strategy_name: deepspeed_train
-    #strategy_config: ${deepspeed_zero2}
-    strategy_name: megatron_train
-    strategy_config:
-      tensor_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
-      expert_model_parallel_size: 1
-      use_distributed_optimizer: true
-      recompute_granularity: full
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
   device_mapping: list(range(0,1))
   infer_batch_size: 1
 
 actor_infer:
   model_args:
-    flash_attn: fa2
+    flash_attn: sdpa
     disable_gradient_checkpointing: true
     dtype: fp16
   generating_args:
@@ -115,7 +108,7 @@ actor_infer:
 
 reference:
   model_args:
-    flash_attn: fa2
+    flash_attn: sdpa
     disable_gradient_checkpointing: true
     dtype: fp16
     model_type: ~

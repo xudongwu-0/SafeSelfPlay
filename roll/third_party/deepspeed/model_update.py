@@ -1,3 +1,5 @@
+from dataclasses import asdict
+
 import ray
 import torch.distributed as dist
 from deepspeed.runtime.zero import GatheredParameters
@@ -29,9 +31,23 @@ def _gather_weights(is_zero3, named_params):
         return [(n, p.data) for n, p in named_params]
 
 
-def gather_deepspeed_weights(model, ds_config, buffer_size):
+def _strip_peft_prefix(name: str) -> str:
+    """Strip PEFT wrapper prefixes and adapter suffixes from parameter names.
+
+    Converts e.g. 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight'
+    to 'model.layers.0.self_attn.q_proj.lora_A.weight'
+    """
+    if name.startswith("base_model.model."):
+        name = name[len("base_model.model."):]
+    name = name.replace(".default.", ".")
+    return name
+
+
+def gather_deepspeed_weights(model, ds_config, buffer_size, lora_only: bool = False):
     is_zero3 = ds_config.is_zero3()
     named_params = [(name, param) for name, param in model.named_parameters()]
+    if lora_only:
+        named_params = [(_strip_peft_prefix(n), p) for n, p in named_params if "lora_" in n]
 
     waiting_params, waiting_params_size = [], 0
     for name, param in named_params:
@@ -149,14 +165,17 @@ class DeepSpeedWeightUpdater:
 
     def _colocated_model_update(self):
         refs = []
+        infer_parallel_size = dist.get_world_size(self._infer_parallel_cpu_group)
+        co_infer_rank = dist.get_rank(self._infer_parallel_cpu_group)
+        if self.is_lora:
+            peft_model = self.model.module if hasattr(self.model, "module") else self.model
+            peft_config = peft_model.peft_config.get("default", None)
         for named_weights in gather_deepspeed_weights(
-            self.model, self.ds_config, buffer_size=self._model_update_buffer_size
+            self.model, self.ds_config, buffer_size=self._model_update_buffer_size, lora_only=self.is_lora
         ):
             serialized_tensors = serialize_named_weights(
                 named_weights, infer_strategy=self.infer_worker_config.strategy_args.strategy_name
             )
-            infer_parallel_size = dist.get_world_size(self._infer_parallel_cpu_group)
-            co_infer_rank = dist.get_rank(self._infer_parallel_cpu_group)
             infer_parallel_tensors = [serialized_tensors]  # tensors for each infer parallel rank
             if infer_parallel_size > 1:
                 infer_parallel_tensors = [None] * infer_parallel_size if co_infer_rank == 0 else None
@@ -167,9 +186,18 @@ class DeepSpeedWeightUpdater:
                 ray.get(refs)
                 refs = []
             if co_infer_rank == 0 and self._co_infer_worker is not None:
-                refs.append(self._co_infer_worker.update_parameter_in_bucket.remote(infer_parallel_tensors))
+                refs.append(
+                    self._co_infer_worker.update_parameter_in_bucket.remote(
+                        infer_parallel_tensors, is_lora=self.is_lora
+                    )
+                )
             if self._broadcast_workers:
                 refs.extend(self._broadcast_to_infer_workers(named_weights))
+        if refs:
+            ray.get(refs)
+            refs = []
+        if self.is_lora and co_infer_rank == 0 and self._co_infer_worker is not None:
+            refs.append(self._co_infer_worker.add_lora.remote(peft_config=asdict(peft_config)))
         if refs:
             ray.get(refs)
         return {}
@@ -183,6 +211,7 @@ class DeepSpeedWeightUpdater:
                 names=[n for n, _ in named_weights],
                 dtypes=[w.dtype for _, w in named_weights],
                 shapes=[w.shape for _, w in named_weights],
+                is_lora=self.is_lora,
             )
             for worker in self._broadcast_workers
         ]
@@ -197,9 +226,15 @@ class DeepSpeedWeightUpdater:
 
     def _separated_model_update(self):
         logger.info(f"start broadcast model update {self.model_update_group_name}")
+        if self.is_lora:
+            peft_model = self.model.module if hasattr(self.model, "module") else self.model
+            peft_config = peft_model.peft_config.get("default", None)
         for named_weights in gather_deepspeed_weights(
-            self.model, self.ds_config, buffer_size=self._model_update_buffer_size
+            self.model, self.ds_config, buffer_size=self._model_update_buffer_size, lora_only=self.is_lora
         ):
             refs = self._broadcast_to_infer_workers(named_weights)
+            ray.get(refs)
+        if self.is_lora and self._broadcast_workers:
+            refs = [worker.add_lora.remote(peft_config=asdict(peft_config)) for worker in self._broadcast_workers]
             ray.get(refs)
         return {}

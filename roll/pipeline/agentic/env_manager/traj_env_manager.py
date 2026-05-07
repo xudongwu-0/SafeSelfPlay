@@ -104,6 +104,10 @@ class TrajEnvManager(BaseEnvManager):
         assert "seed" in data.meta_info
         self.running = True
         self.group_seed = data.meta_info['seed'] + self.env_config['group_seed']
+        self.logger.debug(
+            f"[seed] group_id={self.env_config['group_id']} env_id={self.env_config['env_id']} "
+            f"group_seed={self.group_seed}"
+        )
         rollout_cache: RolloutCache = self.reset()
         start_step = self.current_step
 
@@ -120,16 +124,33 @@ class TrajEnvManager(BaseEnvManager):
             with Timer(name="step", logger=None) as step_timer:
                 if stop_reason == GenerateStopReason.FINISH:
                     rollout_cache: RolloutCache = self.step(lm_output)
+                    if getattr(self.pipeline_config, "debug_log_agent_response", False) and len(self.rollout_cache.history) >= 2:
+                        prev = self.rollout_cache.history[-2]
+                        self.logger.info(
+                            f"[agent_response] env_id={self.env_config['env_id']} step={self.rollout_cache.step}\n"
+                            f"=== OBSERVATION ===\n{prev.get('observation', '')}\n"
+                            f"=== RESPONSE ===\n{prev.get('llm_response', '')}\n"
+                            f"=== REWARD ===\n{prev.get('reward', 'N/A')}\n"
+                        )
             log_stats["step_time"].append(step_timer.last)
 
             if self.running and (rollout_cache.terminated or stop_reason == GenerateStopReason.MAX_LENGTH):
                 self.logger.debug(f"group_id: {self.env_config['group_id']} env_id: {self.env_config['env_id']} episode_id: {self.episode_id} start_step {start_step} gen_stats: {log_stats}")
                 log_stats = {"generate_time": [], "step_time": [], "current_step": []}
                 rollout: DataProto = self.formulate_rollouts(rollout_cache)
+                if rollout is None:
+                    # Degenerate episode with no agent actions — skip
+                    rollout_cache = self.reset()
+                    start_step = self.current_step
+                    continue
                 traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
                 traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
                 rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id] * rollout.batch.batch_size[0], dtype=object)
                 rollout.non_tensor_batch["traj_id"] = np.array([traj_id] * rollout.batch.batch_size[0], dtype=object)
+                if self.rollout_cache.init_state_id is not None:
+                    rollout.non_tensor_batch["init_state_id"] = np.array(
+                        [self.rollout_cache.init_state_id] * rollout.batch.batch_size[0], dtype=object
+                    )
                 ray.get(self.output_queue.put.remote(self.env_config['group_id'], self.episode_id, start_step, rollout, self.env_config['env_id']))
 
                 rollout_cache = self.reset()
@@ -157,6 +178,8 @@ class TrajEnvManager(BaseEnvManager):
             observation, info = self.env.reset(seed=seed)
             if observation is None:
                 return None
+        if hasattr(self.env, 'get_init_state_id'):
+            self.rollout_cache.init_state_id = self.env.get_init_state_id()
         self.rollout_cache.history.append({
             "observation": observation,
             "actions_left": self.env_config.max_steps - self.rollout_cache.step,
@@ -237,7 +260,9 @@ class TrajEnvManager(BaseEnvManager):
 
         messages = []
         user_content = ""
-        if content["actions_left"] == self.env_config.max_steps:
+        is_first_turn = content["actions_left"] == self.env_config.max_steps
+        fresh = content.get("fresh_conversation", False)
+        if is_first_turn or fresh:
             messages.append({"role": "system", "content": self.agent_system_template})
             if "env_instruction" in history.history[0]:
                 user_content =  f"{history.history[0]['env_instruction']}\n"
@@ -256,11 +281,12 @@ class TrajEnvManager(BaseEnvManager):
             user_content += self.agent_template.format(**render_dict)
             messages.append({"role": "user", "content": user_content})
 
-        prompt_ids = custom_apply_chat_template(messages=messages, tokenizer=self.tokenizer, add_generation_prompt=True, skip_mock_system_prompt=self.pipeline_config.skip_mock_system_prompt)
+        prompt_ids = custom_apply_chat_template(messages=messages, tokenizer=self.tokenizer, add_generation_prompt=True, template_name=self.pipeline_config.actor_infer.data_args.template)
         history_token_ids = []
-        for items in self.rollout_cache.history[:-1]:
-            history_token_ids.extend(items["prompt_ids"])
-            history_token_ids.extend(items["response_ids"])
+        if not fresh:
+            for items in self.rollout_cache.history[:-1]:
+                history_token_ids.extend(items["prompt_ids"])
+                history_token_ids.extend(items["response_ids"])
         if len(history_token_ids):
             prompt_ids = compute_conversation_end_token_id(self.tokenizer) + prompt_ids
         input_ids = history_token_ids + prompt_ids
@@ -288,6 +314,8 @@ class TrajEnvManager(BaseEnvManager):
         """
         if 'observation' in rollout_cache.history[-1]:
             rollout_cache.history.pop(-1)
+        if not rollout_cache.history:
+            return None
         history = rollout_cache.history[:-1]
         last_cache = copy.deepcopy(rollout_cache.history[-1])
         last_cache.pop("reward", None)
@@ -308,6 +336,10 @@ class TrajEnvManager(BaseEnvManager):
             if "infer_logprobs" in items:
                 infer_logprobs.extend([0] * len(items["prompt_ids"]) + items["infer_logprobs"])
 
+        pre_pad_len = len(token_ids)
+        seq_len = self.pipeline_config.sequence_length
+        is_truncated = pre_pad_len > seq_len
+
         input_ids =torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
         attention_mask = torch.tensor([1] * len(token_ids), dtype=torch.long).unsqueeze(0)
         response_mask = torch.tensor(response_masks, dtype=torch.bool).unsqueeze(0)
@@ -316,7 +348,15 @@ class TrajEnvManager(BaseEnvManager):
         prompt_masks = [1] * first_response_idx + [0] * (len(token_ids) - first_response_idx)
         prompt_mask =torch.tensor(prompt_masks, dtype=torch.bool).unsqueeze(0)
         score_tensor = torch.tensor([0] * len(token_ids), dtype=torch.float).unsqueeze(0)
-        score_tensor[0][-1] = episode_score
+        if is_truncated:
+            # reward at [-1] would be cut by pad_to_length; place it at last response token in window
+            last_resp_in_window = next(
+                (i for i in range(min(pre_pad_len, seq_len) - 1, -1, -1) if response_masks[i] == 1),
+                seq_len - 1,
+            )
+            score_tensor[0][last_resp_in_window] = episode_score
+        else:
+            score_tensor[0][-1] = episode_score
         # Huggingface Transformers prefer position_ids to be 0-based.
         # Attn Mask: [1, 1, 1, ..., 1, 0, 0, ..., 0]
         # cumsum: [1, 2, 3, ..., n, n+1, n+1, ..., n+1]
@@ -367,8 +407,27 @@ class TrajEnvManager(BaseEnvManager):
         history_metrics = [item.get("metrics", {}) for item in self.rollout_cache.history]
         env_metric = aggregate_metrics(history_metrics=history_metrics, metrics_agg_mode=metrics_agg_mode)
         env_metric["num_actions"] = rollout_cache.step
+        env_metric["truncated"] = 1.0 if is_truncated else 0.0
+        env_metric["seq_len"] = float(pre_pad_len)
 
-        env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
+        env_metric = {
+            k if k.startswith("reasoning/") else f"env/{rollout_cache.tag}/{k}": v
+            for k, v in env_metric.items()
+        }
         env_metric["env/response_length"] = response_length
+
+        if self.pipeline_config.enable_reasoning_filter:
+            from roll.pipeline.agentic.utils import _REASONING_BUG_KEYS, _REASONING_GOOD_KEYS
+            for key in _REASONING_BUG_KEYS + _REASONING_GOOD_KEYS:
+                # Default to 0.0 for keys the env didn't emit (e.g. conditional metrics).
+                # dtype=object is required by DataProto.check_consistency.
+                lm_input.non_tensor_batch[key] = np.array([float(env_metric.get(key, 0.0))], dtype=object)
+
+            bug_w = self.pipeline_config.reasoning_bug_weight
+            good_w = self.pipeline_config.reasoning_good_weight
+            score = sum(bug_w * float(env_metric.get(k, 0.0)) for k in _REASONING_BUG_KEYS)
+            score += sum(good_w * float(env_metric.get(k, 0.0)) for k in _REASONING_GOOD_KEYS)
+            env_metric["reasoning/score"] = score
+
         lm_input.meta_info = {"metrics": env_metric}
         return lm_input

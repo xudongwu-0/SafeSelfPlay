@@ -1,0 +1,30 @@
+defaults:
+  - agent_kuhn_poker_fsp_train
+
+# GRPO group_size sweep: no FSP, longer training to see reward trends
+exp_name: "kuhn_poker_grpo_sweep"
+max_steps: 100
+fsp_save_steps: 0
+eval_steps: 10
+save_steps: 10000
+
+# Use best num_env_groups from bench (32 = max tok/s)
+train_env_manager:
+  num_env_groups: 32
+  max_env_num_per_worker: 256
+  num_groups_partition: [32]
+
+val_env_manager:
+  num_env_groups: 4
+  group_size: 1
+  max_env_num_per_worker: 4
+  num_groups_partition: [4]
+
+# Override output/logging dirs (set per-run in sweep script)
+output_dir: /projects/bfoz/wchen11/kuhn_grpo_sweep
+logging_dir: /projects/bfoz/wchen11/kuhn_grpo_sweep/logs
+tracker_kwargs:
+  log_dir: /projects/bfoz/wchen11/kuhn_grpo_sweep/tensorboard
+checkpoint_config:
+  type: file_system
+  output_dir: /projects/bfoz/wchen11/kuhn_grpo_sweep/render

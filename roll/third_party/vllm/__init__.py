@@ -45,7 +45,7 @@ logger.info(f"Using vllm version {vllm.__version__}")
 
 
 async def create_async_llm(resource_placement_groups: List[Dict], **kwargs):
-    kwargs["enable_sleep_mode"] = True
+    kwargs["enable_sleep_mode"] = os.environ.get("ROLL_DISABLE_SLEEP_MODE", "0") != "1"
 
     if "worker_extension_cls" not in kwargs:
         # VLLM_USE_V1 is deprecated in vllm>=0.11.1

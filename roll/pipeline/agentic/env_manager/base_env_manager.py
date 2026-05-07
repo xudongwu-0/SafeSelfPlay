@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.env import gem
@@ -18,6 +18,7 @@ class RolloutCache:
     truncated: bool = False
     terminated: bool = False
     step: int = 0
+    init_state_id: Optional[str] = None
 
 
 class BaseEnvManager:

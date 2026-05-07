@@ -318,6 +318,18 @@ class ActorWorker(Worker):
         return total_loss, pg_metrics
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_lora_weights(self, num_training_steps: int):
+        """FSP cold-start: reset LoRA weights to initial (PEFT default) state."""
+        with Timer("reset_lora_weights") as total_timer:
+            exec_metrics: Dict = self.strategy.reset_lora_weights(num_training_steps)
+        metrics = {
+            f"time/{self.cluster_name}/reset_lora_weights/total": total_timer.last,
+        }
+        metric_prefix = f"time/{self.cluster_name}/reset_lora_weights"
+        metrics.update({f"{metric_prefix}/{k}": v for k, v in exec_metrics.items()})
+        return DataProto(meta_info={"metrics": metrics})
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def do_checkpoint(self, global_step, is_last_step=None):
         if self.worker_config.offload_nccl:
             reload_process_groups()

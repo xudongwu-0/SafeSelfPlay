@@ -198,3 +198,59 @@ def make_micro_batch_iter_for_dynamic_batching(mini_batch: DataProto):
                     length=seqlen if micro_batch.batch[k].shape[-1] == input_ids_shape[-1] else seqlen - 1,
                 )
         yield micro_batch
+
+
+def split_mini_batch_sorted_chunks_narrowed(
+    mini_batch: DataProto,
+    num_chunks: int,
+    sequence_length_round: int = 4,
+):
+    """Generator: sort samples in `mini_batch` by (unpadded) seq length ascending
+    and yield exactly `num_chunks` chunks one at a time, each narrowed to its max
+    actual sequence length (rounded up to `sequence_length_round`).
+
+    Lazy allocation: each chunk is allocated via advanced indexing when yielded and
+    freed after the caller's iteration advances. Peak extra memory ≈ 1 chunk worth
+    of tensors (≈ 1/num_chunks × mini-batch), vs doing a full reorder upfront.
+
+    Keeps `num_microbatches == gradient_accumulation_steps` so DS's grad-accum
+    counter and fp32 accumulator state remain undisturbed.
+    """
+    import numpy as np
+    attention_mask = mini_batch.batch["attention_mask"]
+    batch_size = attention_mask.shape[0]
+    full_len = attention_mask.shape[-1]
+    seq_lens = attention_mask.view(batch_size, -1).sum(-1).tolist()
+    # Descending by length: first chunk allocates the largest activation tensors,
+    # subsequent shorter chunks reuse freed memory blocks → less fragmentation.
+    sorted_indices = sorted(range(batch_size), key=lambda i: seq_lens[i], reverse=True)
+
+    # Indices for each chunk (equal-ish count, same partition rule as DataProto.chunk)
+    index_groups = np.array_split(np.arange(batch_size), num_chunks)
+
+    for group in index_groups:
+        if len(group) == 0:
+            continue
+        # CPU tensor: DataProto.reorder calls indices.numpy() internally which requires CPU.
+        chunk_sample_indices = torch.tensor(
+            [sorted_indices[i] for i in group.tolist()],
+            dtype=torch.long,
+        )
+        # Single advanced-indexing allocation for just this chunk (~1/N of full batch).
+        chunk = mini_batch.slice()
+        chunk.reorder(chunk_sample_indices)
+
+        chunk_mask = chunk.batch["attention_mask"]
+        chunk_max = int(chunk_mask.view(chunk.batch.batch_size[0], -1).sum(-1).max().item())
+        chunk_max = max(chunk_max, sequence_length_round)
+        rounded = ((chunk_max + sequence_length_round - 1) // sequence_length_round) * sequence_length_round
+        rounded = min(rounded, full_len)
+        for k in list(chunk.batch.keys()):
+            t = chunk.batch[k]
+            if t.dim() < 2:
+                continue
+            if t.shape[-1] == full_len:
+                chunk.batch[k] = torch.narrow(t, dim=-1, start=0, length=rounded)
+            elif t.shape[-1] == full_len - 1:
+                chunk.batch[k] = torch.narrow(t, dim=-1, start=0, length=max(rounded - 1, 1))
+        yield chunk

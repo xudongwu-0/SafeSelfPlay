@@ -1,0 +1,142 @@
+defaults:
+  - ../config/traj_envs@_here_
+  - ../config/deepspeed_zero@_here_
+  - ../config/deepspeed_zero2@_here_
+  - ../config/deepspeed_zero3@_here_
+  - ../config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "kuhn_psro_smoke"
+seed: 42
+logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
+output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output
+system_envs: {}
+
+track_with: wandb
+tracker_kwargs:
+  project: self-play-debug
+  name: ${exp_name}
+  tags:
+    - kuhn_poker
+    - psro
+    - debug
+    - auton
+
+checkpoint_config:
+  type: file_system
+  async_upload: false
+  output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/render
+
+num_gpus_per_node: 2
+
+max_steps: 3
+save_steps: 10000
+logging_steps: 1
+eval_steps: 100
+resume_from_checkpoint: false
+fsp_save_steps: 1
+cold_start: true
+
+# PSRO: expand payoff matrix + compute Nash after each FSP generation
+psro_mode: true
+psro_episodes_per_pair: 12   # 1 full cycle of 12 start states
+psro_max_concurrent_eval: 4
+psro_seed_base: 12345
+
+rollout_batch_size: 26
+val_batch_size: 4
+sequence_length: 1024
+
+advantage_clip: 10.0
+ppo_epochs: 1
+adv_estimator: "grpo"
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+pretrain: Qwen/Qwen2.5-0.5B-Instruct
+reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
+
+actor_train:
+  model_args:
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true
+    dtype: fp16
+    model_type: ~
+    lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    lora_rank: 32
+    lora_alpha: 32
+  training_args:
+    learning_rate: 2.0e-5
+    weight_decay: 0
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 2
+    warmup_steps: 2
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: "[0]"
+  infer_batch_size: 1
+
+actor_infer:
+  model_args:
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true
+    dtype: fp16
+    lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    lora_rank: 32
+    lora_alpha: 32
+  generating_args:
+    max_new_tokens: 256
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.85
+      block_size: 16
+      load_format: auto
+      max_loras: 6  # ceil(max_steps/fsp_save_steps) + 1 = 3 + 1 = 4, using 6 for headroom
+      enforce_eager: true
+      max_num_batched_tokens: 8192
+  device_mapping: "[1]"
+  infer_batch_size: 1
+
+reward_normalization:
+  grouping: tags
+  method: identity
+
+train_env_manager:
+  format_penalty: -0.01
+  max_env_num_per_worker: 8
+  num_env_groups: 13
+  group_size: 2
+  tags: [KuhnPokerLLMThink]
+  num_groups_partition: [13]
+
+val_env_manager:
+  max_env_num_per_worker: 2
+  num_env_groups: 2
+  group_size: 1
+  tags: [KuhnPokerLLMThink]
+  num_groups_partition: [2]
+
+max_tokens_per_step: 256
+max_actions_per_traj: 2
+
+custom_envs:
+  KuhnPokerLLMThink:
+    ${custom_env.KuhnPokerLLMThink}

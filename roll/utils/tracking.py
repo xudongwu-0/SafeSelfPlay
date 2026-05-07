@@ -1,3 +1,4 @@
+from concurrent import futures
 import json
 from functools import wraps
 from typing import Optional, Dict, Any
@@ -77,9 +78,9 @@ class TensorBoardTracker(BaseTracker):
                 self.config[k] = str(self.config[k])
         self.writer.add_hparams(hparam_dict=self.config, metric_dict={})
         self.writer.flush()
+        self.executor = futures.ThreadPoolExecutor(max_workers=1)
 
-    @strip_at_tag_in_log
-    def log(self, values: dict, step: Optional[int], **kwargs):
+    def _write(self, values: dict, step: Optional[int], **kwargs):
         for k, v in values.items():
             if isinstance(v, (int, float)):
                 self.writer.add_scalar(k, v, global_step=step, **kwargs)
@@ -89,7 +90,12 @@ class TensorBoardTracker(BaseTracker):
                 self.writer.add_scalars(k, v, global_step=step, **kwargs)
         self.writer.flush()
 
+    @strip_at_tag_in_log
+    def log(self, values: dict, step: Optional[int], **kwargs):
+        self.executor.submit(self._write, values, step, **kwargs)
+
     def finish(self):
+        self.executor.shutdown(wait=True)
         self.writer.close()
 
 
@@ -108,7 +114,21 @@ class WandbTracker(BaseTracker):
         import wandb
         if api_key:
             wandb.login(key=api_key)
-        self.run = wandb.init(project=project, tags=tags, name=name, notes=notes, dir=log_dir, mode=mode, settings=settings)
+        # Retry wandb.init on transient CommError (90s default timeout can flake).
+        # Use a longer init_timeout and bounded retries with backoff.
+        if isinstance(settings, dict):
+            settings = {**settings, "init_timeout": 300}
+        import time
+        last_err = None
+        for attempt in range(5):
+            try:
+                self.run = wandb.init(project=project, tags=tags, name=name, notes=notes, dir=log_dir, mode=mode, settings=settings)
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(min(2 ** attempt * 5, 60))
+        else:
+            raise last_err
 
         self.run.config.update(config, allow_val_change=True)
 
@@ -168,7 +188,55 @@ def create_tracker(tracker_name: str, config: dict, **kwargs) -> BaseTracker:
     tracker_cls = tracker_registry[tracker_name]
     return tracker_cls(config, **kwargs)
 
+class TrackioTracker(BaseTracker):
+
+    def __init__(self, config: dict, **kwargs):
+        self.config = config
+
+        project = kwargs.pop("project", None)
+        name = kwargs.pop("name", None)
+        group = kwargs.pop("group", None)
+        space_id = kwargs.pop("space_id", None)
+        dataset_id = kwargs.pop("dataset_id", None)
+        tags = kwargs.pop("tags", None)
+
+        auto_log_gpu = kwargs.pop("auto_log_gpu", True)
+        gpu_log_interval = kwargs.pop("gpu_log_interval", 2)
+
+        import trackio
+
+        if space_id:
+            logger.info(f"[Trackio] Using HF Space: {space_id}")
+        if dataset_id:
+            logger.info(f"[Trackio] Syncing to dataset: {dataset_id}")
+
+        self.run = trackio.init(
+            project=project,
+            name=name,
+            group=group,
+            config=config,
+            space_id=space_id,
+            dataset_id=dataset_id,
+            tags=tags,
+            auto_log_gpu=auto_log_gpu,
+            gpu_log_interval=gpu_log_interval,
+        )
+
+    @strip_at_tag_in_log
+    def log(self, values: dict, step: Optional[int], **kwargs):
+        if step is not None:
+            values = dict(values)
+            values["step"] = step
+        self.run.log(values)
+
+    def log_system(self, values: dict):
+        self.run.log_system(values)
+
+    def finish(self):
+        self.run.finish()
+
 tracker_registry["tensorboard"] = TensorBoardTracker
 tracker_registry["wandb"] = WandbTracker
 tracker_registry["stdout"] = StdoutTracker
 tracker_registry["swanlab"] = SwanlabTracker
+tracker_registry["trackio"] = TrackioTracker

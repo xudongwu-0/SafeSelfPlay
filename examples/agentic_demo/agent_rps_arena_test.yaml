@@ -1,0 +1,17 @@
+defaults:
+  - agent_rps_fsp_train
+
+# Override for quick arena evaluation test
+max_steps: 3
+fsp_save_steps: 1
+eval_steps: 100
+save_steps: 10000
+
+# Use projects dir to avoid home quota issues
+output_dir: /projects/bfoz/wchen11/arena_output
+logging_dir: /projects/bfoz/wchen11/arena_output/logs
+checkpoint_config:
+  type: file_system
+  output_dir: /projects/bfoz/wchen11/arena_output/render
+tracker_kwargs:
+  log_dir: /projects/bfoz/wchen11/arena_output/tensorboard

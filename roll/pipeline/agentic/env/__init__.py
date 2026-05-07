@@ -15,6 +15,8 @@ gem.register("roll_qa", entry_point="roll.pipeline.agentic.env.gem.qa_env:QaEnv"
 gem.register("sokoban_sandbox", entry_point="roll.pipeline.agentic.env.sandbox:SokobanSandboxEnv")
 gem.register("sokoban_native_env", entry_point="roll.pipeline.agentic.env.sokoban.native_env:SokobanNativeEnv")
 gem.register("deepeyes", entry_point="roll.pipeline.agentic.env.deepeyes:DeepEyesEnv")
+gem.register("rock_paper_scissors", entry_point="roll.pipeline.agentic.env.rock_paper_scissors:RockPaperScissorsEnv")
+gem.register("kuhn_poker", entry_point="roll.pipeline.agentic.env.kuhn_poker:KuhnPokerEnv")
 gem.register("rock_tb_native_env", entry_point="roll.pipeline.agentic.env.sandbox.rock_tb_native_env:RockTBNativeEnv")
 
 try:

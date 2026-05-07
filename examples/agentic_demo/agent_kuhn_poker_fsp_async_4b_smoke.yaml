@@ -1,0 +1,48 @@
+defaults:
+  - agent_kuhn_poker_fsp_4b_smoke
+
+exp_name: "kuhn_fsp_async1_4b_sota_smoke"
+tracker_kwargs:
+  project: self-play-debug
+  name: ${exp_name}
+  tags:
+    - kuhn_poker
+    - fsp_async
+    - smoke
+    - qwen3_5_4b
+    - sota
+    - auton
+
+async_generation_ratio: 1
+
+max_steps: 5
+fsp_save_steps: 2
+eval_steps: 100
+save_steps: 10000
+
+rollout_batch_size: 256
+sequence_length: 1024
+
+train_env_manager:
+  format_penalty: -0.01
+  max_env_num_per_worker: 256
+  num_env_groups: 64
+  group_size: 4
+  tags: [KuhnPokerLLMThink]
+  num_groups_partition: [64]
+
+actor_train:
+  device_mapping: list(range(0,3))
+  training_args:
+    gradient_accumulation_steps: 3
+  infer_batch_size: 4
+
+actor_infer:
+  device_mapping: "[3]"
+  generating_args:
+    max_new_tokens: 1024
+  strategy_args:
+    strategy_config:
+      enforce_eager: false
+      max_num_batched_tokens: 4096
+  infer_batch_size: 4

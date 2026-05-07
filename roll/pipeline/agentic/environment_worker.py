@@ -78,7 +78,8 @@ class EnvironmentWorker(Worker):
                 mode=mode,
                 extra_data_provider=extra_data_provider,
             )
-        with ThreadPoolExecutor(max_workers=min(len(self.env_configs), 64)) as executor:
+        # cap at 8: concurrent deepcopy of Rust-backed fast tokenizers segfaults at high counts
+        with ThreadPoolExecutor(max_workers=min(len(self.env_configs), 8)) as executor:
             futures = [
                 executor.submit(create_env_manager, env_id, env_config)
                 for env_id, env_config in self.env_configs.items()
@@ -122,6 +123,18 @@ class EnvironmentWorker(Worker):
     async def update_step(self, global_step):
         for env_manager in self.env_managers.values():
             env_manager.update_step(global_step)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
+    async def update_enemy_pool(self, lora_path: str):
+        for env_manager in self.env_managers.values():
+            if hasattr(env_manager, "update_enemy_pool"):
+                env_manager.update_enemy_pool(lora_path)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
+    async def update_nash_probabilities(self, probs) -> None:
+        for env_manager in self.env_managers.values():
+            if hasattr(env_manager, "set_nash_probabilities"):
+                env_manager.set_nash_probabilities(probs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
     async def stop(self):

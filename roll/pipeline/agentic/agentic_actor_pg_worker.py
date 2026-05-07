@@ -4,7 +4,7 @@ import torch
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.base_worker import ActorWorker as BaseActorWorker
 from roll.utils.functionals import masked_mean, agg_loss, compute_approx_kl
-from roll.pipeline.agentic.utils import compute_segment_masked_mean
+from roll.pipeline.agentic.utils import compute_segment_masked_mean, effective_kl_coef
 from roll.pipeline.agentic.agentic_pipeline import get_episode_scores
 from roll.utils.train_infer_corrections import compute_train_infer_correction
 from roll.platforms import current_platform
@@ -116,7 +116,8 @@ class ActorWorker(BaseActorWorker):
         )
 
         if self.pipeline_config.use_kl_loss:
-            total_loss = pg_loss + kl_loss * self.pipeline_config.kl_loss_coef
+            kl_coef = effective_kl_coef(self.pipeline_config, data.meta_info.get("global_step", 0))
+            total_loss = pg_loss + kl_loss * kl_coef
         else:
             total_loss = pg_loss
         if self.pipeline_config.entropy_loss_coef > 0:
@@ -481,8 +482,7 @@ class ActorWorker(BaseActorWorker):
 
         # 构建基础指标
         base_metrics = {
-            "actor/ratio_mean@sum": agg_loss(loss_mat=ratio, loss_mask=response_mask, loss_agg_mode='seq-mean-token-mean',
-                                                global_valid_samples=global_valid_samples['response_mask'],).detach().item(),
+            "actor/ratio_mean@mean": masked_mean(ratio, response_mask).detach().item(),
             "actor/ratio_max@max": torch.max(ratio * response_mask).detach().item(),
             "actor/ratio_min@min": torch.min(ratio * response_mask + (1 - response_mask) * 1e10).detach().item(),
             "actor/pg_loss@sum": cached["original_pg_loss"].detach().item(),

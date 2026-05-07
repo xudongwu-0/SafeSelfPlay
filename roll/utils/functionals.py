@@ -220,6 +220,8 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
 def entropy_from_logits(logits: torch.Tensor):
     """Calculate entropy from logits."""
     logits = logits.float()
+    # Numerical stability: subtract max to prevent overflow in logsumexp/softmax
+    logits = logits - logits.max(dim=-1, keepdim=True).values
     pd = torch.nn.functional.softmax(logits, dim=-1)
     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
     return entropy

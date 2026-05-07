@@ -1,0 +1,164 @@
+defaults:
+  - ../config/traj_envs@_here_
+  - ../config/deepspeed_zero@_here_
+  - ../config/deepspeed_zero2@_here_
+  - ../config/deepspeed_zero3@_here_
+  - ../config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "kuhn_psro_3b_1k_fixLR_rfilter_bubble144"
+seed: 42
+logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
+output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output
+system_envs: {}
+
+track_with: wandb
+tracker_kwargs:
+  project: self-play
+  name: ${exp_name}
+  tags:
+    - kuhn_poker
+    - psro
+    - qwen2_5_3b
+    - cold_start
+    - async
+    - modal
+    - ev_payoff
+    - gs24
+    - score0p15
+    - reasoning_filter
+
+checkpoint_config:
+  type: file_system
+  async_upload: false
+  output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/render
+
+num_gpus_per_node: 4
+
+max_steps: 1000
+save_steps: 10000
+logging_steps: 1
+eval_steps: 50
+resume_from_checkpoint: false
+fsp_save_steps: 50
+fsp_opponent_weight_mode: uniform
+fsp_score_threshold: 0.15
+fsp_score_window: 10
+fsp_score_timeout: 150
+cold_start: true
+async_generation_ratio: 1
+
+# PSRO: expand payoff matrix + compute Nash after each FSP generation
+psro_mode: true
+psro_episodes_per_pair: 36   # 3 full cycles of 12 start states
+psro_seed_base: 12345
+psro_bubble_eval_episodes: 144   # 12 groups × 12 start states
+
+enable_reasoning_filter: true
+reasoning_filter_n: 132  # half of rollout_batch_size
+
+rollout_batch_size: 264  # 11 * 24
+val_batch_size: 8
+sequence_length: 1024
+
+advantage_clip: 10.0
+ppo_epochs: 1
+adv_estimator: "grpo"
+init_kl_coef: 0.01
+use_kl_loss: true
+kl_loss_coef: 0.01
+kl_loss_coef_end: -1.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+pretrain: Qwen/Qwen2.5-3B-Instruct
+reward_pretrain: Qwen/Qwen2.5-3B-Instruct
+
+actor_train:
+  model_args:
+    flash_attn: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+    lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    lora_rank: 32
+    lora_alpha: 32
+  training_args:
+    learning_rate: 2.0e-5
+    weight_decay: 0
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 11
+    warmup_steps: 2
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: "[0,1,2]"
+  infer_batch_size: 4
+  use_dynamic_batching_in_train: false
+  max_tokens_per_microbatch_in_train: 0
+  sequence_length_round_in_train: 4
+  use_inner_dynamic_batching_in_train: false
+
+actor_infer:
+  model_args:
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    lora_rank: 32
+    lora_alpha: 32
+  generating_args:
+    max_new_tokens: 512
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.92
+      block_size: 16
+      load_format: auto
+      max_loras: 21  # ceil(max_steps/fsp_save_steps) + 1 = 1000/50 + 1
+      enforce_eager: false
+      max_num_batched_tokens: 4096
+  device_mapping: "[3]"
+  infer_batch_size: 4
+
+reward_normalization: {}
+
+train_env_manager:
+  format_penalty: -0.01
+  max_env_num_per_worker: 64
+  num_env_groups: 11
+  group_size: 24
+  tags: [KuhnPokerLLMThink]
+  num_groups_partition: [11]
+  include_opponent_reasoning: false
+
+val_env_manager:
+  max_env_num_per_worker: 4
+  num_env_groups: 4
+  group_size: 1
+  tags: [KuhnPokerLLMThink]
+  num_groups_partition: [4]
+
+max_tokens_per_step: 512
+max_actions_per_traj: 2
+
+custom_envs:
+  KuhnPokerLLMThink:
+    ${custom_env.KuhnPokerLLMThink}
+  KuhnPokerLLMThinkStochastic:
+    ${custom_env.KuhnPokerLLMThinkStochastic}

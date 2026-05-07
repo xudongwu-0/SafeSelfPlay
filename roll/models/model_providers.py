@@ -17,6 +17,10 @@ from transformers import (
     PreTrainedTokenizer,
     TrainingArguments,
 )
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 from transformers.dynamic_module_utils import get_cached_module_file
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import is_fsdp_enabled
@@ -237,21 +241,13 @@ def load_model(
 
     init_kwargs["config"] = config
     init_kwargs["pretrained_model_name_or_path"] = model_name_or_path
-    # TODO: remove AutoModelForVision2Seq after deprecate torch260
-    import transformers
-
-    if Version("4.54.0") <= Version(transformers.__version__):
-        from transformers import AutoModelForImageTextToText
-
-        it2t_model_cls = AutoModelForImageTextToText
+    cfg_type = type(config)
+    if cfg_type in AutoModelForCausalLM._model_mapping.keys():
+        model_class = AutoModelForCausalLM  # text (incl. VLM text-only variant)
+    elif cfg_type in AutoModelForVision2Seq._model_mapping.keys():
+        model_class = AutoModelForVision2Seq  # image and video
     else:
-        from transformers import AutoModelForVision2Seq
-
-        it2t_model_cls = AutoModelForVision2Seq
-    if type(config) in it2t_model_cls._model_mapping.keys():  # assume built-in models
-        model_class = it2t_model_cls  # image and video
-    else:
-        model_class = AutoModelForCausalLM  # text
+        model_class = AutoModelForCausalLM  # fallback
 
     fsdp2_init_context = getattr(_fsdp2_init_context, "context", None)
 
@@ -515,8 +511,9 @@ def default_actor_model_provider(
                 init_kwargs["device_map"] = "balanced"
         logger.info(f"init_kwargs: {init_kwargs}")
         model = load_model(model_args, is_trainable, False)
-        if model.config.pad_token_id is None:
-            model.config.pad_token_id = tokenizer.pad_token_id
+        _text_cfg = model.config.get_text_config()
+        if getattr(_text_cfg, "pad_token_id", None) is None:
+            _text_cfg.pad_token_id = tokenizer.pad_token_id
         patch_model(model, config, use_mcore=False)
 
     model_args.model_name_or_path = old_model_name_or_path
@@ -606,8 +603,9 @@ def default_reward_model_provider(
             logger.info("patch AutoModelForCausalLMWithValueHead load_state_dict and forward")
         else:
             raise NotImplementedError
-        if model.config.pad_token_id is None:
-            model.config.pad_token_id = tokenizer.pad_token_id
+        _text_cfg = model.config.get_text_config()
+        if getattr(_text_cfg, "pad_token_id", None) is None:
+            _text_cfg.pad_token_id = tokenizer.pad_token_id
 
     model_args.model_name_or_path = old_model_name_or_path
 
@@ -677,8 +675,9 @@ def default_value_model_provider(
             )
         else:
             raise NotImplementedError
-        if model.config.pad_token_id is None:
-            model.config.pad_token_id = tokenizer.pad_token_id
+        _text_cfg = model.config.get_text_config()
+        if getattr(_text_cfg, "pad_token_id", None) is None:
+            _text_cfg.pad_token_id = tokenizer.pad_token_id
 
     model_args.model_name_or_path = old_model_name_or_path
 

@@ -1,0 +1,14 @@
+defaults:
+  - agent_kuhn_poker_fsp_train
+
+# Benchmark: 32 concurrent envs
+max_steps: 2
+fsp_save_steps: 0
+eval_steps: 10000
+save_steps: 10000
+
+train_env_manager:
+  num_env_groups: 32
+  group_size: 1
+  max_env_num_per_worker: 64
+  num_groups_partition: [32]

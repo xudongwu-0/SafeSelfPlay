@@ -148,6 +148,7 @@ class ActorPGWorker(ActorWorker):
             "kl_loss": kl_loss,
             "approxkl": approxkl,
             "policykl": policykl,
+            "entropy_loss": entropy_loss,
         })
 
         if self.pipeline_config.use_kl_loss:
@@ -452,10 +453,7 @@ class ActorPGWorker(ActorWorker):
 
         # 构建基础指标
         base_metrics = {
-            "actor/ratio_mean@sum": agg_loss(loss_mat=ratio,
-                           loss_mask=response_mask,
-                           loss_agg_mode='seq-mean-token-mean',
-                           global_valid_samples=global_valid_samples['final_response_mask'],).detach().item(),
+            "actor/ratio_mean@mean": masked_mean(ratio, response_mask).detach().item(),
             "actor/ratio_max@max": torch.max(ratio * response_mask).detach().item(),
             "actor/ratio_min@min": torch.min(ratio * response_mask + (1 - response_mask) * 1e10).detach().item(),
             "actor/pg_loss@sum": cached["original_pg_loss"].detach().item(),
@@ -476,6 +474,7 @@ class ActorPGWorker(ActorWorker):
             "actor/sample_weights_mean": cached["sample_weights"].mean().detach().item(),
             "actor/sample_weights_min": cached["sample_weights"].min().detach().item(),
             "actor/sample_weights_max": cached["sample_weights"].max().detach().item(),
+            "actor/entropy@sum": cached["entropy_loss"].detach().item(),
         }
 
         # 根据PG变体添加特定指标

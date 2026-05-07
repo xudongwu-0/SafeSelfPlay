@@ -1,0 +1,126 @@
+defaults:
+  - ../config/traj_envs@_here_
+  - ../config/deepspeed_zero@_here_
+  - ../config/deepspeed_zero2@_here_
+  - ../config/deepspeed_zero3@_here_
+  - ../config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "agentic_rps_two_player"
+seed: 42
+logging_dir: ./output/logs
+output_dir: ./output
+system_envs: {}
+
+track_with: tensorboard
+tracker_kwargs:
+  log_dir: ./output/tensorboard/agentic_rps_two_player
+
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/render
+
+num_gpus_per_node: 4
+
+max_steps: 10
+save_steps: 10000
+logging_steps: 1
+eval_steps: 10
+resume_from_checkpoint: false
+fsp_save_steps: 5
+
+rollout_batch_size: 16
+val_batch_size: 8
+sequence_length: 4096
+
+advantage_clip: 0.2
+ppo_epochs: 1
+adv_estimator: "grpo"
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+pretrain: Qwen/Qwen2.5-3B-Instruct
+reward_pretrain: Qwen/Qwen2.5-3B-Instruct
+
+actor_train:
+  model_args:
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true
+    dtype: fp16
+    model_type: ~
+    lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    lora_rank: 32
+    lora_alpha: 32
+  training_args:
+    learning_rate: 2.0e-5
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 8
+    warmup_steps: 2
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero3}
+  device_mapping: list(range(0,2))
+  infer_batch_size: 1
+
+actor_infer:
+  model_args:
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true
+    dtype: fp16
+    lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    lora_rank: 32
+    lora_alpha: 32
+  generating_args:
+    max_new_tokens: 256
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.8
+      block_size: 16
+      load_format: auto
+      max_loras: 10
+  device_mapping: list(range(2,4))
+  infer_batch_size: 1
+
+reward_normalization:
+  grouping: tags
+  method: identity
+
+train_env_manager:
+  format_penalty: -0.01
+  max_env_num_per_worker: 16
+  num_env_groups: 1
+  group_size: 1
+  tags: [RockPaperScissorsLLMThink]
+  num_groups_partition: [1]
+
+val_env_manager:
+  max_env_num_per_worker: 1
+  num_env_groups: 1
+  group_size: 1
+  tags: [RockPaperScissorsLLMThink]
+  num_groups_partition: [1]
+
+max_tokens_per_step: 512
+max_actions_per_traj: 1
+
+custom_envs:
+  RockPaperScissorsLLMThink:
+    ${custom_env.RockPaperScissorsLLMThink}
