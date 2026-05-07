@@ -82,6 +82,18 @@ class RewardNormalizationConfig:
             )
         },
     )
+    stratified_baseline: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Re-weighted stratified mean baseline for multi-opponent GRPO. "
+                "Within each GRPO group: baseline = Σ_k(w_k * mu_k) / Σ_k(w_k) over sampled opponents, "
+                "correcting selection bias when empirical sampling deviates from Nash weights. "
+                "Requires 'opponent_id' in non_tensor_batch and opponent_prob_map at runtime (psro_mode=True). "
+                "Mutually exclusive with blended_baseline_c. When active, norm_mean_type/norm_std_type are ignored."
+            )
+        },
+    )
 
     def __post_init__(self):
 
@@ -213,10 +225,13 @@ class AgenticConfig(PPOConfig):
     fsp_score_threshold: float = field(default=0.0, metadata={"help": "If > 0, trigger FSP switch when rolling avg rollout/score/mean >= this value instead of fsp_save_steps. 0 = disabled (use fsp_save_steps)."})
     fsp_score_window: int = field(default=10, metadata={"help": "Number of recent steps to average score over for fsp_score_threshold check."})
     fsp_score_timeout: int = field(default=150, metadata={"help": "If fsp_score_threshold > 0, also trigger FSP switch when score fails to reach threshold for this many steps. 0 = disabled."})
+    fsp_score_threshold_start: float = field(default=0.0, metadata={"help": "If > 0, linearly decay fsp_score_threshold from this value down to fsp_score_threshold_end over fsp_score_timeout steps per generation. Overrides fsp_score_threshold when set."})
+    fsp_score_threshold_end: float = field(default=0.0, metadata={"help": "End value for linear threshold decay (used when fsp_score_threshold_start > 0)."})
     psro_mode: bool = field(default=False, metadata={"help": "Enable PSRO: expand PayoffMatrix and compute Nash after each FSP generation."})
     psro_episodes_per_pair: int = field(default=32, metadata={"help": "PSRO: episodes per (i,j) policy pair during payoff matrix expansion."})
     psro_max_concurrent_eval: Optional[int] = field(default=None, metadata={"help": "PSRO: max concurrent arena episodes during expand_matrix. Defaults to psro_bubble_eval_episodes if set, else 256."})
     psro_seed_base: int = field(default=12345, metadata={"help": "PSRO: base seed for PayoffMatrix episode reproducibility."})
+    arena_log_ci_table: bool = field(default=True, metadata={"help": "Log per-pair 95% CI table after arena evaluation."})
     psro_bubble_eval_episodes: int = field(
         default=144,
         metadata={"help": "PSRO: episodes per bubble-eval step (0 or -1 = disabled). "
@@ -242,7 +257,7 @@ class AgenticConfig(PPOConfig):
         metadata={"help": "Smoke test only. Log each agent observation+response at INFO level."},
     )
     response_log_steps: int = field(
-        default=0,
+        default=10,
         metadata={"help": "Log sample rollout responses to wandb every N steps (0 = disabled)."},
     )
     enable_reasoning_filter: bool = field(

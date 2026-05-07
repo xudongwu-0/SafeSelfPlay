@@ -4,22 +4,8 @@ import torch
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.base_worker import ActorWorker as BaseActorWorker
 from roll.utils.functionals import masked_mean, agg_loss, compute_approx_kl
-from roll.pipeline.agentic.utils import compute_segment_masked_mean
+from roll.pipeline.agentic.utils import compute_segment_masked_mean, effective_kl_coef
 from roll.utils.train_infer_corrections import compute_train_infer_correction
-
-
-def _effective_kl_coef(pipeline_config, global_step: int) -> float:
-    """Linear decay of kl_loss_coef from start value to kl_loss_coef_end over max_steps.
-
-    Returns the constant kl_loss_coef if kl_loss_coef_end < 0 (schedule disabled).
-    """
-    start = float(pipeline_config.kl_loss_coef)
-    end = float(getattr(pipeline_config, "kl_loss_coef_end", -1.0))
-    if end < 0:
-        return start
-    max_steps = int(getattr(pipeline_config, "max_steps", 0)) or 1
-    t = max(0.0, min(1.0, global_step / max_steps))
-    return start + (end - start) * t
 
 
 class ActorWorker(BaseActorWorker):
@@ -107,7 +93,7 @@ class ActorWorker(BaseActorWorker):
         clipped = (clipped_low + clipped_high).float()
 
         if self.pipeline_config.use_kl_loss:
-            kl_coef = _effective_kl_coef(self.pipeline_config, data.meta_info.get("global_step", 0))
+            kl_coef = effective_kl_coef(self.pipeline_config, data.meta_info.get("global_step", 0))
             total_loss = pg_loss + kl_loss * kl_coef
         else:
             total_loss = pg_loss

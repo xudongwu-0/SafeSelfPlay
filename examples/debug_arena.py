@@ -16,6 +16,7 @@ from typing import Callable
 
 sys.path.insert(0, "/zfsauton/scratch/wentsec/ROLL")
 
+from roll.pipeline.agentic.arena_eval import _compute_95ci, log_payoff_ci_table
 from roll.pipeline.agentic.env.kuhn_poker.env import KuhnPokerEnv
 
 CARD = {0: "J", 1: "Q", 2: "K"}
@@ -161,6 +162,38 @@ def run_matrix_vs_fixed(strategy_pairs, episodes_per_state: int = 200):
     print()
 
 
+def run_ci_table_check(episodes_per_state: int = 48):
+    """Build a 3-model arena result dict and verify log_payoff_ci_table output."""
+    env = KuhnPokerEnv(debug_mode=True, action_pattern=r"<action>(.*?)</action>")
+    strategies = [
+        ("always_bet",  make_fixed("Bet")),
+        ("always_pass", make_fixed("Pass")),
+        ("nash",        nash),
+    ]
+    lora_paths = [None, "model_always_pass", "model_nash"]  # None = base_model label
+
+    raw: dict = {}
+    for i, (_, a_strat) in enumerate(strategies):
+        for j, (_, b_strat) in enumerate(strategies):
+            if i == j:
+                continue
+            payoffs = []
+            for si in range(12):
+                for ep in range(episodes_per_state // 12):
+                    seed = si + ep * 12
+                    payoffs.append(play_game(env, a_strat, b_strat, seed=seed))
+            raw[(i, j)] = payoffs
+
+    print("\n=== CI sanity check ===")
+    for (i, j), payoffs in sorted(raw.items()):
+        mean, lo, hi = _compute_95ci(payoffs)
+        print(f"  ({strategies[i][0]} vs {strategies[j][0]})  n={len(payoffs)}  "
+              f"mean={mean:+.3f}  CI=[{lo:+.3f}, {hi:+.3f}]  width={hi - lo:.3f}")
+
+    print("\n=== log_payoff_ci_table output ===")
+    log_payoff_ci_table(raw, lora_paths)
+
+
 if __name__ == "__main__":
     random.seed(42)
 
@@ -187,3 +220,5 @@ if __name__ == "__main__":
         (("random", random_action), ("nash", nash)),
     ]
     run_matrix_vs_fixed(pairs, episodes_per_state=200)
+
+    run_ci_table_check(episodes_per_state=48)

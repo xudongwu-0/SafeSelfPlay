@@ -123,6 +123,7 @@ def _handle_arena_opponent_first(
 
     opponent_lm_input = env_manager._format_opponent_messages(obs_for_opponent)
     opponent_input_ids = opponent_lm_input.batch["input_ids"]
+    opponent_messages = [m for step in env_manager.opponent_history for m in (step.get("messages") or [])]
 
     max_new_tokens = min(
         env_manager.env_config["max_tokens_per_step"],
@@ -135,7 +136,7 @@ def _handle_arena_opponent_first(
     opponent_lm_input.meta_info["lora_name"] = opponent_lora
 
     opponent_output: DataProto = env_manager.llm_proxy.generate(
-        messages=None, lm_input=opponent_lm_input, generation_config=generation_config
+        messages=opponent_messages, lm_input=opponent_lm_input, generation_config=generation_config
     )
 
     if opponent_output is None:
@@ -207,6 +208,7 @@ def play_episode(
         # --- Agent 0 (player_i): format_messages (identical to rollout) ---
         lm_input = env_manager.format_messages(env_manager.rollout_cache)
         input_ids = lm_input.batch["input_ids"]
+        agent_messages = [m for step in env_manager.rollout_cache.history for m in (step.get("messages") or [])]
 
         max_new_tokens = min(
             env_manager.env_config["max_tokens_per_step"],
@@ -220,7 +222,7 @@ def play_episode(
         lm_input.meta_info["lora_name"] = player_i_lora  # KEY: explicit LoRA for agent 0
 
         lm_output: DataProto = env_manager.llm_proxy.generate(
-            messages=None, lm_input=lm_input, generation_config=generation_config
+            messages=agent_messages, lm_input=lm_input, generation_config=generation_config
         )
 
         if lm_output is None:
@@ -318,6 +320,7 @@ def run_arena_evaluation(
     all_trajectories: List[dict] = []
 
     # Run episodes concurrently
+    failure_count = 0
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
         # Map from future to (i, j, ep, env_manager_idx)
         future_to_info = {}
@@ -366,8 +369,9 @@ def run_arena_evaluation(
                         payoff = result
                     results[(i, j)].append(payoff)
                 except Exception as e:
-                    logger.error(f"Arena episode ({i},{j}) ep={ep} failed: {e}")
+                    logger.exception(f"Arena episode ({i},{j}) ep={ep} failed: {e}")
                     results[(i, j)].append(0.0)  # fallback
+                    failure_count += 1
 
                 em_available.append(em_idx)
                 completed += 1
@@ -376,13 +380,60 @@ def run_arena_evaluation(
 
                 submit_batch()
 
+    if failure_count:
+        logger.warning(
+            f"Arena: {failure_count}/{total} episodes failed and were filled with 0.0; "
+            f"payoff matrix may be biased."
+        )
+
     # Compute mean payoffs
     for (i, j), payoffs in results.items():
         payoff_matrix[i][j] = np.mean(payoffs) if payoffs else 0.0
 
+    if pipeline_config.arena_log_ci_table:
+        log_payoff_ci_table(results, lora_paths)
+
     if save_trajectories:
         return payoff_matrix, all_trajectories
     return payoff_matrix
+
+
+def _compute_95ci(payoffs: List[float]) -> Tuple[float, float, float]:
+    """Return (mean, ci_low, ci_high) using normal approximation."""
+    n = len(payoffs)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    arr = np.array(payoffs, dtype=float)
+    mean = float(arr.mean())
+    if n == 1:
+        return mean, mean, mean
+    std = float(arr.std(ddof=1))
+    margin = 1.96 * std / np.sqrt(n)
+    return mean, mean - margin, mean + margin
+
+
+def log_payoff_ci_table(
+    raw_results: Dict[Tuple[int, int], List[float]],
+    lora_paths: List[Optional[str]],
+) -> None:
+    """Print a table of per-pair #runs and 95% CI for the arena payoff."""
+    labels = [_get_model_label(p) for p in lora_paths]
+    col_w = max(max(len(l) for l in labels), 8)
+
+    logger.info("=" * 80)
+    logger.info("Arena 95% CI Table (normal approximation, per matchup pair)")
+    logger.info("=" * 80)
+    header = f"{'player_i':<{col_w}}  {'player_j':<{col_w}}  {'#runs':>6}  {'mean':>8}  {'95% CI'}"
+    logger.info(header)
+    logger.info("-" * 80)
+    for (i, j) in sorted(raw_results.keys()):
+        payoffs = raw_results[(i, j)]
+        mean, ci_low, ci_high = _compute_95ci(payoffs)
+        n = len(payoffs)
+        logger.info(
+            f"{labels[i]:<{col_w}}  {labels[j]:<{col_w}}  {n:>6}  {mean:>+8.3f}  [{ci_low:+.3f}, {ci_high:+.3f}]"
+        )
+    logger.info("=" * 80)
 
 
 def log_payoff_matrix(payoff_matrix: np.ndarray, lora_paths: List[Optional[str]]) -> None:

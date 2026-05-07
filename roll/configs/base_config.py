@@ -137,7 +137,7 @@ class BaseConfig(ScheduleConfig):
         metadata={"help": "Number of steps between logging information."}
     )
     eval_steps: int = field(
-        default=0,
+        default=50,
         metadata={"help": "Run an evaluation every X steps. 0 disables evaluation."},
     )
     rollout_batch_size: int = field(
@@ -539,6 +539,16 @@ class PPOConfig(BaseConfig):
     )
     enable_old_logprobs_recompute: bool = field(default=False, metadata={"help": "Enable old_logprobs computation optimization for disable caching"})
     force_disable_old_logprobs_recompute: bool = field(default=False, metadata={"help": "Force disable old_logprobs computation optimization for disable caching, priority is higher than enable_old_logprobs_recompute"})
+
+    training_lora_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Sentinel directory passed to vLLM as the training LoRA's lora_path. "
+                    "vLLM caches the adapter by lora_int_id so the directory contents are not "
+                    "actually loaded, but vLLM expects a non-empty string. Defaults to "
+                    "~/.cache/roll/training_lora_v1 if unset."
+        },
+    )
 
     train_infer_correction: TrainInferCorrectionConfig = field(
         default_factory=TrainInferCorrectionConfig,

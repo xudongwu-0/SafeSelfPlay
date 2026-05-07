@@ -11,6 +11,16 @@ from packaging.version import Version
 # Must match _TRAINING_LORA_INT_ID in roll/third_party/vllm/worker.py.
 _TRAINING_LORA_INT_ID: int = int(_hashlib.sha256(b"roll_training_lora_v1").hexdigest(), 16) % 0x7FFFFFFF
 
+# Default sentinel path for the training LoRA slot. vLLM caches the adapter by
+# lora_int_id so the directory is not actually read; the value just needs to be
+# stable. Users can override via pipeline_config.training_lora_path.
+_DEFAULT_TRAINING_LORA_PATH: str = os.path.join(os.path.expanduser("~"), ".cache", "roll", "training_lora_v1")
+
+
+def _resolve_training_lora_path(pipeline_config) -> str:
+    """Return the training LoRA sentinel path: pipeline_config override or per-user default."""
+    return getattr(pipeline_config, "training_lora_path", None) or _DEFAULT_TRAINING_LORA_PATH
+
 import torch
 import torch.distributed as dist
 from torch.nn.utils.rnn import pad_sequence
@@ -63,6 +73,10 @@ class VllmStrategy(InferenceStrategy):
         # Must explicitly set VLLM_USE_V1 to pass this check: https://github.com/vllm-project/vllm/pull/14972
         os.environ["VLLM_USE_V1"] = str(vllm_config.pop("VLLM_USE_V1", 1))
         self.sleep_level = vllm_config.pop("sleep_level", 1)
+
+        # Push the training LoRA sentinel path to env so vLLM workers (subprocess) see it.
+        self._training_lora_path = _resolve_training_lora_path(self.worker.pipeline_config)
+        os.environ["ROLL_TRAINING_LORA_PATH"] = self._training_lora_path
 
         data_parallel_size = vllm_config.get("data_parallel_size", 1)
         if data_parallel_size > 1:
@@ -206,15 +220,14 @@ class VllmStrategy(InferenceStrategy):
             if lora_name is None:
                 return None
             # File-based LoRA from enemy pool checkpoint
-            import hashlib
-            lora_int_id = int(hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
+            lora_int_id = int(_hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
             return LoRARequest(lora_name=lora_name, lora_int_id=lora_int_id, lora_path=lora_name)
         # Training agent: use the fixed slot loaded by model_update / custom_add_lora.
         # model_update (PHASE 3) always runs before rollout (PHASE 7) each step.
         return LoRARequest(
             lora_name="training_lora",
             lora_int_id=_TRAINING_LORA_INT_ID,
-            lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora",
+            lora_path=self._training_lora_path,
         )
 
     async def _resolve_lora_request_from_name(self, lora_name):
@@ -226,10 +239,9 @@ class VllmStrategy(InferenceStrategy):
             return LoRARequest(
                 lora_name="training_lora",
                 lora_int_id=_TRAINING_LORA_INT_ID,
-                lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora",
+                lora_path=self._training_lora_path,
             )
-        import hashlib
-        lora_int_id = int(hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
+        lora_int_id = int(_hashlib.sha256(lora_name.encode()).hexdigest(), 16) % 0x7FFFFFFF
         return LoRARequest(lora_name=lora_name, lora_int_id=lora_int_id, lora_path=lora_name)
 
     async def _generate_standard(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:

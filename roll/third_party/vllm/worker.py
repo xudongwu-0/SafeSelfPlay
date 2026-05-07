@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import json
+import os
 import time
 from collections import OrderedDict
 from typing import Iterable, Tuple
@@ -23,6 +24,15 @@ logger = get_logger()
 # one training-LoRA slot regardless of how many training steps are run.
 _TRAINING_LORA_INT_ID: int = int(hashlib.sha256(b"roll_training_lora_v1").hexdigest(), 16) % 0x7FFFFFFF
 
+# Default sentinel path; matches _DEFAULT_TRAINING_LORA_PATH in vllm_strategy.py.
+# Set via env var ROLL_TRAINING_LORA_PATH by the parent strategy from pipeline config.
+_DEFAULT_TRAINING_LORA_PATH: str = os.path.join(os.path.expanduser("~"), ".cache", "roll", "training_lora_v1")
+
+
+def _training_lora_path() -> str:
+    """Return the training LoRA sentinel path set by the parent strategy."""
+    return os.environ.get("ROLL_TRAINING_LORA_PATH", _DEFAULT_TRAINING_LORA_PATH)
+
 
 class TensorLoraManager:
     def __init__(self):
@@ -36,7 +46,7 @@ class TensorLoraManager:
         lora_request = TensorLoRARequest(
             lora_name="training_lora",
             lora_int_id=_TRAINING_LORA_INT_ID,
-            lora_path="/zfsauton/scratch/wentsec/roll_dummy_lora",
+            lora_path=_training_lora_path(),
             peft_config=peft_config,
             lora_tensors=self.lora_params,
         )

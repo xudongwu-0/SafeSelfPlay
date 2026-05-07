@@ -126,6 +126,7 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             # Generate opponent's action via vLLM
             opponent_lm_input = self._format_opponent_messages(obs_for_opponent)
             opponent_input_ids = opponent_lm_input.batch["input_ids"]
+            opponent_messages = [m for step in self.opponent_history for m in (step.get("messages") or [])]
 
             max_new_tokens = min(
                 self.env_config["max_tokens_per_step"],
@@ -138,7 +139,7 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             opponent_lm_input.meta_info["lora_name"] = self.current_opponent_lora
 
             opponent_output: DataProto = self.llm_proxy.generate(
-                messages=None, lm_input=opponent_lm_input, generation_config=generation_config
+                messages=opponent_messages, lm_input=opponent_lm_input, generation_config=generation_config
             )
 
             if opponent_output is None:
@@ -223,6 +224,7 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         else:
             opponent_lm_input = self._format_opponent_messages(obs_for_opponent)
             opponent_input_ids = opponent_lm_input.batch["input_ids"]
+            opponent_messages = [m for step in self.opponent_history for m in (step.get("messages") or [])]
 
             max_new_tokens = min(
                 self.env_config["max_tokens_per_step"],
@@ -235,7 +237,7 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             opponent_lm_input.meta_info["lora_name"] = self.current_opponent_lora  # None=base, str=checkpoint path
 
             opponent_output: DataProto = self.llm_proxy.generate(
-                messages=None, lm_input=opponent_lm_input, generation_config=generation_config
+                messages=opponent_messages, lm_input=opponent_lm_input, generation_config=generation_config
             )
 
             if opponent_output is None:

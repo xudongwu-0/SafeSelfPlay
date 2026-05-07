@@ -415,20 +415,19 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         # After DeepSpeed wraps optimizer, the scheduler's captured base_lrs may
         # mismatch the live optimizer.param_groups. Rebuild the scheduler against
         # whichever optimizer object the scheduler now refers to, so get_lr() and
-        # param_groups always have equal length at step time.
-        try:
-            sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
-            new_scheduler = get_scheduler(
-                self.worker_config.training_args.lr_scheduler_type,
-                sched_opt,
-                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
-                num_training_steps=total_scheduler_steps,
-            )
-            self.scheduler = new_scheduler
-            if hasattr(self.model, "lr_scheduler"):
-                self.model.lr_scheduler = new_scheduler
-        except Exception as _lr_rebuild_err:
-            logger.warning(f"lr scheduler rebuild skipped: {_lr_rebuild_err}")
+        # param_groups always have equal length at step time. A failure here means
+        # the scheduler will desync from the optimizer at step time, so raise hard
+        # rather than silently continue with a corrupted training loop.
+        sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
+        new_scheduler = get_scheduler(
+            self.worker_config.training_args.lr_scheduler_type,
+            sched_opt,
+            num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
+            num_training_steps=total_scheduler_steps,
+        )
+        self.scheduler = new_scheduler
+        if hasattr(self.model, "lr_scheduler"):
+            self.model.lr_scheduler = new_scheduler
 
         logger.info(f"{self.model}")
         dist.barrier()
@@ -444,7 +443,8 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             * self.worker_config.training_args.gradient_accumulation_steps
         )
         rollout_per_rank = self.worker.pipeline_config.rollout_batch_size // self.worker.rank_info.dp_size
-        backward_steps_per_global = max(1, rollout_per_rank * self.worker.pipeline_config.ppo_epochs // backward_batch_size)
+        ppo_epochs = self.worker.pipeline_config.ppo_epochs
+        backward_steps_per_global = max(1, rollout_per_rank * ppo_epochs // backward_batch_size)
         return max(1, num_pipeline_steps * backward_steps_per_global)
 
     def op_compute_language_loss(self, logits: torch.Tensor, labels: torch.Tensor):
@@ -619,21 +619,20 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             logger.warning(f"reset_lora_weights: failed to clear optimizer state: {e}")
 
         # Rebuild LR scheduler from step 0. num_training_steps is in global pipeline-step
-        # units; convert to actual scheduler steps (multiple per pipeline step).
+        # units; convert to actual scheduler steps (multiple per pipeline step). A failure
+        # here leaves the scheduler desynced from the optimizer; raise hard so PSRO resets
+        # never silently continue with a corrupted training loop.
         total_scheduler_steps = self._compute_scheduler_steps(num_training_steps)
-        try:
-            sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
-            new_scheduler = get_scheduler(
-                self.worker_config.training_args.lr_scheduler_type,
-                sched_opt,
-                num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
-                num_training_steps=total_scheduler_steps,
-            )
-            self.scheduler = new_scheduler
-            if hasattr(self.model, "lr_scheduler"):
-                self.model.lr_scheduler = new_scheduler
-        except Exception as e:
-            logger.warning(f"reset_lora_weights: scheduler rebuild failed: {e}")
+        sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
+        new_scheduler = get_scheduler(
+            self.worker_config.training_args.lr_scheduler_type,
+            sched_opt,
+            num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
+            num_training_steps=total_scheduler_steps,
+        )
+        self.scheduler = new_scheduler
+        if hasattr(self.model, "lr_scheduler"):
+            self.model.lr_scheduler = new_scheduler
 
         logger.info(f"reset_lora_weights: reinit {num_a} lora_A + {num_b} lora_B params; "
                     f"synced {num_fp32_synced} fp32 master groups; Adam state cleared; "

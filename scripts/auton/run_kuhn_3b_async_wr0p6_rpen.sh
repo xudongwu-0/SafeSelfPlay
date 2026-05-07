@@ -53,7 +53,7 @@ python examples/start_agentic_pipeline.py \
     output_dir=${FSP_OUTPUT_ROOT} \
     checkpoint_config.output_dir=${FSP_OUTPUT_ROOT}/render \
     train_env_manager.format_penalty=-0.1 \
-    custom_env.KuhnPokerLLMThink.env_config.reasoning_penalty=-0.01 \
+    custom_env.KuhnPokerLLMThink.env_config.reasoning_reward=0.01 \
     fsp_win_rate_threshold=0.6 \
     fsp_win_rate_window=10 \
     exp_name=kuhn_3b_async_wr0p6_rpen \

@@ -75,13 +75,15 @@ class OpenAIProxy(BaseLLMProxy):
         temperature = generation_config.get("temperature", 0.7)
         max_tokens = generation_config.get("max_new_tokens", 8192)
         top_p = generation_config.get("top_p", 0.8)
-        top_k = generation_config.get("top_k", None) # Default to None, only add if specified
         # presence_penalty = generation_config.get("repetition_penalty", 0.0) # OpenAI default is 0.0
 
         enable_thinking = generation_config.get("enable_thinking", False)
+        top_k = generation_config.get("top_k", None)
+        # Only include top_k if explicitly enabled via proxy_config (most APIs don't support it)
+        pass_top_k = self.llm_proxy_config.proxy_config.get("pass_top_k", False)
 
         extra_body = {}
-        if top_k is not None:
+        if top_k is not None and pass_top_k:
             extra_body["top_k"] = top_k
         if enable_thinking:
             # According to the example, enable_thinking goes under extend_fields
@@ -106,7 +108,7 @@ class OpenAIProxy(BaseLLMProxy):
                 if completion.choices is None:
                     response_text = "OpenAI API returned no choices."
                 else:
-                    response_text = completion.choices[0].message.content
+                    response_text = completion.choices[0].message.content or ""
                 responses = self.tokenizer([response_text], return_tensors="pt")
                 lm_input.batch["responses"] = responses["input_ids"]
                 lm_input.non_tensor_batch["response_text"] = np.array([response_text], dtype=object)

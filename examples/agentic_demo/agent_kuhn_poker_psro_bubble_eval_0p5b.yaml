@@ -153,7 +153,7 @@ custom_envs:
       action_pattern: ${think_action_pattern}
       max_steps: 2
       format_penalty: -0.01
-      reasoning_penalty: 0.0
+      reasoning_reward: 0.0
       opponent_strategy: "llm"
       stochastic_policy: false
       debug_mode: true   # deterministic state cycling: seed % NUM_START_STATES

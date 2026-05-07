@@ -10,7 +10,8 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "kuhn_psro_3b"
+# Diff vs rst300: drop_zero_variance_groups=true, eval_steps=0.
+exp_name: "kuhn_psro_3b_fixSeed_bubbleEval_rst300_dropZV"
 seed: 42
 logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
 output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output
@@ -30,6 +31,7 @@ tracker_kwargs:
     - ev_payoff
     - gs24
     - score0p15
+    - dropZV
 
 checkpoint_config:
   type: file_system
@@ -41,15 +43,13 @@ num_gpus_per_node: 4
 max_steps: 1000
 save_steps: 10000
 logging_steps: 1
-eval_steps: 50
+eval_steps: 0
 resume_from_checkpoint: false
 fsp_save_steps: 50
 fsp_opponent_weight_mode: uniform
 fsp_score_threshold: 0.15
 fsp_score_window: 10
 fsp_score_timeout: 300
-fsp_score_threshold_start: 0.0
-fsp_score_threshold_end: 0.0
 cold_start: true
 async_generation_ratio: 1
 
@@ -58,6 +58,9 @@ psro_mode: true
 psro_episodes_per_pair: 36   # 3 full cycles of 12 start states
 psro_seed_base: 12345
 psro_bubble_eval_episodes: 144   # 12 groups × 12 start states
+
+# GRPO: drop zero-variance groups (whole groups removed from the batch)
+drop_zero_variance_groups: true
 
 rollout_batch_size: 264  # 11 * 24
 val_batch_size: 8
@@ -134,8 +137,8 @@ actor_infer:
   device_mapping: "[3]"
   infer_batch_size: 4
 
-reward_normalization: {}
-filter_zero_variance_groups: false
+reward_normalization:
+  grouping: state   # auto-upgrades to init_state_id (12 Kuhn Poker start states); required for drop_zero_variance_groups
 
 train_env_manager:
   format_penalty: -0.01

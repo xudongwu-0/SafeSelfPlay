@@ -29,6 +29,20 @@ from roll.utils.functionals import (
 logger = get_logger()
 
 
+def effective_kl_coef(pipeline_config, global_step: int) -> float:
+    """Linear decay of kl_loss_coef from start value to kl_loss_coef_end over max_steps.
+
+    Returns the constant kl_loss_coef if kl_loss_coef_end < 0 (schedule disabled).
+    """
+    start = float(pipeline_config.kl_loss_coef)
+    end = float(getattr(pipeline_config, "kl_loss_coef_end", -1.0))
+    if end < 0:
+        return start
+    max_steps = int(getattr(pipeline_config, "max_steps", 0)) or 1
+    t = max(0.0, min(1.0, global_step / max_steps))
+    return start + (end - start) * t
+
+
 def dump_rollout_render(save_dir, step, frames: List[List], env_ids: List, tags: List, episode_scores: List):
     with Timer(name="dump", logger=None) as timer:
         try:
@@ -100,11 +114,13 @@ def compute_discounted_returns(batch: DataProto, adv_estimator, gamma=1.0) -> Da
 def _blended_baseline_norm(
     scores: torch.Tensor,
     opponent_ids: np.ndarray,
+    group_ids: Optional[np.ndarray] = None,
     c: float = 3.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Empirical Bayesian Shrinkage normalization for multi-opponent GRPO.
 
-    Blends per-opponent statistics with global batch statistics. λ_k = n_k / (n_k + c).
+    Groups by (group_id, opponent_id) when group_ids is provided, else by opponent_id alone.
+    Blends per-group statistics with global batch statistics: λ_k = n_k / (n_k + c).
     High n_k → local baseline; low n_k → global baseline. Handles n_k == 1 without NaN.
     """
     eps = 1e-5
@@ -115,19 +131,24 @@ def _blended_baseline_norm(
     var_g = ((s - mu_g) ** 2).mean()
 
     advantages = torch.zeros_like(s)
-    unique_opps = np.unique(opponent_ids)
+    # Group by (init_state, opponent) when group_ids provided; opponent-only otherwise.
+    if group_ids is not None:
+        composite_ids = np.array([f"{g}|||{o}" for g, o in zip(group_ids, opponent_ids)], dtype=object)
+    else:
+        composite_ids = opponent_ids
+    unique_keys = np.unique(composite_ids)
     lambdas: List[float] = []
     n_ks: List[int] = []
 
-    for opp_id in unique_opps:
-        opp_mask = torch.from_numpy(opponent_ids == opp_id).to(device)
-        opp_scores = s[opp_mask]
-        n_k = opp_scores.numel()
+    for key in unique_keys:
+        key_mask = torch.from_numpy(composite_ids == key).to(device)
+        key_scores = s[key_mask]
+        n_k = key_scores.numel()
         n_ks.append(n_k)
 
-        mu_k = opp_scores.mean()
+        mu_k = key_scores.mean()
         # n_k == 1: local variance is 0 by definition (single sample, no spread)
-        var_k = ((opp_scores - mu_k) ** 2).mean() if n_k > 1 else s.new_zeros(1).squeeze()
+        var_k = ((key_scores - mu_k) ** 2).mean() if n_k > 1 else s.new_zeros(1).squeeze()
 
         lambda_k = n_k / (n_k + c)
         lambdas.append(lambda_k)
@@ -136,12 +157,68 @@ def _blended_baseline_norm(
         var_hat = lambda_k * var_k + (1 - lambda_k) * var_g
         sigma_hat = torch.sqrt(var_hat.clamp(min=0.0))
 
-        advantages[opp_mask] = (opp_scores - mu_hat) / (sigma_hat + eps)
+        advantages[key_mask] = (key_scores - mu_hat) / (sigma_hat + eps)
 
     metrics: Dict[str, float] = {
-        "critic/blended/unique_opponents": float(len(unique_opps)),
+        "critic/blended/unique_groups": float(len(unique_keys)),
         "critic/blended/mean_n_k": float(np.mean(n_ks)),
         "critic/blended/mean_lambda": float(np.mean(lambdas)),
+    }
+    return advantages.to(dtype=scores.dtype), metrics
+
+
+@torch.no_grad()
+def _stratified_weighted_baseline_norm(
+    scores: torch.Tensor,
+    opponent_ids: np.ndarray,
+    group_ids: np.ndarray,
+    opponent_prob_map: Dict[str, float],
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Stratified re-weighted baseline normalization for multi-opponent GRPO.
+
+    Per GRPO group: baseline = Σ_k(w_k * mu_k) / Σ_k(w_k) over sampled opponents.
+    Corrects within-group selection bias when empirical sampling deviates from Nash weights.
+    Std normalization uses per-group std.
+    """
+    eps = 1e-5
+    device = scores.device
+    s = scores.float()
+    advantages = torch.zeros_like(s)
+
+    unique_groups = np.unique(group_ids)
+    opps_per_group: List[int] = []
+    all_n_ks: List[int] = []
+
+    for grp in unique_groups:
+        grp_mask_np = group_ids == grp
+        grp_mask = torch.from_numpy(grp_mask_np).to(device)
+        grp_scores = s[grp_mask]
+        grp_opp_ids = opponent_ids[grp_mask_np]
+
+        unique_opps = np.unique(grp_opp_ids)
+        opps_per_group.append(len(unique_opps))
+
+        mu_ks: Dict[str, torch.Tensor] = {}
+        for opp_id in unique_opps:
+            opp_mask = torch.from_numpy(grp_opp_ids == opp_id).to(device)
+            opp_scores = grp_scores[opp_mask]
+            mu_ks[opp_id] = opp_scores.mean()
+            all_n_ks.append(opp_scores.numel())
+
+        raw_weights = {opp_id: opponent_prob_map.get(opp_id, 0.0) for opp_id in unique_opps}
+        total_w = float(sum(raw_weights.values()))
+        if total_w < eps:
+            normalized_w = {opp_id: 1.0 / len(unique_opps) for opp_id in unique_opps}
+        else:
+            normalized_w = {opp_id: w / total_w for opp_id, w in raw_weights.items()}
+
+        baseline = sum(normalized_w[opp_id] * mu_ks[opp_id] for opp_id in unique_opps)
+        grp_std = grp_scores.std()
+        advantages[grp_mask] = (grp_scores - baseline) / (grp_std + eps)
+
+    metrics: Dict[str, float] = {
+        "critic/stratified/mean_unique_opps_per_group": float(np.mean(opps_per_group)),
+        "critic/stratified/mean_n_k": float(np.mean(all_n_ks)) if all_n_ks else 0.0,
     }
     return advantages.to(dtype=scores.dtype), metrics
 
@@ -151,6 +228,7 @@ def agentic_reward_norm(
     batch: "DataProto",
     reward_normalization: RewardNormalizationConfig,
     filter_zero_variance_groups: bool = False,
+    opponent_prob_map: Optional[Dict[str, float]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Normalize rewards per group and return (normalized_rewards, metrics).
 
@@ -158,12 +236,34 @@ def agentic_reward_norm(
         filter_zero_variance_groups: If True, zero out rewards for groups where all
             members have the same score (std < 1e-6). This prevents GRPO from
             producing near-zero advantages that provide no learning signal.
+        opponent_prob_map: Mapping from opponent_id string to population probability.
+            Required when reward_normalization.stratified_baseline is True.
     """
-    assert not (filter_zero_variance_groups and reward_normalization.grouping == "traj_group_id"), (
+    # traj_group_id auto-upgrades to init_state_id when the env provides it; check effective grouping.
+    _effective_grouping = reward_normalization.grouping
+    if _effective_grouping == "traj_group_id" and "init_state_id" in batch.non_tensor_batch:
+        _effective_grouping = "init_state_id"
+    assert not (filter_zero_variance_groups and _effective_grouping == "traj_group_id"), (
         "filter_zero_variance_groups and grouping='traj_group_id' are mutually exclusive: "
         "small traj_group_id groups will frequently be zero-variance by chance, "
         "silently discarding most of the batch."
     )
+    if reward_normalization.stratified_baseline:
+        if filter_zero_variance_groups:
+            raise ValueError(
+                "stratified_baseline and filter_zero_variance_groups cannot both be set: "
+                "stratified baseline uses opponent-weighted group means that handle "
+                "zero-variance via its own normalization."
+            )
+        if "opponent_id" not in batch.non_tensor_batch:
+            raise ValueError("stratified_baseline requires 'opponent_id' in non_tensor_batch.")
+        scores = batch.batch["scores"]
+        opponent_ids = batch.non_tensor_batch["opponent_id"]
+        group_key = "init_state_id" if "init_state_id" in batch.non_tensor_batch else "traj_group_id"
+        group_ids = batch.non_tensor_batch[group_key]
+        # Before first Nash solve, opponent_prob_map is None — fall back to uniform weights (simple group mean).
+        effective_prob_map: Dict[str, float] = opponent_prob_map if opponent_prob_map is not None else {}
+        return _stratified_weighted_baseline_norm(scores, opponent_ids, group_ids, effective_prob_map)
     if reward_normalization.blended_baseline_c is not None:
         if filter_zero_variance_groups:
             raise ValueError(
@@ -177,7 +277,10 @@ def agentic_reward_norm(
             )
         scores = batch.batch["scores"]
         opponent_ids = batch.non_tensor_batch["opponent_id"]
-        return _blended_baseline_norm(scores, opponent_ids, c=reward_normalization.blended_baseline_c)
+        group_ids = batch.non_tensor_batch.get(
+            "init_state_id", batch.non_tensor_batch.get("traj_group_id")
+        )
+        return _blended_baseline_norm(scores, opponent_ids, group_ids=group_ids, c=reward_normalization.blended_baseline_c)
     batch.batch["sample_order_placeholder"] = torch.arange(batch.batch.batch_size[0], device=batch.batch.device)
     grouping = reward_normalization.grouping
     norm_mean_type = reward_normalization.norm_mean_type
@@ -232,13 +335,10 @@ def agentic_reward_norm(
         else:
             reward_std = None
 
-        is_zero_variance = scores_float.numel() <= 1 or (reward_std is not None and reward_std.abs() < 1e-6)
-        if is_zero_variance:
-            # Also check raw score std for groups without std normalization
-            if reward_std is None and scores_float.numel() > 1 and scores_float.std().abs() < 1e-6:
-                is_zero_variance = True
-            elif reward_std is None:
-                is_zero_variance = False
+        if reward_std is not None:
+            is_zero_variance = scores_float.numel() <= 1 or reward_std.abs() < 1e-6
+        else:
+            is_zero_variance = scores_float.numel() <= 1 or scores_float.std().abs() < 1e-6
 
         if is_zero_variance:
             num_zero_variance_groups += 1
@@ -300,7 +400,11 @@ def build_state_group(batch: "DataProto") -> "DataProto":
 
 
 @torch.no_grad()
-def compute_response_level_rewards(batch: "DataProto", pipeline_config: AgenticConfig) -> "DataProto":
+def compute_response_level_rewards(
+    batch: "DataProto",
+    pipeline_config: AgenticConfig,
+    opponent_prob_map: Optional[Dict[str, float]] = None,
+) -> "DataProto":
     reward_metrics = {}
     filter_zv = getattr(pipeline_config, "filter_zero_variance_groups", False)
     if pipeline_config.adv_estimator == "gigpo":
@@ -312,6 +416,7 @@ def compute_response_level_rewards(batch: "DataProto", pipeline_config: AgenticC
         episode_rewards, ep_norm_metrics = agentic_reward_norm(
             scores_to_group, reward_normalization=pipeline_config.reward_normalization,
             filter_zero_variance_groups=filter_zv,
+            opponent_prob_map=opponent_prob_map,
         )
         reward_metrics.update(ep_norm_metrics)
 
@@ -341,6 +446,7 @@ def compute_response_level_rewards(batch: "DataProto", pipeline_config: AgenticC
         rewards, norm_metrics = agentic_reward_norm(
             scores_to_group, reward_normalization=pipeline_config.reward_normalization,
             filter_zero_variance_groups=filter_zv,
+            opponent_prob_map=opponent_prob_map,
         )
         batch.batch["response_level_rewards"] = rewards
         reward_metrics.update(norm_metrics)
@@ -350,6 +456,7 @@ def compute_response_level_rewards(batch: "DataProto", pipeline_config: AgenticC
         rewards, norm_metrics = agentic_reward_norm(
             scores_to_group, reward_normalization=pipeline_config.reward_normalization,
             filter_zero_variance_groups=filter_zv,
+            opponent_prob_map=opponent_prob_map,
         )
         batch.batch["response_level_rewards"] = rewards
         reward_metrics.update(norm_metrics)

@@ -10,7 +10,10 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "kuhn_psro_debug_0p5b"
+# Smoke check: verify NxN payoff matrix is logged correctly as N grows large.
+# fsp_save_steps=5 → PSRO reset every 5 steps; max_steps=65 → N=14 (14×14 matrix by end).
+# psro_episodes_per_pair=4 is intentionally minimal — training quality is irrelevant here.
+exp_name: "kuhn_psro_payoff_matrix_smoke"
 seed: 42
 logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
 output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output
@@ -23,7 +26,8 @@ tracker_kwargs:
   tags:
     - kuhn_poker
     - psro
-    - debug
+    - bubble_eval
+    - payoff_matrix_smoke
     - auton
 
 checkpoint_config:
@@ -33,22 +37,23 @@ checkpoint_config:
 
 num_gpus_per_node: 2
 
-max_steps: 3
+max_steps: 65
 save_steps: 10000
 logging_steps: 1
 eval_steps: 100
 resume_from_checkpoint: false
-fsp_save_steps: 1
+fsp_save_steps: 5   # PSRO reset every 5 steps → 13 resets → N=14 (14×14 matrix)
 cold_start: true
 
 # PSRO: expand payoff matrix + compute Nash after each FSP generation
 psro_mode: true
-psro_episodes_per_pair: 12   # 1 full cycle of 12 start states (NUM_START_STATES)
+psro_episodes_per_pair: 4    # minimal; goal is matrix logging, not training quality
 psro_max_concurrent_eval: 4
 psro_seed_base: 12345
+psro_bubble_eval_episodes: 12   # 1 group × 12 = 12 episodes per step (minimum)
 
-debug_log_agent_response: true
-debug_log_group_rewards: true
+debug_log_agent_response: false
+debug_log_group_rewards: false
 
 rollout_batch_size: 26
 val_batch_size: 4
@@ -112,7 +117,7 @@ actor_infer:
       gpu_memory_utilization: 0.85
       block_size: 16
       load_format: auto
-      max_loras: 6
+      max_loras: 16  # ceil(65/5) + 3 = 16
       enforce_eager: true
       max_num_batched_tokens: 8192
   device_mapping: "[1]"
@@ -156,4 +161,4 @@ custom_envs:
       reasoning_reward: 0.0
       opponent_strategy: "llm"
       stochastic_policy: false
-      debug_mode: true   # deterministic state cycling: seed % NUM_START_STATES
+      debug_mode: true

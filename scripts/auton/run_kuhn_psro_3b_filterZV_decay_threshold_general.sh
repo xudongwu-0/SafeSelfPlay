@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=kuhn_3b_pr_wr0p6_rpen_gs32
-#SBATCH --output=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_3b_pr_wr0p6_rpen_gs32_%j.out
-#SBATCH --error=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_3b_pr_wr0p6_rpen_gs32_%j.err
-#SBATCH --partition=preempt
+#SBATCH --job-name=kuhn_psro_3b_filterZV_decay_threshold_general
+#SBATCH --output=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_psro_3b_filterZV_decay_threshold_general_%j.out
+#SBATCH --error=/zfsauton/scratch/wentsec/ROLL/logs/kuhn_psro_3b_filterZV_decay_threshold_general_%j.err
+#SBATCH --partition=general
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=192G
-#SBATCH --time=7-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --gres=gpu:a6000:4
-#SBATCH --exclude=gpu31
+#SBATCH --exclude=gpu24,gpu26,gpu30
 
 set -ex
 
@@ -34,9 +34,9 @@ export LD_LIBRARY_PATH=$CUDA_TARGET_DIR/lib:$CUDA_HOME/lib:$LD_LIBRARY_PATH
 export CPATH=$CUDA_TARGET_DIR/include:$CPATH
 export LIBRARY_PATH=$CUDA_TARGET_DIR/lib:$CUDA_HOME/lib:$LIBRARY_PATH
 export PYTHONPATH=$ROLL_DIR:$PYTHONPATH
-export TMPDIR=/zfsauton/scratch/wentsec/tmp_ray_$$
 export TRITON_CACHE_DIR=/zfsauton/scratch/wentsec/triton_cache
 export RAY_TMPDIR=/zfsauton/scratch/wentsec/ray_tmp
+export TMPDIR=/zfsauton/scratch/wentsec/tmp_ray_$$
 mkdir -p $TMPDIR $TRITON_CACHE_DIR $RAY_TMPDIR
 
 df -h /zfsauton/scratch /zfsauton2/home/wentsec
@@ -48,19 +48,16 @@ sleep 2
 cd $ROLL_DIR
 python examples/start_agentic_pipeline.py \
     --config_path agentic_demo \
-    --config_name agent_kuhn_poker_fsp_train \
+    --config_name agent_kuhn_poker_psro_3b_fixSeed_bubbleEval_rst300 \
     logging_dir=${FSP_OUTPUT_ROOT}/logs \
     output_dir=${FSP_OUTPUT_ROOT} \
     checkpoint_config.output_dir=${FSP_OUTPUT_ROOT}/render \
-    train_env_manager.format_penalty=-0.1 \
-    custom_env.KuhnPokerLLMThink.env_config.reasoning_reward=0.01 \
-    fsp_win_rate_threshold=0.6 \
-    fsp_win_rate_window=10 \
-    train_env_manager.group_size=32 \
-    rollout_batch_size=1056 \
-    exp_name=kuhn_3b_pr_wr0p6_rpen_gs32 \
-    tracker_kwargs.tags="[kuhn_poker,fsp_train,qwen2_5_3b,cold_start,async,auton,preempt,wr0p6,reasoning_penalty,gs32]" \
+    exp_name=kuhn_psro_3b_decay0p3_0p15 \
+    filter_zero_variance_groups=true \
+    fsp_score_threshold=0.0 \
+    fsp_score_threshold_start=0.3 \
+    fsp_score_threshold_end=0.15 \
     2>&1
 
 rm -rf $TMPDIR
-echo "===== KUHN 3B PREEMPT WR0P6 RPEN GS32 DONE (RUN_ID=${RUN_ID}) ====="
+echo "===== kuhn_psro_3b_filterZV_decay_threshold_general DONE (RUN_ID=${RUN_ID}) ====="

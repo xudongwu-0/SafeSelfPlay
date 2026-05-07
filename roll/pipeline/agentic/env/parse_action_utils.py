@@ -1,6 +1,10 @@
 import random
 import re
 
+from roll.utils.logging import get_logger
+
+logger = get_logger()
+
 
 def parse_chance_action(action_content: str, action_lookup: dict) -> tuple:
     """Parse mixed-strategy format: 'Pass 1/3 Bet 2/3' or 'Bet 2/3 Pass 1/3'.
@@ -114,12 +118,10 @@ def default_parser_action_func(text, action_pattern, action_lookup, special_toke
             "think_content": think_content,
         }
         return action_info
-    except Exception as e:
-        print(f"Error parsing action: {[text]}")
-        print(f"Error parsing action: {e}")
-        action_info = {
+    except Exception:
+        logger.exception(f"default_parser_action_func: failed to parse text={text!r}")
+        return {
             "action": action,
             "action_content": "",
-            "think_content": ""
+            "think_content": "",
         }
-        return action_info

@@ -10,6 +10,8 @@ Covers:
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pytest
 
@@ -280,27 +282,35 @@ class TestPayoffMatrixStructure:
             f"BR gap={best_response_gap(M_meta, p1, p2):.4f} on antisymmetrized matrix"
         )
 
-    # --- 3f. PSROLoop uses raw matrix (documents the bug) -----------------------
+    # --- 3f. Why antisymmetrization is required (historical bug, now fixed) ------
 
-    def test_psro_p2_strategy_should_use_antisymmetric_matrix(self):
+    def test_raw_vs_antisym_p2_strategy_differ(self):
         """
-        PSROLoop.on_policy_added() calls compute_nash(updated_matrix) where
-        updated_matrix is the RAW (non-antisymmetric) matrix.
+        PSROLoop.on_policy_added() previously computed Nash on the RAW payoff
+        matrix (before the fix). The raw matrix is not zero-sum due to positional
+        bias, so Nash on it gives spurious mixed strategies.
 
-        This test shows that raw vs antisym p2_strategy differ on the concrete
-        example M_raw=[[0, 0.3],[0.1, 0]]. The correct opponent weights (antisym)
-        concentrate on the stronger policy-0; the buggy weights (raw) give a spurious
-        mixed strategy that over-weights the weaker policy-1.
+        The fix (psro_loop.py:99): M_meta = 0.5 * (updated_matrix - updated_matrix.T)
+        is now applied before compute_nash. This test documents WHY the fix matters:
+        raw vs antisym p2_strategy differ significantly on the concrete example below.
+
+        M_raw = [[0, 0.3], [0.1, 0]]:
+          M[0][1] = 0.3: policy-0 earns 0.3 as P1 vs policy-1 as P2
+          M[1][0] = 0.1: policy-1 earns 0.1 as P1 vs policy-0 as P2
+          (both positive because P1 has structural advantage)
+
+        Raw Nash (wrong): p2 ~= [0.75, 0.25] — spurious weight on weaker policy-1
+        Antisym Nash (correct): p2 ~= [1, 0] — concentrates on stronger policy-0
         """
         M_raw = np.array([[0.0, 0.3], [0.1, 0.0]])
         M_meta = antisymmetrize(M_raw)
 
-        _, p2_current = compute_nash(M_raw)   # current (buggy) behavior
-        _, p2_correct = compute_nash(M_meta)  # correct behavior
+        _, p2_raw = compute_nash(M_raw)
+        _, p2_correct = compute_nash(M_meta)
 
         # Raw: ~[0.75, 0.25] — gives 25% weight to weaker policy-1
-        assert p2_current[1] > 0.2, (
-            f"Raw p2[1] should be >0.2 (spurious weight on weaker policy), got {p2_current[1]:.4f}"
+        assert p2_raw[1] > 0.2, (
+            f"Raw p2[1] should be >0.2 (spurious weight on weaker policy), got {p2_raw[1]:.4f}"
         )
 
         # Correct: ~[1, 0] — concentrates on stronger policy-0
@@ -309,6 +319,85 @@ class TestPayoffMatrixStructure:
         )
 
         # The two p2_strategy values differ significantly.
-        assert not np.allclose(p2_current, p2_correct, atol=0.05), (
-            f"Expected p2 to differ: current={p2_current}, correct={p2_correct}"
+        assert not np.allclose(p2_raw, p2_correct, atol=0.05), (
+            f"Expected p2 to differ: raw={p2_raw}, correct={p2_correct}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Section 4: PSROLoop.on_policy_added() regression — must antisymmetrize
+# ---------------------------------------------------------------------------
+
+class TestPSROLoopAntisymmetrization:
+    """
+    Regression test: PSROLoop.on_policy_added() must call compute_nash on the
+    antisymmetrized matrix M_meta = 0.5*(M - M.T), NOT on the raw matrix.
+
+    Uses mocks to isolate the antisymmetrization logic without needing a real
+    generate_scheduler, tokenizer, or env setup.
+    """
+
+    def _make_psro_loop(self, raw_matrix: np.ndarray):
+        """Return a PSROLoop whose PayoffMatrix.expand_matrix returns raw_matrix."""
+        from roll.pipeline.agentic.psro_loop import PSROLoop
+
+        mock_config = MagicMock()
+        mock_config.psro_episodes_per_pair = 4
+        mock_config.psro_max_concurrent_eval = 1
+        mock_config.psro_seed_base = 0
+        mock_config.psro_bubble_eval_episodes = 0
+
+        with patch("roll.pipeline.agentic.psro_loop.PayoffMatrix") as MockPM:
+            instance = MockPM.return_value
+            # policies list grows with each expand_matrix call
+            instance.policies = [None] * raw_matrix.shape[0]
+            instance.expand_matrix.return_value = raw_matrix.copy()
+
+            loop = PSROLoop.__new__(PSROLoop)
+            loop._iteration = 0
+            loop.payoff_matrix = instance
+        return loop
+
+    def test_on_policy_added_passes_antisymmetric_matrix_to_compute_nash(self):
+        """compute_nash must receive the antisymmetric form of the raw payoff matrix."""
+        M_raw = np.array([[0.0, 0.3], [0.1, 0.0]])
+        M_expected = 0.5 * (M_raw - M_raw.T)
+
+        loop = self._make_psro_loop(M_raw)
+        # policies already has 2 entries (simulating one existing + one new policy)
+        loop.payoff_matrix.policies = [None, "ckpt_1"]
+
+        captured: list[np.ndarray] = []
+
+        def _capture_nash(mat):
+            captured.append(mat.copy())
+            return np.array([0.5, 0.5]), np.array([0.5, 0.5])
+
+        with (
+            patch("roll.pipeline.agentic.psro_loop.compute_nash", side_effect=_capture_nash),
+            patch.object(loop.payoff_matrix, "log"),
+            patch.object(loop.payoff_matrix, "save"),
+        ):
+            loop.on_policy_added(new_policy="ckpt_1", output_dir="/tmp")
+
+        assert len(captured) == 1, "compute_nash should be called exactly once"
+        np.testing.assert_allclose(
+            captured[0], M_expected, atol=1e-9,
+            err_msg="compute_nash received wrong matrix: expected antisymmetrized M_meta",
+        )
+
+    def test_on_policy_added_skips_nash_for_single_policy(self):
+        """When only one policy exists, on_policy_added returns None without calling Nash."""
+        M_raw = np.array([[0.0]])
+        loop = self._make_psro_loop(M_raw)
+        loop.payoff_matrix.policies = [None]
+
+        with (
+            patch("roll.pipeline.agentic.psro_loop.compute_nash") as mock_nash,
+            patch.object(loop.payoff_matrix, "log"),
+            patch.object(loop.payoff_matrix, "save"),
+        ):
+            result = loop.on_policy_added(new_policy=None, output_dir="/tmp")
+
+        assert result is None
+        mock_nash.assert_not_called()

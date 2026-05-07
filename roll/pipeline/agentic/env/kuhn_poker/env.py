@@ -44,7 +44,7 @@ class KuhnPokerEnv(Env):
         self,
         max_steps: int = 2,
         format_penalty: float = 0.0,
-        reasoning_penalty: float = 0.0,
+        reasoning_reward: float = 0.0,
         action_pattern: str = r"<answer>(.*?)</answer>",
         special_token_list: tuple = ("<|im_start|>", "<|im_end|>"),
         env_instruction: Optional[str] = None,
@@ -55,7 +55,7 @@ class KuhnPokerEnv(Env):
     ):
         self.max_steps = max_steps
         self.format_penalty = format_penalty
-        self.reasoning_penalty = reasoning_penalty
+        self.reasoning_reward = reasoning_reward
         self.action_pattern = action_pattern
         self.special_token_list = special_token_list
         self.opponent_strategy = opponent_strategy
@@ -96,7 +96,8 @@ class KuhnPokerEnv(Env):
                 "  P2: Pass or Bet\n"
                 "  If P1 passed and P2 bet → P1 gets one more chance: Pass(fold) or Bet(call)\n"
                 "Showdown: higher card wins the pot.\n\n"
-                "For each decision: consider your card strength and the expected value of betting vs passing, then choose.\n"
+                "For each decision: consider your card strength and the expected value of "
+                "betting vs passing, then choose.\n"
                 "Reply ONLY in this format (nothing after the action tag):\n"
                 "<think>your reasoning</think><action>Pass</action>\n"
                 "or\n"
@@ -219,17 +220,21 @@ class KuhnPokerEnv(Env):
         else:
             self._opponent_action_at_think = None
 
+        handler_args = (action_name, is_valid, action_info, metrics_agg_mode)
         if self.game_state == self.P0_ACTING:
-            obs, reward, terminated, truncated, info = self._handle_p0_acting(action_name, is_valid, action_info, metrics_agg_mode)
+            obs, reward, terminated, truncated, info = self._handle_p0_acting(*handler_args)
         elif self.game_state == self.P1_ACTING:
-            obs, reward, terminated, truncated, info = self._handle_p1_acting(action_name, is_valid, action_info, metrics_agg_mode)
+            obs, reward, terminated, truncated, info = self._handle_p1_acting(*handler_args)
         elif self.game_state == self.P0_RESPONDING:
-            obs, reward, terminated, truncated, info = self._handle_p0_responding(action_name, is_valid, action_info, metrics_agg_mode)
+            obs, reward, terminated, truncated, info = self._handle_p0_responding(*handler_args)
         else:
             info = self._make_info(True, metrics_agg_mode, "Unexpected state.")
             return "", 0.0, True, False, info
 
-        reward += info.pop("reasoning_step_penalty", 0.0)
+        reward += info.pop("reasoning_bonus", 0.0)
+        length_bonus = self.reasoning_reward * (len(action) / 4000)  # 4000 chars ≈ 1000 tokens ≈ 1 good-pattern unit
+        reward += length_bonus
+        info["metrics"]["reasoning/length_bonus"] = length_bonus
         return obs, reward, terminated, truncated, info
 
     def _handle_p0_acting(self, action_name: str, is_valid: bool, action_info: dict, agg: dict):
@@ -392,8 +397,9 @@ class KuhnPokerEnv(Env):
         _direct_claim = bool(re.search(
             rf'\b{_opp_ref}\b.{{0,40}}\b(?:has|have|holds|hold|is\s+holding)\b.{{0,30}}\b{_card_name}\b',
             think, re.IGNORECASE))
+        _neg_words = r"(?:not|no|never|doesn't|don't|can't|cannot|won't|impossible)"
         _neg_claim = bool(re.search(
-            rf"\b{_opp_ref}\b.{{0,80}}\b(?:not|no|never|doesn't|don't|can't|cannot|won't|impossible)\b.{{0,40}}\b{_card_name}\b",
+            rf"\b{_opp_ref}\b.{{0,80}}\b{_neg_words}\b.{{0,40}}\b{_card_name}\b",
             think, re.IGNORECASE))
         impossible_opponent_card = 1.0 if ((_poss_claim or _direct_claim) and not _neg_claim) else 0.0
 
@@ -414,12 +420,15 @@ class KuhnPokerEnv(Env):
             _action_ref = bool(re.search(rf'\b{re.escape(_opp_word)}\b', think, re.IGNORECASE))
             mentions_opp_action = 1.0 if (_general or _action_ref) else 0.0
             # Detect claims that opponent did the opposite of what actually happened
-            _wrong_verbs = r'(?:pass(?:ed)?|fold(?:ed)?|check(?:ed)?)' if _opp_action == "Bet" else r'(?:bet(?:s|ted)?)'
+            _wrong_verbs = (
+                r'(?:pass(?:ed)?|fold(?:ed)?|check(?:ed)?)' if _opp_action == "Bet" else r'(?:bet(?:s|ted)?)'
+            )
             _subj = r'(?:opponent|player\s*(?:1|2|one|two)|they)'
             _m = re.search(rf'\b{_subj}\b.{{0,30}}\b{_wrong_verbs}\b', think, re.IGNORECASE)
             if _m:
                 _pre = think[max(0, _m.start() - 60):_m.start()]
-                if not re.search(r'\b(?:if|when|would|could|might|should|suppose|imagine|assuming)\b', _pre, re.IGNORECASE):
+                _hyp_words = r'\b(?:if|when|would|could|might|should|suppose|imagine|assuming)\b'
+                if not re.search(_hyp_words, _pre, re.IGNORECASE):
                     hallucinated_opponent_action = 1.0
 
         # Reasoning-action consistency: only scored when think contains an unambiguous directive
@@ -514,16 +523,31 @@ class KuhnPokerEnv(Env):
             "reasoning/action_consistent":              "mean",
         }
         base_agg.update({k: "mean" for k in info_set_metrics})
+        base_agg["reasoning/reasoning_bonus"] = "mean"
+        base_agg["reasoning/length_bonus"] = "mean"
 
-        # reasoning_step_penalty: sum of all reasoning error counts × per-error penalty weight
-        num_errors = card_strength_error + card_rank_error + impossible_opponent_card + wrong_poker_rules + hallucinated_opponent_action
-        reasoning_step_penalty = self.reasoning_penalty * num_errors
+        num_good = (
+            think_present
+            + mentions_card
+            + base_metrics.get("reasoning/mentions_opponent_action", 0.0)
+            + base_metrics.get("reasoning/action_consistent", 0.0)
+        )
+        num_errors = (
+            card_strength_error
+            + card_rank_error
+            + impossible_opponent_card
+            + wrong_poker_rules
+            + hallucinated_opponent_action
+        )
+        reasoning_bonus = self.reasoning_reward * (num_good - num_errors)
+        base_metrics["reasoning/reasoning_bonus"] = reasoning_bonus
+        base_metrics["reasoning/length_bonus"] = 0.0  # filled in by step()
 
         return {
             "metrics": base_metrics,
             "metrics_agg_mode": base_agg,
             "action_desc": desc,
-            "reasoning_step_penalty": reasoning_step_penalty,
+            "reasoning_bonus": reasoning_bonus,
         }
 
     def _info_set_indicators(self) -> dict:
@@ -575,7 +599,10 @@ class KuhnPokerEnv(Env):
         strength = CARD_STRENGTH[self.cards[1]]
         pot = 3 if self.p0_action == "Bet" else 2
         call_cost = 1 if self.p0_action == "Bet" else 0
-        pot_odds_str = f"Pot odds: {pot}:{call_cost} (call {call_cost} to win {pot})." if call_cost else "No bet to call."
+        pot_odds_str = (
+            f"Pot odds: {pot}:{call_cost} (call {call_cost} to win {pot})."
+            if call_cost else "No bet to call."
+        )
         return (f"Your card: {card} ({strength} card). You are Player 2.\n"
                 f"Pot size: {pot} chips. Board state: Player 1 chose {self.p0_action}.\n"
                 f"{pot_odds_str}\n"
@@ -641,7 +668,12 @@ class KuhnPokerEnv(Env):
                 # "action: Bet" / "answer:Pass" (model forgot angle brackets)
                 m = re.search(r'(?:action|answer)\s*[:=]\s*(Pass|Bet)', cleaned, re.IGNORECASE)
             if m:
-                result = {"action": rev.get(m.group(1).strip().lower()), "action_content": m.group(1).strip(), "think_content": ""}
+                _content = m.group(1).strip()
+                result = {
+                    "action": rev.get(_content.lower()),
+                    "action_content": _content,
+                    "think_content": "",
+                }
         return result
 
     def sample_random_action(self) -> str:
@@ -728,7 +760,8 @@ if __name__ == "__main__":
     env.cards = {0: 2, 1: 0}
     env.agent_is_p0 = True
     obs, reward, terminated, _, info = env.step("garbage text")
-    print(f"  Invalid action defaults to Pass: valid={info['metrics']['action_is_valid']}, penalty={info['metrics']['format_penalty']}")
+    _m = info['metrics']
+    print(f"  Invalid action defaults to Pass: valid={_m['action_is_valid']}, penalty={_m['format_penalty']}")
     assert info["metrics"]["action_is_valid"] is False
 
     # Test reset with position randomization

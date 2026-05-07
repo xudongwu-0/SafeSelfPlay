@@ -90,5 +90,5 @@ def cleanup_fsp_weights(paths: Iterable[str]) -> None:
             logger.info(f"FSP cleanup: removed {p}")
         except FileNotFoundError:
             continue
-        except Exception as e:
+        except OSError as e:
             logger.warning(f"FSP cleanup: failed to remove {p}: {e}")

@@ -15,6 +15,7 @@ from roll.pipeline.agentic.arena_eval import (
     ARENA_SRC_RANK_BASE,
     _create_arena_env_manager,
     _get_model_label,
+    log_payoff_ci_table,
     log_payoff_matrix,
     play_episode,
     save_payoff_matrix,
@@ -24,6 +25,14 @@ from roll.utils.logging import get_logger
 logger = get_logger()
 
 _SEED_STRIDE = 1_000_000
+
+# Bubble-eval seed-space partition. Bubble episodes pick the least-visited (i, j)
+# pair and run BUBBLE_GROUP_SIZE episodes per call; seeds are drawn from a region
+# offset by BUBBLE_SEED_OFFSET so they never collide with main-expansion seeds.
+# BUBBLE_SEED_STRIDE separates groups inside that region.
+_BUBBLE_GROUP_SIZE: int = 12
+_BUBBLE_SEED_OFFSET: int = 2_000_000_000
+_BUBBLE_SEED_STRIDE: int = 13
 
 
 class PayoffMatrix:
@@ -60,6 +69,7 @@ class PayoffMatrix:
         self._worker_config = pipeline_config.train_env_manager
         if self._pipeline_config.psro_bubble_eval_episodes > 0:
             self._online_sum: np.ndarray = np.zeros((1, 1))
+            self._online_sum_sq: np.ndarray = np.zeros((1, 1))
             self._online_count: np.ndarray = np.zeros((1, 1), dtype=int)
             self._bubble_episode_counter: int = 0
 
@@ -207,11 +217,16 @@ class PayoffMatrix:
             new_sum = np.zeros((n + 1, n + 1))
             new_sum[:n, :n] = self._online_sum
             self._online_sum = new_sum
+            new_sum_sq = np.zeros((n + 1, n + 1))
+            new_sum_sq[:n, :n] = self._online_sum_sq
+            self._online_sum_sq = new_sum_sq
             new_count = np.zeros((n + 1, n + 1), dtype=int)
             new_count[:n, :n] = self._online_count
             self._online_count = new_count
 
         logger.info(f"PayoffMatrix: expansion complete, matrix is now {n+1}×{n+1}.")
+        if self._pipeline_config.arena_log_ci_table:
+            log_payoff_ci_table(results, self.policies)
         self._log_per_state_breakdown(episode_log, n, new_policy)
         return self._matrix.copy()
 
@@ -258,6 +273,8 @@ class PayoffMatrix:
     def get_online_matrix(self) -> np.ndarray:
         """Return payoff matrix with online estimates overlaid where available."""
         result = self._matrix.copy()
+        if not hasattr(self, "_online_count"):
+            return result
         mask = self._online_count > 0
         result[mask] = self._online_sum[mask] / self._online_count[mask]
         return result
@@ -271,7 +288,7 @@ class PayoffMatrix:
 
         Args:
             stop_event: Set by the main thread when training finishes.
-            episodes_per_step: Total episodes; groups of 12 assigned to least-visited pairs.
+            episodes_per_step: Total episodes; groups of _BUBBLE_GROUP_SIZE assigned to least-visited pairs.
 
         Returns:
             Dict of results keyed by (i,j) pair, or None if interrupted early.
@@ -280,7 +297,7 @@ class PayoffMatrix:
         if n < 2:
             return None
 
-        n_groups = max(1, episodes_per_step // 12)
+        n_groups = max(1, episodes_per_step // _BUBBLE_GROUP_SIZE)
         pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
 
         # Greedy selection: pick least-visited pair for each group.
@@ -289,15 +306,15 @@ class PayoffMatrix:
         for _ in range(n_groups):
             best = min(pairs, key=lambda p: (local_counts[p[0], p[1]], p[0], p[1]))
             group_targets.append(best)
-            local_counts[best[0], best[1]] += 12
+            local_counts[best[0], best[1]] += _BUBBLE_GROUP_SIZE
 
-        # Build all tasks; seed uniquely per (group, ep).
+        # Build all tasks; seed uniquely per (group, ep) inside the bubble region.
         counter_base = self._bubble_episode_counter
         self._bubble_episode_counter += n_groups
         tasks: List[Tuple[int, int, int, int]] = []  # (i, j, ep, group_idx)
         for g, (i, j) in enumerate(group_targets):
-            for ep in range(12):
-                seed = self._seed_base + 2_000_000_000 + (counter_base + g) * 13 + ep
+            for ep in range(_BUBBLE_GROUP_SIZE):
+                seed = self._seed_base + _BUBBLE_SEED_OFFSET + (counter_base + g) * _BUBBLE_SEED_STRIDE + ep
                 tasks.append((i, j, ep, seed))
 
         results: Dict[Tuple[int, int], List[float]] = {}
@@ -346,7 +363,11 @@ class PayoffMatrix:
                     n_completed += 1
                     _submit_batch()
                     if n_completed >= 36 and stop_event.is_set():
-                        logger.info("PayoffMatrix bubble_eval: stop_event set, interrupting after %d/%d.", n_completed, total)
+                        logger.info(
+                            "PayoffMatrix bubble_eval: stop_event set, interrupting after %d/%d.",
+                            n_completed,
+                            total,
+                        )
                         return None
                     break  # re-enter as_completed with updated future_to_info
 
@@ -357,7 +378,26 @@ class PayoffMatrix:
         """Accumulate bubble eval results into online estimator."""
         for (i, j), payoffs in results.items():
             self._online_sum[i, j] += sum(payoffs)
+            self._online_sum_sq[i, j] += sum(p * p for p in payoffs)
             self._online_count[i, j] += len(payoffs)
+
+    def get_online_ci95(self) -> float:
+        """Return the max per-pair CI95 width across all online-evaluated pairs.
+
+        Uses cumulative sum-of-squares so the CI shrinks as more games are played.
+        Returns inf when no pair has ≥2 samples yet.
+        """
+        if not hasattr(self, "_online_count"):
+            return float("inf")
+        mask = self._online_count >= 2
+        if not mask.any():
+            return float("inf")
+        counts = self._online_count[mask].astype(float)
+        means = self._online_sum[mask] / counts
+        sq_means = self._online_sum_sq[mask] / counts
+        variances = np.maximum(sq_means - means ** 2, 0.0)
+        sems = np.sqrt(variances / counts)
+        return float(np.max(2 * 1.96 * sems))
 
     def log(self) -> None:
         """Pretty-print the current payoff matrix."""

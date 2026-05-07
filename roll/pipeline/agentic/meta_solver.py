@@ -13,6 +13,11 @@ from typing import Tuple
 
 import numpy as np
 
+# Hedge regret bound is O(sqrt(T log n)); 50k iters is enough for ~1e-3 accuracy on
+# the < 20-strategy meta-games we hit. eta is the canonical sqrt(log n / T) step.
+_HEDGE_NUM_ITERATIONS: int = 50_000
+_HEDGE_ETA_SCALE: float = 2.0
+
 
 def compute_nash(payoff_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Compute Nash Equilibrium mixed strategies for a 2-player zero-sum game.
@@ -44,15 +49,14 @@ def compute_nash(payoff_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if n == 1:
         return np.full(m, 1.0 / m), np.array([1.0])
 
-    T = 50_000
-    eta = 2.0 * np.sqrt(np.log(max(m, n) + 1) / T)
+    eta = _HEDGE_ETA_SCALE * np.sqrt(np.log(max(m, n) + 1) / _HEDGE_NUM_ITERATIONS)
 
     p = np.ones(m) / m
     q = np.ones(n) / n
     avg_p = np.zeros(m)
     avg_q = np.zeros(n)
 
-    for _ in range(T):
+    for _ in range(_HEDGE_NUM_ITERATIONS):
         avg_p += p
         avg_q += q
         # P1 (maximiser): payoff for each row = A @ q
@@ -62,4 +66,4 @@ def compute_nash(payoff_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         q = q * np.exp(eta * (-(A.T @ p)))
         q /= q.sum()
 
-    return avg_p / T, avg_q / T
+    return avg_p / _HEDGE_NUM_ITERATIONS, avg_q / _HEDGE_NUM_ITERATIONS

@@ -248,7 +248,7 @@ class GroupQueue:
         self.progress = asyncio.Event()
         self.complete = asyncio.Event()
 
-    def flush_in_place(self):
+    def flush_in_place(self) -> None:
         """Drop queued groups but keep Event identity so existing awaiters wake up.
         clear() replaces Events, which strands any task already inside
         `await self.progress.wait()` on the old event (new .set() never reaches them).
@@ -431,7 +431,7 @@ class GroupQueueManager:
         for group_queue in self.group_queue.values():
             group_queue.clear()
 
-    def flush_in_place(self):
+    def flush_in_place(self) -> None:
         """Drop queued rollouts while preserving Event identity (see GroupQueue.flush_in_place)."""
         self.rollout_complete = {}
         for get_task in self.pending_gets:
