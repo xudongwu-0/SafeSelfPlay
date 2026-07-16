@@ -250,6 +250,7 @@ def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]
     env_hung_timeout = os.environ.get("ABS_ENV_HUNG_TIMEOUT", "").strip()
     env_monitor_interval = os.environ.get("ABS_ENV_MONITOR_INTERVAL", "").strip()
     rollout_get_batch_timeout = os.environ.get("ABS_ROLLOUT_GET_BATCH_TIMEOUT", "").strip()
+    response_log_steps = int(os.environ.get("ABS_RESPONSE_LOG_STEPS", "10"))
     overrides = [
         f"exp_name={exp_name}",
         f"logging_dir={logs_dir}",
@@ -263,6 +264,7 @@ def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]
         f"actor_infer.strategy_args.strategy_config.gpu_memory_utilization={vllm_gpu_memory_utilization}",
         f"actor_infer.strategy_args.strategy_config.max_num_batched_tokens={vllm_max_num_batched_tokens}",
         f"actor_infer.strategy_args.strategy_config.enforce_eager={vllm_enforce_eager}",
+        f"response_log_steps={response_log_steps}",
         "eval_steps=0",
         f"save_steps={save_steps}",
         f"fsp_save_steps={fsp_save_interval}",
@@ -549,6 +551,7 @@ def train_roll_psro(
     env_monitor_interval: int = 0,
     rollout_get_batch_timeout: int = 0,
     actor_infer_max_concurrency: int = 0,
+    response_log_steps: int = 0,
     actor_lr: str = "",
     init_kl_coef: str = "",
     kl_loss_coef: str = "",
@@ -671,6 +674,10 @@ def train_roll_psro(
         os.environ["ROLL_ACTOR_INFER_MAX_CONCURRENCY"] = str(actor_infer_max_concurrency)
     else:
         os.environ.pop("ROLL_ACTOR_INFER_MAX_CONCURRENCY", None)
+    if response_log_steps:
+        os.environ["ABS_RESPONSE_LOG_STEPS"] = str(response_log_steps)
+    else:
+        os.environ.pop("ABS_RESPONSE_LOG_STEPS", None)
     if actor_lr:
         os.environ["ABS_ACTOR_LR"] = str(actor_lr)
     else:
