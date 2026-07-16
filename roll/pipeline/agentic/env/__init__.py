@@ -17,6 +17,7 @@ gem.register("sokoban_native_env", entry_point="roll.pipeline.agentic.env.sokoba
 gem.register("deepeyes", entry_point="roll.pipeline.agentic.env.deepeyes:DeepEyesEnv")
 gem.register("rock_paper_scissors", entry_point="roll.pipeline.agentic.env.rock_paper_scissors:RockPaperScissorsEnv")
 gem.register("kuhn_poker", entry_point="roll.pipeline.agentic.env.kuhn_poker:KuhnPokerEnv")
+gem.register("red_team_safety", entry_point="roll.pipeline.agentic.env.red_team_safety:RedTeamSafetyEnv")
 gem.register("rock_tb_native_env", entry_point="roll.pipeline.agentic.env.sandbox.rock_tb_native_env:RockTBNativeEnv")
 
 try:

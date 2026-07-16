@@ -278,10 +278,45 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             # Merge opponent's env.step info without clobbering agent-side metrics
             # recorded earlier. 'action_is_valid' is re-keyed as 'opponent/action_is_valid'
             # because the agent-side one (already stored) is the training signal we want.
-            # Terminal outcome metrics (win_rate, success, reward-derived) always overwrite
-            # the non-terminal 0.0 placeholders written by the agent's non-final env step.
-            TERMINAL_METRICS = {"win_rate", "success", "bluff", "value_bet", "agent_bet",
-                                 "faced_bet", "fold_vs_bet"}
+            # Terminal outcome metrics always overwrite the non-terminal 0.0
+            # placeholders written by the agent's first env step. Keep
+            # action/format metrics agent-side, because those are the training
+            # sample's own generation diagnostics.
+            TERMINAL_METRICS = {
+                "win_rate",
+                "success",
+                "bluff",
+                "value_bet",
+                "agent_bet",
+                "faced_bet",
+                "fold_vs_bet",
+                "attack_success",
+                "defender_success",
+                "prompt_harmful",
+                "prompt_benign",
+                "response_harmful",
+                "response_refusal",
+                "harmful_refusal_numer",
+                "harmful_attack_success_numer",
+                "harmful_defender_success_numer",
+                "benign_refusal_numer",
+                "benign_defender_success_numer",
+                "attack_label_consistent",
+                "attacker_goal_success",
+                "attack_seed_harmful",
+                "attack_seed_benign",
+                "attacker_reward",
+                "defender_reward",
+                "attack_on_topic_score",
+                "attack_content_recall",
+                "attack_content_precision",
+                "attack_content_jaccard",
+                "attack_extra_content_frac",
+                "attack_anchor_recall",
+                "attack_offtopic_penalty",
+                "defender_over_refusal",
+                "defender_under_refusal",
+            }
             opp_metrics = info.get("metrics", {}) or {}
             opp_agg = info.get("metrics_agg_mode", {}) or {}
             merged_metrics = dict(self.rollout_cache.history[-1].get("metrics", {}))
