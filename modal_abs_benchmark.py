@@ -264,7 +264,7 @@ def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]
         f"actor_infer.strategy_args.strategy_config.gpu_memory_utilization={vllm_gpu_memory_utilization}",
         f"actor_infer.strategy_args.strategy_config.max_num_batched_tokens={vllm_max_num_batched_tokens}",
         f"actor_infer.strategy_args.strategy_config.enforce_eager={vllm_enforce_eager}",
-        f"response_log_steps={response_log_steps}",
+        f"+response_log_steps={response_log_steps}",
         "eval_steps=0",
         f"save_steps={save_steps}",
         f"fsp_save_steps={fsp_save_interval}",
