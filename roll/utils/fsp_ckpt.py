@@ -57,8 +57,12 @@ def export_peft_adapter(ckpt_dir: str) -> str:
         state_dict = raw
 
     lora = OrderedDict()
+    skipped_aux = 0
     for k, v in state_dict.items():
         if "lora_" not in k:
+            continue
+        if ".role_start." in k:
+            skipped_aux += 1
             continue
         new_k = k.replace(".default.weight", ".weight").replace(".default.bias", ".bias")
         if not isinstance(v, torch.Tensor):
@@ -70,7 +74,7 @@ def export_peft_adapter(ckpt_dir: str) -> str:
 
     out_path = os.path.join(ckpt_dir, "adapter_model.safetensors")
     save_file(lora, out_path)
-    logger.info(f"FSP: wrote {len(lora)} LoRA tensors to {out_path}")
+    logger.info(f"FSP: wrote {len(lora)} LoRA tensors to {out_path} (skipped {skipped_aux} auxiliary LoRA tensors)")
 
     shutil.rmtree(os.path.join(ckpt_dir, "checkpoint"), ignore_errors=True)
     return out_path
