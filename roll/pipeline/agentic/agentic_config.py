@@ -248,6 +248,15 @@ class AgenticConfig(PPOConfig):
     env_monitor: EnvMonitorConfig = field(
         default_factory=EnvMonitorConfig, metadata={"help": "Environment monitoring configuration."}
     )
+    rollout_get_batch_timeout: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Seconds to wait for a rollout group before releasing a partial group. "
+                "0 keeps the default behavior of waiting for complete groups."
+            )
+        },
+    )
     debug_log_group_rewards: bool = field(
         default=False,
         metadata={"help": "Smoke test only. Log per-trajectory rewards after reward computation."},

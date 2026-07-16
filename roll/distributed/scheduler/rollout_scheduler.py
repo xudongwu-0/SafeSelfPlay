@@ -349,11 +349,22 @@ class GroupQueue:
                 self.complete.set()
                 self.progress_bar.update(self.group_size)
 
-    async def get(self) -> GroupData:
+    async def get(self, timeout: Optional[float] = None, allow_partial: bool = False) -> Optional[GroupData]:
+        async def wait_complete() -> bool:
+            if timeout is None or timeout <= 0:
+                await self.complete.wait()
+                return True
+            try:
+                await asyncio.wait_for(self.complete.wait(), timeout=timeout)
+                return True
+            except asyncio.TimeoutError:
+                return False
+
         while True:
             while not self.groups:
                 self.complete.clear()
-                await self.complete.wait()
+                if not await wait_complete():
+                    return None
             episode_id = next(iter(self.groups)) # must consume the first group (smallest episode_id)
             group = self.groups[episode_id]
             if len(group.rollouts) >= self.group_size:
@@ -361,8 +372,29 @@ class GroupQueue:
                 if self.env_monitor:
                     self.env_monitor.cleanup_episode(self.group_id, episode_id)
                 return group
+            if allow_partial and group.rollouts:
+                logger.warning(
+                    f"GroupQueue: releasing partial group {self.group_id=} {episode_id=} "
+                    f"with {len(group.rollouts)}/{self.group_size} rollouts after timeout"
+                )
+                self.groups.pop(episode_id)
+                if self.env_monitor:
+                    self.env_monitor.cleanup_episode(self.group_id, episode_id)
+                self.progress_bar.update(len(group.rollouts))
+                return group
             self.complete.clear()
-            await self.complete.wait()
+            if not await wait_complete():
+                if allow_partial and group.rollouts:
+                    logger.warning(
+                        f"GroupQueue: releasing partial group {self.group_id=} {episode_id=} "
+                        f"with {len(group.rollouts)}/{self.group_size} rollouts after timeout"
+                    )
+                    self.groups.pop(episode_id)
+                    if self.env_monitor:
+                        self.env_monitor.cleanup_episode(self.group_id, episode_id)
+                    self.progress_bar.update(len(group.rollouts))
+                    return group
+                return None
 
 @ray.remote
 class GroupQueueManager:
@@ -415,6 +447,12 @@ class GroupQueueManager:
         # for debug
         self.total = 0
         self.waiting = 0
+        self.get_batch_timeout = getattr(config, "rollout_get_batch_timeout", 0) or 0
+        if self.get_batch_timeout > 0:
+            logger.warning(
+                f"GroupQueueManager({self.mode}): rollout_get_batch_timeout={self.get_batch_timeout}s; "
+                "slow groups may be released partially to avoid rollout hangs."
+            )
 
     def collect_metrics(self):
         group_filter_count = 0
@@ -505,6 +543,7 @@ class GroupQueueManager:
         # When batch_size < 0, iterate until exit run_rollout_loop immediately.
         ret: List[DataProto] = []
         progress_bar = tqdm(desc=f"{self.mode} rollout get_batch progress(trajectory)", mininterval=self.group_size)
+        batch_start_time = time.time()
         while batch_size < 0 or len(ret) < batch_size:
 
             if len(self.rollout_complete) == len(self.group_queue):
@@ -516,7 +555,13 @@ class GroupQueueManager:
                 if not self.pending_gets:
                     pending = set(
                         [
-                            asyncio.create_task(self.group_queue[group_id].get(), name=str(group_id))
+                            asyncio.create_task(
+                                self.group_queue[group_id].get(
+                                    timeout=self.get_batch_timeout,
+                                    allow_partial=self.get_batch_timeout > 0,
+                                ),
+                                name=str(group_id),
+                            )
                             for group_id in self.group_queue if str(group_id) not in self.rollout_complete
                         ]
                     )
@@ -530,6 +575,8 @@ class GroupQueueManager:
                     while done and (batch_size < 0 or len(ret) < batch_size):
                         d = done.pop()
                         group = await d
+                        if group is None:
+                            continue
                         group_rollout = group.rollouts
                         self.total -= len(group_rollout)
 
@@ -545,6 +592,8 @@ class GroupQueueManager:
                             continue
 
                         group_rollout = group_rollout[:self.group_size]
+                        if batch_size > 0:
+                            group_rollout = group_rollout[: max(batch_size - len(ret), 0)]
                         ret.extend(group_rollout)
                         progress_bar.update(len(group_rollout))
 
@@ -554,6 +603,18 @@ class GroupQueueManager:
                 self.pending_gets.update(pending)
 
             await wait_a_episode()
+            if (
+                self.get_batch_timeout > 0
+                and batch_size > 0
+                and 0 < len(ret) < batch_size
+                and time.time() - batch_start_time >= self.get_batch_timeout
+            ):
+                logger.warning(
+                    f"GroupQueueManager({self.mode}): returning partial batch "
+                    f"with {len(ret)}/{batch_size} rollouts after {self.get_batch_timeout}s timeout; "
+                    "adjust_batch will pad to the required training shape."
+                )
+                break
         get_batch_return_start_time = time.time()
         for d in ret:
             d.meta_info["get_batch_return_start_time"] = get_batch_return_start_time

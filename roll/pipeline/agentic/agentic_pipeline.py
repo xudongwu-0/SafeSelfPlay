@@ -1,5 +1,5 @@
 import json
-import os.path
+import os
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -81,6 +81,52 @@ def _kuhn_derived_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
         if f"env/{env_tag}/kuhn_visit/" in k or f"env/{env_tag}/kuhn_bet/" in k:
             del metrics[k]
     return derived
+
+def _dashboard_alias_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Add stable dashboard-friendly aliases for red-team safety runs."""
+    aliases = {
+        "rollout/score/mean": "score/mean",
+        "rollout/score/max": "score/max",
+        "rollout/score/min": "score/min",
+        "critic/group_reward_std/mean": "score/group_reward_std_mean",
+        "critic/zero_variance_group_frac": "score/zero_variance_group_frac",
+        "env/RedTeamSafety/attacker_reward": "score/attacker_reward",
+        "env/RedTeamSafety/defender_reward": "score/defender_reward",
+        "env/RedTeamSafety/attack_success": "safety/attack_success",
+        "env/RedTeamSafety/defender_success": "safety/defender_success",
+        "env/RedTeamSafety/response_refusal": "safety/response_refusal",
+        "env/RedTeamSafety/response_harmful": "safety/response_harmful",
+        "env/RedTeamSafety/defender_over_refusal": "safety/defender_over_refusal",
+        "env/RedTeamSafety/defender_under_refusal": "safety/defender_under_refusal",
+        "env/RedTeamSafety/attacker_goal_success": "attack/goal_success",
+        "env/RedTeamSafety/attack_label_consistent": "attack/label_consistent",
+        "env/RedTeamSafety/prompt_harmful": "data/prompt_harmful",
+        "env/RedTeamSafety/prompt_benign": "data/prompt_benign",
+        "env/RedTeamSafety/attack_seed_harmful": "data/attack_seed_harmful",
+        "env/RedTeamSafety/attack_seed_benign": "data/attack_seed_benign",
+        "env/RedTeamSafety/truncated": "quality/truncated",
+        "env/RedTeamSafety/action_is_valid": "quality/action_is_valid",
+        "env/RedTeamSafety/answer_tag_present": "quality/answer_tag_present",
+        "env/RedTeamSafety/answer_tag_closed": "quality/answer_tag_closed",
+        "rollout/raw/unique_response_frac": "quality/raw_unique_response_frac",
+        "rollout/raw/zero_diversity_group_frac": "quality/raw_zero_diversity_group_frac",
+        "rollout/train/unique_response_frac": "quality/train_unique_response_frac",
+        "rollout/train/zero_diversity_group_frac": "quality/train_zero_diversity_group_frac",
+        "env/RedTeamSafety/attack_on_topic_score": "attack/on_topic_score",
+        "env/RedTeamSafety/attack_content_recall": "attack/content_recall",
+        "env/RedTeamSafety/attack_content_precision": "attack/content_precision",
+        "env/RedTeamSafety/attack_content_jaccard": "attack/content_jaccard",
+        "env/RedTeamSafety/attack_extra_content_frac": "attack/extra_content_frac",
+        "env/RedTeamSafety/attack_anchor_recall": "attack/anchor_recall",
+        "env/RedTeamSafety/attack_offtopic_penalty": "attack/offtopic_penalty",
+    }
+    out: Dict[str, Any] = {}
+    for source, target in aliases.items():
+        value = metrics.get(source)
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            out[target] = float(value)
+    return out
+
 
 class AgenticPipeline(BasePipeline):
     def __init__(self, pipeline_config: AgenticConfig):
@@ -263,6 +309,67 @@ class AgenticPipeline(BasePipeline):
             )
             logger.info("PSROLoop initialized (psro_mode=True).")
 
+        initial_enemy_pool = [
+            path.strip()
+            for path in os.environ.get("ROLL_INITIAL_ENEMY_POOL", "").split(",")
+            if path.strip()
+        ]
+        if initial_enemy_pool:
+            logger.info(f"FSP: preloading {len(initial_enemy_pool)} initial enemy policies")
+            _generate_scheduler = None
+            if self._psro_loop is not None:
+                _generate_scheduler = ray.get(
+                    self.train_rollout_scheduler.get_generate_scheduler.remote()
+                )
+                ray.get(_generate_scheduler.resume.remote())
+            try:
+                for enemy_path in initial_enemy_pool:
+                    logger.info(f"FSP: adding initial enemy policy: {enemy_path}")
+                    ray.get(self.train_rollout_scheduler.update_enemy_pool.remote(enemy_path))
+                    ray.get(self.val_rollout_scheduler.update_enemy_pool.remote(enemy_path))
+                    self.fsp_checkpoints.append(enemy_path)
+
+                    if self._psro_loop is not None:
+                        nash_probs = self._psro_loop.on_policy_added(
+                            new_policy=enemy_path,
+                            output_dir=self.pipeline_config.output_dir,
+                        )
+                        if nash_probs is not None:
+                            self._latest_nash_probs = nash_probs
+                            nash_list = nash_probs.tolist()
+                            ray.get(self.train_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+                            ray.get(self.val_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+            finally:
+                if _generate_scheduler is not None:
+                    ray.get(_generate_scheduler.suspend.remote())
+
+            initial_enemy_probs = [
+                float(item.strip())
+                for item in os.environ.get("ROLL_INITIAL_ENEMY_PROBS", "").split(",")
+                if item.strip()
+            ]
+            if initial_enemy_probs:
+                expected_len = 1 + len(initial_enemy_pool)
+                if len(initial_enemy_probs) != expected_len:
+                    logger.warning(
+                        "FSP: ignoring ROLL_INITIAL_ENEMY_PROBS with length %d; expected %d "
+                        "(base plus %d initial enemies)",
+                        len(initial_enemy_probs),
+                        expected_len,
+                        len(initial_enemy_pool),
+                    )
+                else:
+                    total_prob = sum(initial_enemy_probs)
+                    if total_prob <= 0:
+                        logger.warning("FSP: ignoring ROLL_INITIAL_ENEMY_PROBS because probabilities sum to <= 0")
+                    else:
+                        nash_probs = np.asarray([p / total_prob for p in initial_enemy_probs], dtype=float)
+                        self._latest_nash_probs = nash_probs
+                        nash_list = nash_probs.tolist()
+                        logger.info("FSP: using externally supplied opponent probabilities: %s", nash_list)
+                        ray.get(self.train_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+                        ray.get(self.val_rollout_scheduler.update_nash_probabilities.remote(nash_list))
+
         try:
             self._run_impl(tps_timer)
         finally:
@@ -270,20 +377,23 @@ class AgenticPipeline(BasePipeline):
             if self.pipeline_config.fsp_save_steps > 0:
                 weight_dirs = [p for p in getattr(self, "fsp_checkpoints", []) if p]
                 if weight_dirs:
-                    try:
-                        import shutil as _shutil
-                        du_before = _shutil.disk_usage("/zfsauton/scratch")
-                        logger.info(f"FSP cleanup: scratch free before = {du_before.free // (1024**3)}G")
-                    except (FileNotFoundError, OSError) as e:
-                        logger.warning(f"FSP cleanup: disk_usage probe (before) failed: {e}")
-                    from roll.utils.fsp_ckpt import cleanup_fsp_weights
-                    cleanup_fsp_weights(weight_dirs)
-                    try:
-                        import shutil as _shutil
-                        du_after = _shutil.disk_usage("/zfsauton/scratch")
-                        logger.info(f"FSP cleanup: scratch free after = {du_after.free // (1024**3)}G")
-                    except (FileNotFoundError, OSError) as e:
-                        logger.warning(f"FSP cleanup: disk_usage probe (after) failed: {e}")
+                    if os.environ.get("ROLL_KEEP_FSP_CHECKPOINTS", "").lower() in {"1", "true", "yes"}:
+                        logger.info(f"FSP cleanup: keeping {len(weight_dirs)} checkpoint directories")
+                    else:
+                        try:
+                            import shutil as _shutil
+                            du_before = _shutil.disk_usage("/zfsauton/scratch")
+                            logger.info(f"FSP cleanup: scratch free before = {du_before.free // (1024**3)}G")
+                        except (FileNotFoundError, OSError) as e:
+                            logger.warning(f"FSP cleanup: disk_usage probe (before) failed: {e}")
+                        from roll.utils.fsp_ckpt import cleanup_fsp_weights
+                        cleanup_fsp_weights(weight_dirs)
+                        try:
+                            import shutil as _shutil
+                            du_after = _shutil.disk_usage("/zfsauton/scratch")
+                            logger.info(f"FSP cleanup: scratch free after = {du_after.free // (1024**3)}G")
+                        except (FileNotFoundError, OSError) as e:
+                            logger.warning(f"FSP cleanup: disk_usage probe (after) failed: {e}")
 
     @torch.no_grad()
     def _run_impl(self, tps_timer):
@@ -448,9 +558,11 @@ class AgenticPipeline(BasePipeline):
                         metrics["time/step_shrink"] = shrink_timer.last
 
                     batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
+                    metrics.update(_response_diversity_metrics(batch, prefix="rollout/raw"))
 
                     batch = self.adjust_batch(batch, mode=self.pipeline_config.batch_adjust_mode)
                     metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                    metrics.update(_response_diversity_metrics(batch, prefix="rollout/train"))
 
                     # PHASE 11: Reference Log Probs
                     with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
@@ -470,7 +582,15 @@ class AgenticPipeline(BasePipeline):
                                 )
                                 metrics.update(dynamic_batching_metrics)
                             if not self.use_ref_model:
-                                batch.meta_info["disable_adapter"] = True
+                                use_role_start_ref = (
+                                    os.environ.get("ROLL_ROLE_START_REF", "").lower() in {"1", "true", "yes"}
+                                    and bool(os.environ.get("ROLL_INIT_LORA_PATH", "").strip())
+                                )
+                                batch.meta_info["disable_adapter"] = not use_role_start_ref
+                                if use_role_start_ref:
+                                    batch.meta_info["adapter_name"] = "role_start"
+                                else:
+                                    batch.meta_info.pop("adapter_name", None)
                                 batch.meta_info["is_offload_states"] = False
                                 batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
                                 ref_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
@@ -490,6 +610,7 @@ class AgenticPipeline(BasePipeline):
                     with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
                         if self.pipeline_config.enable_reference and not self.use_ref_model:
                             batch.meta_info["disable_adapter"] = False
+                            batch.meta_info.pop("adapter_name", None)
                         batch.meta_info["is_offload_states"] = False
                         if self.pipeline_config.enable_old_logprobs_recompute:
                             batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
@@ -828,20 +949,64 @@ class AgenticPipeline(BasePipeline):
                         if rls > 0 and global_step % rls == 0:
                             from roll.utils.tracking import WandbTracker
                             if isinstance(self.tracker, WandbTracker):
+                                import re
                                 import wandb
                                 parts = []
+                                table = wandb.Table(
+                                    columns=[
+                                        "global_step",
+                                        "traj_idx",
+                                        "sample_idx",
+                                        "role",
+                                        "seed_label",
+                                        "user_or_seed_prompt",
+                                        "episode_score",
+                                        "step_score",
+                                        "response",
+                                        "full_prompt",
+                                    ]
+                                )
                                 for traj_idx, traj in enumerate(log_res):
                                     parts.append(f"=== traj {traj_idx} ===")
                                     for step_idx, item in enumerate(traj):
+                                        prompt = item["prompt"]
+                                        role_match = re.search(r"Role: (attacker|defender)", prompt)
+                                        label_match = re.search(r"Seed label: ([^\n]+)", prompt)
+                                        user_prompt_match = re.search(
+                                            r"User prompt:\n(.*?)\n\nResponse format:", prompt, re.S
+                                        )
+                                        seed_prompt_match = re.search(
+                                            r"Vanilla seed prompt:\n(.*?)\n\nResponse format:", prompt, re.S
+                                        )
+                                        user_or_seed_prompt = ""
+                                        if user_prompt_match:
+                                            user_or_seed_prompt = user_prompt_match.group(1).strip()
+                                        elif seed_prompt_match:
+                                            user_or_seed_prompt = seed_prompt_match.group(1).strip()
+
                                         parts.append(f"[step {step_idx}] score={item['episode_score']}")
-                                        parts.append(f"PROMPT: {item['prompt']}")
+                                        parts.append(f"PROMPT: {prompt}")
                                         parts.append(f"RESPONSE: {item['response']}")
+                                        table.add_data(
+                                            global_step,
+                                            traj_idx,
+                                            step_idx,
+                                            role_match.group(1) if role_match else "",
+                                            label_match.group(1).strip() if label_match else "",
+                                            user_or_seed_prompt,
+                                            item["episode_score"],
+                                            json.dumps(item["step_score"], ensure_ascii=False),
+                                            item["response"],
+                                            prompt,
+                                        )
                                 text = "\n".join(parts)
                                 metrics["rollout/responses"] = wandb.Html(f"<pre>{text}</pre>")
+                                metrics["rollout/prompt_response_table"] = table
 
                 metrics["time/step_log"] = log_timer.last
 
             metrics["time/step_total"] = step_timer.last
+            metrics.update(_dashboard_alias_metrics(metrics))
             self.tracker.log(values=metrics, step=global_step)
 
             # Early stopping: stop when per-group reward std is consistently low (model converged)
@@ -869,6 +1034,7 @@ class AgenticPipeline(BasePipeline):
             global_step += 1
             logger.info(f"epoch {global_step} finished")
 
+
         # Final checkpoint: save the end-of-training model and add to arena pool
         # so arena eval includes the most recent generation (not just FSP snapshots).
         # Cleaned up on pipeline exit by run()'s finally block (same path as FSP snapshots).
@@ -891,7 +1057,10 @@ class AgenticPipeline(BasePipeline):
 
         # Arena evaluation: pairwise payoff matrix for all FSP checkpoints.
         # In PSRO mode, the matrix is already built incrementally — just log and save.
-        if self.pipeline_config.psro_mode and self._psro_loop is not None:
+        skip_final_arena = os.environ.get("ROLL_SKIP_FINAL_ARENA", "").lower() in {"1", "true", "yes"}
+        if skip_final_arena:
+            logger.info("Arena: skipping final arena evaluation because ROLL_SKIP_FINAL_ARENA=1")
+        elif self.pipeline_config.psro_mode and self._psro_loop is not None:
             self._psro_loop.payoff_matrix.log()
             self._psro_loop.payoff_matrix.save(
                 os.path.join(self.pipeline_config.output_dir, "psro"),
@@ -1342,6 +1511,61 @@ def compute_rollout_traj_metrics(batch) -> Dict:
         "rollout/non_prompt_length/max": torch.max(non_prompt_mask).detach().item(),
         "rollout/non_prompt_length/min": torch.min(non_prompt_mask).detach().item(),
     }
+    return metrics
+
+
+def _response_diversity_metrics(batch: DataProto, prefix: str) -> Dict[str, float]:
+    """Exact response-token diversity grouped by the GRPO normalization key.
+
+    This catches accidental batch-copy padding separately from true rollout
+    sampling diversity. It avoids decoding text, so it is cheap enough to log
+    every train step.
+    """
+    metrics: Dict[str, float] = {}
+    if batch is None or batch.batch is None:
+        return metrics
+    if "input_ids" not in batch.batch or "response_mask" not in batch.batch:
+        return metrics
+
+    batch_size = int(batch.batch.batch_size[0])
+    metrics[f"{prefix}/batch_size"] = float(batch_size)
+    if batch_size == 0:
+        return metrics
+
+    default_groups = np.array(["default"] * batch_size, dtype=object)
+    group_ids = batch.non_tensor_batch.get(
+        "init_state_id",
+        batch.non_tensor_batch.get("traj_group_id", default_groups),
+    )
+
+    input_ids = batch.batch["input_ids"].detach().cpu()
+    response_mask = batch.batch["response_mask"].detach().cpu().bool()
+    grouped: Dict[str, list[tuple[int, ...]]] = {}
+    all_responses: list[tuple[int, ...]] = []
+
+    for idx in range(batch_size):
+        response_ids = tuple(input_ids[idx][response_mask[idx]].tolist())
+        grouped.setdefault(str(group_ids[idx]), []).append(response_ids)
+        all_responses.append(response_ids)
+
+    group_sizes = [len(items) for items in grouped.values()]
+    unique_counts = [len(set(items)) for items in grouped.values()]
+    duplicate_count = sum(size - uniq for size, uniq in zip(group_sizes, unique_counts))
+    repeated_groups = sum(1 for size in group_sizes if size > 1)
+    zero_diversity_groups = sum(
+        1 for size, uniq in zip(group_sizes, unique_counts) if size > 1 and uniq <= 1
+    )
+
+    metrics[f"{prefix}/unique_response_frac"] = float(len(set(all_responses)) / max(batch_size, 1))
+    metrics[f"{prefix}/exact_duplicate_frac"] = float(duplicate_count / max(batch_size, 1))
+    metrics[f"{prefix}/num_groups"] = float(len(grouped))
+    metrics[f"{prefix}/mean_group_size"] = float(np.mean(group_sizes)) if group_sizes else 0.0
+    metrics[f"{prefix}/mean_unique_responses_per_group"] = (
+        float(np.mean(unique_counts)) if unique_counts else 0.0
+    )
+    metrics[f"{prefix}/zero_diversity_group_frac"] = (
+        float(zero_diversity_groups / repeated_groups) if repeated_groups else 0.0
+    )
     return metrics
 
 def compute_train_data_metrics(batch):

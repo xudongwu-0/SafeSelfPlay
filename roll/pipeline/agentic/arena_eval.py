@@ -66,6 +66,46 @@ def _build_trajectory(
     }
 
 
+def _compute_safety_game_payoff(env_manager: TwoPlayerTrajEnvManager, default_payoff: float) -> float:
+    """Return a zero-sum safety-game payoff for RedTeamSafety arena episodes.
+
+    RedTeamSafety's training reward is role-specific and general-sum-ish. PSRO,
+    however, needs a pairwise "who won this matchup?" signal from player_i's
+    perspective. The env records agent_role for player_i and terminal safety
+    metrics in the final info dict, so we remap:
+
+    - player_i as defender: +1 if defender_success else -1
+    - player_i as attacker: -1 if the rewrite violates the seed label;
+      otherwise -1 if defender_success else +1
+
+    Other environments keep their original payoff semantics.
+    """
+    env = getattr(env_manager, "env", None)
+    if env is None or env.__class__.__name__ != "RedTeamSafetyEnv":
+        return default_payoff
+
+    final_info = {}
+    for entry in getattr(env_manager.rollout_cache, "history", []):
+        if "agent_role" in entry:
+            final_info = entry
+
+    role = final_info.get("agent_role", getattr(env, "agent_role", None))
+    metrics = final_info.get("metrics", {}) or {}
+
+    if role == "defender":
+        if "defender_success" in metrics:
+            return 1.0 if float(metrics["defender_success"]) > 0.5 else -1.0
+    elif role == "attacker":
+        if "attack_label_consistent" in metrics and float(metrics["attack_label_consistent"]) <= 0.5:
+            return -1.0
+        if "defender_success" in metrics:
+            return -1.0 if float(metrics["defender_success"]) > 0.5 else 1.0
+        if "attack_success" in metrics:
+            return 1.0 if float(metrics["attack_success"]) > 0.5 else -1.0
+
+    return default_payoff
+
+
 def _create_arena_env_manager(
     pipeline_config: AgenticConfig,
     env_tag: str,
@@ -244,7 +284,8 @@ def play_episode(
         if rollout_cache.terminated:
             break
 
-    payoff = env_manager.env.final_reward if env_manager.env.step_count > 0 else 0.0
+    default_payoff = env_manager.env.final_reward if env_manager.env.step_count > 0 else 0.0
+    payoff = _compute_safety_game_payoff(env_manager, default_payoff)
 
     if save_trajectory:
         traj = _build_trajectory(env_manager, tokenizer, player_i_lora, player_j_lora, seed, payoff)

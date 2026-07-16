@@ -81,9 +81,12 @@ class BasePipeline:
 
         metrics = self.state.log_history[-1]
         metrics["system/step"] = global_step
-        if global_step > 0 and (
-            global_step % self.pipeline_config.save_steps == 0 or global_step == self.pipeline_config.max_steps - 1
-        ):
+        save_steps = getattr(self.pipeline_config, "save_steps", 0)
+        if save_steps <= 0:
+            futures.wait(self.resume_futures)
+            self.resume_futures.clear()
+            return
+        if global_step > 0 and (global_step % save_steps == 0 or global_step == self.pipeline_config.max_steps - 1):
             ckpt_metrics_refss = []
             for cluster in self.checkpoint_clusters:
                 ckpt_metrics_refss.append(
