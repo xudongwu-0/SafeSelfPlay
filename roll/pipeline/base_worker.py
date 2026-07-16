@@ -161,7 +161,7 @@ class ActorWorker(Worker):
         log_probs = self.strategy.op_compute_log_probs(
             logits=output_tensor, input_ids=data.batch["input_ids"], attention_mask=data.batch["response_mask"]
         )
-        entropy = self.strategy.op_compute_entropy(logits=output_tensor, attention_mask=data.batch["response_mask"])
+        entropy = -log_probs
         return torch.tensor(0., device=output_tensor.device), {"log_probs": log_probs.clone().detach(), "entropy": entropy.clone().detach()}
 
     def get_old_log_probs_with_cache(self, data: DataProto, log_probs: torch.Tensor) -> torch.Tensor:

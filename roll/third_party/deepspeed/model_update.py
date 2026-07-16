@@ -43,11 +43,21 @@ def _strip_peft_prefix(name: str) -> str:
     return name
 
 
+def _is_training_lora_param(name: str) -> bool:
+    if "lora_" not in name:
+        return False
+    if ".role_start." in name:
+        return False
+    if ".default." in name:
+        return True
+    return True
+
+
 def gather_deepspeed_weights(model, ds_config, buffer_size, lora_only: bool = False):
     is_zero3 = ds_config.is_zero3()
     named_params = [(name, param) for name, param in model.named_parameters()]
     if lora_only:
-        named_params = [(_strip_peft_prefix(n), p) for n, p in named_params if "lora_" in n]
+        named_params = [(_strip_peft_prefix(n), p) for n, p in named_params if _is_training_lora_param(n)]
 
     waiting_params, waiting_params_size = [], 0
     for name, param in named_params:

@@ -1,12 +1,14 @@
 import inspect
 import os
 import threading
+from copy import deepcopy
 from typing import Any, List, Optional
 
 import torch
 import torch.nn as nn
 from packaging.version import Version
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, set_peft_model_state_dict
+from safetensors.torch import load_file as safe_load_file
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -153,6 +155,39 @@ def freeze_model(model, model_args: "ModelArguments"):
             param.requires_grad_(False)
 
 
+def _set_peft_state_dict(model, state_dict: dict, adapter_name: Optional[str] = None):
+    if adapter_name is None:
+        return set_peft_model_state_dict(model, state_dict)
+    try:
+        return set_peft_model_state_dict(model, state_dict, adapter_name=adapter_name)
+    except TypeError:
+        previous_adapter = getattr(model, "active_adapter", None)
+        if callable(previous_adapter):
+            previous_adapter = previous_adapter()
+        model.set_adapter(adapter_name)
+        try:
+            return set_peft_model_state_dict(model, state_dict)
+        finally:
+            if previous_adapter:
+                model.set_adapter(previous_adapter)
+
+
+def _load_role_start_adapter(model, init_lora_path: str, state_dict: dict) -> None:
+    active_adapter = getattr(model, "active_adapter", "default")
+    if callable(active_adapter):
+        active_adapter = active_adapter()
+    if not active_adapter:
+        active_adapter = "default"
+    role_start_config = deepcopy(model.peft_config[active_adapter])
+    logger.info(f"Creating frozen role_start LoRA adapter from current config and weights in {init_lora_path}")
+    model.add_adapter("role_start", role_start_config)
+    _set_peft_state_dict(model, state_dict, adapter_name="role_start")
+    for name, param in model.named_parameters():
+        if ".role_start." in name:
+            param.requires_grad_(False)
+    model.set_adapter(active_adapter)
+
+
 # Inspired by: https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/model/adapter.py
 def setup_lora_training(
     config, model, model_args: "ModelArguments", is_trainable: Optional[bool] = False, is_mca: Optional[bool] = False
@@ -186,6 +221,22 @@ def setup_lora_training(
         model = get_peft_model(
             model, LoraConfig(**lora_config), autocast_adapter_dtype=model_args.autocast_adapter_dtype
         )
+        init_lora_path = os.environ.get("ROLL_INIT_LORA_PATH", "").strip()
+        if init_lora_path:
+            adapter_path = os.path.join(init_lora_path, "adapter_model.safetensors")
+            if os.path.exists(adapter_path):
+                logger.info(f"Initializing LoRA weights from {adapter_path}")
+                init_lora_state = safe_load_file(adapter_path)
+                _set_peft_state_dict(model, init_lora_state)
+            else:
+                adapter_path = os.path.join(init_lora_path, "adapter_model.bin")
+                if not os.path.exists(adapter_path):
+                    raise FileNotFoundError(f"ROLL_INIT_LORA_PATH has no adapter model: {init_lora_path}")
+                logger.info(f"Initializing LoRA weights from {adapter_path}")
+                init_lora_state = torch.load(adapter_path, map_location="cpu")
+                _set_peft_state_dict(model, init_lora_state)
+            if os.environ.get("ROLL_ROLE_START_REF", "").lower() in {"1", "true", "yes"}:
+                _load_role_start_adapter(model, init_lora_path, init_lora_state)
     return model
 
 

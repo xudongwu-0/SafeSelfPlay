@@ -1,5 +1,5 @@
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from typing import Callable, Dict, Tuple
 
@@ -33,6 +33,27 @@ from roll.utils.offload_states import OffloadStateType
 
 
 logger = get_logger()
+
+
+@contextmanager
+def _adapter_context(model, adapter_name, disable_adapter: bool):
+    if disable_adapter:
+        with model.disable_adapter():
+            yield
+        return
+    if not adapter_name:
+        yield
+        return
+
+    previous_adapter = getattr(model, "active_adapter", None)
+    if callable(previous_adapter):
+        previous_adapter = previous_adapter()
+    model.set_adapter(adapter_name)
+    try:
+        yield
+    finally:
+        if previous_adapter:
+            model.set_adapter(previous_adapter)
 
 
 class DeepSpeedInferStrategy(InferenceStrategy):
@@ -151,7 +172,11 @@ class DeepSpeedInferStrategy(InferenceStrategy):
         loss_scale = num_microbatches * self.worker.rank_info.dp_size
 
         disable_adapter = batch.meta_info.get("disable_adapter", False)
-        adapter_context = self.unwrap_model().disable_adapter() if disable_adapter else nullcontext()
+        adapter_context = _adapter_context(
+            self.unwrap_model(),
+            batch.meta_info.get("adapter_name"),
+            disable_adapter,
+        )
         losses_reduced = []
         with adapter_context:
             for data in micro_batches:

@@ -97,18 +97,32 @@ class ActorWorker(BaseActorWorker):
             total_loss = pg_loss + kl_loss * kl_coef
         else:
             total_loss = pg_loss
-        entropy = self.strategy.op_compute_entropy(
-            logits=output_tensor, attention_mask=data.batch["response_mask"]
-        )
-        entropy_loss = agg_loss(
-            loss_mat=entropy,
-            loss_mask=response_mask,
-            loss_agg_mode=self.pipeline_config.loss_agg_mode,
-            batch_num_tokens=batch_num_tokens['response_mask'],
-            global_valid_samples=global_valid_samples['response_mask'],
-        )
         if self.pipeline_config.entropy_loss_coef > 0:
+            entropy = self.strategy.op_compute_entropy(
+                logits=output_tensor, attention_mask=data.batch["response_mask"]
+            )
+            entropy_loss = agg_loss(
+                loss_mat=entropy,
+                loss_mask=response_mask,
+                loss_agg_mode=self.pipeline_config.loss_agg_mode,
+                batch_num_tokens=batch_num_tokens['response_mask'],
+                global_valid_samples=global_valid_samples['response_mask'],
+            )
             total_loss = total_loss - entropy_loss * self.pipeline_config.entropy_loss_coef
+            entropy_metric = entropy_loss.detach()
+            entropy_proxy_metric = entropy_metric
+        else:
+            # Full-vocabulary entropy materializes a large softmax tensor and can
+            # OOM on A10G. Track sampled-token surprise as a cheap diversity proxy.
+            entropy_proxy = -log_probs.detach()
+            entropy_proxy_metric = agg_loss(
+                loss_mat=entropy_proxy,
+                loss_mask=response_mask,
+                loss_agg_mode=self.pipeline_config.loss_agg_mode,
+                batch_num_tokens=batch_num_tokens['response_mask'],
+                global_valid_samples=global_valid_samples['response_mask'],
+            ).detach()
+            entropy_metric = entropy_proxy_metric
 
         pg_metrics = {
             "actor/ppo_ratio_high_clipfrac@sum": agg_loss(loss_mat=clipped_high,
@@ -133,7 +147,8 @@ class ActorWorker(BaseActorWorker):
             "actor/pg_loss@sum": pg_loss.detach().item(),
             "actor/kl_loss@sum": kl_loss.detach().item(),
             "actor/total_loss@sum": total_loss.detach().item(),
-            "actor/entropy@sum": entropy_loss.detach().item(),
+            "actor/entropy@sum": entropy_metric.item(),
+            "actor/entropy_proxy@sum": entropy_proxy_metric.item(),
             "actor/approxkl@sum": agg_loss(
                 loss_mat=approxkl, loss_mask=response_mask, loss_agg_mode=self.pipeline_config.loss_agg_mode,
                 batch_num_tokens=batch_num_tokens['response_mask'], global_valid_samples=global_valid_samples['response_mask']
