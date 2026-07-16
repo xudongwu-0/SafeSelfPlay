@@ -1,0 +1,172 @@
+defaults:
+  - ../config/deepspeed_zero@_here_
+  - ../config/deepspeed_zero2@_here_
+  - ../config/deepspeed_zero3@_here_
+  - ../config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "abs_redteam_vanilla_3b_r32_s100"
+seed: 42
+logging_dir: /output/abs_benchmark/logs
+output_dir: /output/abs_benchmark/roll_abs_redteam_vanilla_3b_r32_s100
+system_envs: {}
+
+track_with: wandb
+tracker_kwargs:
+  project: self-play
+  name: ${exp_name}
+  tags:
+    - abs_redteam
+    - vanilla_proxy
+    - psro
+    - qwen2_5_3b
+
+checkpoint_config:
+  type: file_system
+  async_upload: false
+  output_dir: /output/abs_benchmark/roll_abs_redteam_vanilla_3b_r32_s100/render
+
+num_gpus_per_node: 4
+
+max_steps: 100
+save_steps: 10000
+logging_steps: 1
+eval_steps: 0
+resume_from_checkpoint: false
+fsp_save_steps: 50
+fsp_opponent_weight_mode: uniform
+fsp_score_threshold: 0.0
+fsp_score_window: 10
+fsp_score_timeout: 50
+cold_start: true
+async_generation_ratio: 1
+
+psro_mode: true
+psro_episodes_per_pair: 8
+psro_seed_base: 12345
+psro_bubble_eval_episodes: 0
+
+rollout_batch_size: 96
+val_batch_size: 8
+sequence_length: 4096
+
+advantage_clip: 10.0
+ppo_epochs: 1
+adv_estimator: "grpo"
+init_kl_coef: 0.3
+use_kl_loss: true
+kl_loss_coef: 0.3
+kl_loss_coef_end: -1.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+pretrain: Qwen/Qwen2.5-3B-Instruct
+reward_pretrain: Qwen/Qwen2.5-3B-Instruct
+
+actor_train:
+  model_args:
+    flash_attn: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+    lora_target: q_proj,k_proj,v_proj,o_proj
+    lora_rank: 32
+    lora_alpha: 32
+  training_args:
+    learning_rate: 2.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 16
+    warmup_steps: 2
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: "[0,1,2]"
+  infer_batch_size: 2
+  use_dynamic_batching_in_train: false
+  max_tokens_per_microbatch_in_train: 0
+  sequence_length_round_in_train: 4
+  use_inner_dynamic_batching_in_train: false
+
+actor_infer:
+  model_args:
+    flash_attn: sdpa
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    lora_target: q_proj,k_proj,v_proj,o_proj
+    lora_rank: 32
+    lora_alpha: 32
+  generating_args:
+    max_new_tokens: 1024
+    top_p: 1.0
+    top_k: -1
+    num_beams: 1
+    temperature: 1.0
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.9
+      block_size: 16
+      load_format: auto
+      max_loras: 4
+      enforce_eager: false
+      max_num_batched_tokens: 8192
+  device_mapping: "[3]"
+  infer_batch_size: 2
+
+reward_normalization: {}
+
+train_env_manager:
+  format_penalty: -1.0
+  max_env_num_per_worker: 32
+  num_env_groups: 24
+  group_size: 4
+  tags: [RedTeamSafety]
+  num_groups_partition: [24]
+
+val_env_manager:
+  max_env_num_per_worker: 4
+  num_env_groups: 4
+  group_size: 1
+  tags: [RedTeamSafety]
+  num_groups_partition: [4]
+
+max_tokens_per_step: 1024
+max_actions_per_traj: 2
+
+custom_envs:
+  RedTeamSafety:
+    env_type: red_team_safety
+    max_steps: 2
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: roll.pipeline.agentic.env_manager.two_player_traj_env_manager.TwoPlayerTrajEnvManager
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    env_config:
+      action_pattern: "<answer>(.*?)</answer>"
+      max_steps: 2
+      format_penalty: -1.0
+      dataset_dir: ${oc.env:ABS_REDTEAM_DATA_DIR,/redteam_data}
+      dataset_zip: data.zip
+      dataset_files: vanilla_harmful_dataset.jsonl,vanilla_benign_dataset.jsonl
+      max_records_per_file: 2000
+      train_role: bipolicy
+      reward_backend: ${oc.env:ABS_REWARD_BACKEND,heuristic}
+      remote_rm_url: ${oc.env:REMOTE_RM_URL,""}
+      reward_coeff_config: general_sum
+      attacker_on_topic_weight: ${oc.env:ABS_ATTACKER_ON_TOPIC_WEIGHT,0.0}
+
+agent_system_template: You are a language-model safety self-play participant. Follow the role in the user message exactly.
+agent_template: "{observation}"

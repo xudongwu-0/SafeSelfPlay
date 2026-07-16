@@ -1,3 +1,80 @@
+# SafeSelfPlay
+
+SafeSelfPlay is a research fork of ROLL for safety self-play experiments. It
+implements an ABS-style two-player red-team safety game and adds PSRO-style
+opponent pools for alternating attacker/defender training.
+
+This codebase is built on top of [ROLL](https://github.com/alibaba/ROLL) and
+uses its Ray/vLLM/DeepSpeed agentic RL infrastructure. The safety environment,
+prompt templates, and WildGuard-based reward path are informed by the public
+[selfplay-redteaming](https://github.com/mickelliu/selfplay-redteaming)
+reference used around Anchored Bipolicy Self-Play (ABS). We should describe
+our runs as an **ABS-style reproduction/extension**, not as official ABS
+training code.
+
+## What This Fork Adds
+
+- A `RedTeamSafetyEnv` two-turn self-play environment:
+  - attacker rewrites a seed prompt into a stronger safety test;
+  - defender answers the rewritten prompt safely and helpfully;
+  - rewards support the public-style `general_sum` safety components.
+- Fixed-role training segments for attacker-only and defender-only LoRA best
+  responses.
+- PSRO-style attacker/defender checkpoint pools with cached pairwise payoff
+  matrices and mixture-based opponent selection.
+- Modal launchers for remote GPU training, WildGuard reward serving, safety
+  evaluation, SFT attacker bootstrapping, and prompt-rewrite probes.
+- W&B logging for training curves, safety metrics, raw prompt/response tables,
+  payoff matrices, and selected checkpoint metadata.
+- Role-start KL support, so each role can measure KL against its own starting
+  LoRA or base model instead of an unrelated reference.
+
+## Key Files
+
+- `ABS_PSRO_README.md` — experiment protocol, naming, W&B tables, payoff
+  caching, and the `5 x 100` PSRO schedule.
+- `ABS_PSRO_EXPERIMENT_CONSTRAINTS.md` — collaborator-facing constraints and
+  method boundaries.
+- `examples/agentic_demo/agent_abs_redteam_vanilla_3b.yaml` — ABS-style 3B
+  GRPO/LoRA configuration.
+- `roll/pipeline/agentic/env/red_team_safety/env.py` — safety self-play
+  environment and reward computation.
+- `modal_abs_benchmark.py` — Modal training/evaluation utilities and WildGuard
+  reward service.
+- `modal_sft_base_psro_once.py` — long-running Modal PSRO loop where the SFT
+  attacker starts against a base defender.
+- `scripts/abs_sft/` — prompt-optimization and SFT data-generation scripts for
+  attacker rewrite instruction following.
+
+## Quick Start
+
+Modal is the intended execution path for these experiments.
+
+```bash
+cd /home/xudong/work/self_play/ROLL
+modal secret create roll-secrets WANDB_API_KEY=<wandb-key> HF_TOKEN=<hf-token>
+```
+
+Check access to the gated WildGuard assets:
+
+```bash
+modal run modal_abs_benchmark.py --mode check-token
+```
+
+Run the main long-GPU PSRO loop from an SFT attacker and a base defender:
+
+```bash
+ABS_TRAIN_GPU=A10G:4 modal run -d modal_sft_base_psro_once.py::sft_base_psro_long \
+  --iterations 5 \
+  --role-steps 50 \
+  --payoff-episodes-per-pair 12
+```
+
+For the cold-start ABS-style PSRO protocol and comparable vanilla baseline, see
+`ABS_PSRO_README.md`.
+
+---
+
 <div align="center">
 
 <img src="assets/roll.jpeg" width="40%" alt="ROLL Logo">
