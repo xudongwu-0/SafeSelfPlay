@@ -501,8 +501,16 @@ def create_sampling_params_for_vllm(gen_kwargs, collect_unfinished=False):
         )
     structured_outputs = None
     if gen_kwargs.get("structured_outputs_regex"):
-        from vllm.sampling_params import StructuredOutputsParams
-        structured_outputs = StructuredOutputsParams(regex=gen_kwargs["structured_outputs_regex"])
+        try:
+            from vllm.sampling_params import StructuredOutputsParams
+
+            structured_outputs = StructuredOutputsParams(regex=gen_kwargs["structured_outputs_regex"])
+        except ImportError:
+            logger.warning(
+                "vllm StructuredOutputsParams is unavailable in this version; "
+                "falling back to unconstrained sampling for structured_outputs_regex=%s",
+                gen_kwargs["structured_outputs_regex"],
+            )
     sampling_kwargs = dict(
         max_tokens=gen_kwargs["max_new_tokens"],
         temperature=gen_kwargs["temperature"],
