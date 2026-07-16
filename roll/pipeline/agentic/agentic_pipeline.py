@@ -926,10 +926,15 @@ class AgenticPipeline(BasePipeline):
                             step_scores = group_batch.non_tensor_batch["step_scores"].tolist()
                             if isinstance(step_scores[0], np.ndarray):
                                 step_scores = [t.tolist() for t in step_scores]
+                            default_text = np.array([""] * len(episode_scores), dtype=object)
+                            opponent_prompts = group_batch.non_tensor_batch.get("opponent_prompt", default_text).tolist()
+                            opponent_responses = group_batch.non_tensor_batch.get("opponent_response", default_text).tolist()
+                            opponent_actions = group_batch.non_tensor_batch.get("opponent_action", default_text).tolist()
 
                             log_item = []
-                            for prompt, response, episode_score, step_score in zip(
-                                    prompts, responses, episode_scores, step_scores
+                            for prompt, response, episode_score, step_score, opponent_prompt, opponent_response, opponent_action in zip(
+                                    prompts, responses, episode_scores, step_scores,
+                                    opponent_prompts, opponent_responses, opponent_actions
                             ):
                                 log_item.append(
                                     {
@@ -937,6 +942,9 @@ class AgenticPipeline(BasePipeline):
                                         "response": response,
                                         "episode_score": episode_score,
                                         "step_score": step_score,
+                                        "opponent_prompt": opponent_prompt,
+                                        "opponent_response": opponent_response,
+                                        "opponent_action": opponent_action,
                                     }
                                 )
                             log_res.append(log_item)
@@ -963,6 +971,9 @@ class AgenticPipeline(BasePipeline):
                                         "episode_score",
                                         "step_score",
                                         "response",
+                                        "opponent_response",
+                                        "opponent_action",
+                                        "opponent_prompt",
                                         "full_prompt",
                                     ]
                                 )
@@ -987,6 +998,10 @@ class AgenticPipeline(BasePipeline):
                                         parts.append(f"[step {step_idx}] score={item['episode_score']}")
                                         parts.append(f"PROMPT: {prompt}")
                                         parts.append(f"RESPONSE: {item['response']}")
+                                        if item.get("opponent_response"):
+                                            parts.append(f"OPPONENT_RESPONSE: {item['opponent_response']}")
+                                        if item.get("opponent_action") and item.get("opponent_action") != item.get("opponent_response"):
+                                            parts.append(f"OPPONENT_ACTION: {item['opponent_action']}")
                                         table.add_data(
                                             global_step,
                                             traj_idx,
@@ -997,6 +1012,9 @@ class AgenticPipeline(BasePipeline):
                                             item["episode_score"],
                                             json.dumps(item["step_score"], ensure_ascii=False),
                                             item["response"],
+                                            item.get("opponent_response", ""),
+                                            item.get("opponent_action", ""),
+                                            item.get("opponent_prompt", ""),
                                             prompt,
                                         )
                                 text = "\n".join(parts)

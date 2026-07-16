@@ -257,8 +257,13 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
                     "content": self.tokenizer.decode(opponent_response_ids, skip_special_tokens=True),
                 })
 
+        # Keep the raw opponent text for transcript inspection before any fallback normalization.
+        self.rollout_cache.history[-1]['opponent_response'] = opponent_action
+        self.rollout_cache.history[-1]['opponent_prompt'] = obs_for_opponent
+
         # --- Resolve round: env.step with opponent's action (default to Pass if invalid format) ---
         opponent_action = self._normalize_opponent_action(opponent_action)
+        self.rollout_cache.history[-1]['opponent_action'] = opponent_action
         with self.thread_lock, self.env_step_limiter:
             obs_for_agent, reward, terminated, truncated, info = self.env.step(action=opponent_action)
 
@@ -349,8 +354,18 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         lm_input = super().formulate_rollouts(rollout_cache)
         if lm_input is not None:
             opponent_id = str(self.current_opponent_lora) if self.current_opponent_lora is not None else "base"
+            history_item = self.rollout_cache.history[-1] if self.rollout_cache.history else {}
             lm_input.non_tensor_batch["opponent_id"] = np.array(
                 [opponent_id] * lm_input.batch.batch_size[0], dtype=object
+            )
+            lm_input.non_tensor_batch["opponent_prompt"] = np.array(
+                [history_item.get("opponent_prompt", "")] * lm_input.batch.batch_size[0], dtype=object
+            )
+            lm_input.non_tensor_batch["opponent_response"] = np.array(
+                [history_item.get("opponent_response", "")] * lm_input.batch.batch_size[0], dtype=object
+            )
+            lm_input.non_tensor_batch["opponent_action"] = np.array(
+                [history_item.get("opponent_action", "")] * lm_input.batch.batch_size[0], dtype=object
             )
         return lm_input
 
