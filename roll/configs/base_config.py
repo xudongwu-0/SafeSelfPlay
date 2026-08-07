@@ -503,13 +503,13 @@ class PPOConfig(BaseConfig):
     kl_horizon: int = field(default=10000, metadata={"help": "Horizon for adaptive KL control"})
     use_reward_scaling: bool = field(default=False, metadata={"help": "Use reward scaling"})
     add_len_reward: bool = field(default=False)
-    reward_clip: float = field(default=None, metadata={"help": "reward clip value."})
+    reward_clip: Optional[float] = field(default=None, metadata={"help": "reward clip value."})
     use_reward_norm: bool = field(
         default=False, metadata={"help": "Use reward normalization. Only applicable if use_reward_scaling is True."}
     )
     whiten_rewards: bool = field(default=False, metadata={"help": "Whiten the rewards before compute advantages."})
     whiten_advantages: bool = field(default=False, metadata={"help": "Whiten the advantage."})
-    advantage_clip: float = field(default=None, metadata={"help": "advantage_clip value"})
+    advantage_clip: Optional[float] = field(default=None, metadata={"help": "advantage_clip value"})
     adv_estimator: Literal["gae", "reinforce", "grpo", "gigpo", "step_reinforce", "agentic_reinforce"] = field(
         default="gae", metadata={"help": "advantage estimator: gae (GAE)."}
     )

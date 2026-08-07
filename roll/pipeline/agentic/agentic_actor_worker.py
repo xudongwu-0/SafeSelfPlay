@@ -1,14 +1,56 @@
 import numpy as np
 import torch
 
+from roll.distributed.scheduler.decorator import Dispatch, register
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.base_worker import ActorWorker as BaseActorWorker
 from roll.utils.functionals import masked_mean, agg_loss, compute_approx_kl
+from roll.pipeline.agentic.aux_sft import RoleAuxSFTSampler
 from roll.pipeline.agentic.utils import compute_segment_masked_mean, effective_kl_coef
 from roll.utils.train_infer_corrections import compute_train_infer_correction
 
 
 class ActorWorker(BaseActorWorker):
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def initialize(self, pipeline_config):
+        super().initialize(pipeline_config)
+        self.aux_sft_sampler = None
+        if pipeline_config.aux_sft_coef > 0:
+            if not pipeline_config.aux_sft_path:
+                raise ValueError("aux_sft_coef > 0 requires aux_sft_path")
+            rank = getattr(self.rank_info, "rank", 0)
+            self.aux_sft_sampler = RoleAuxSFTSampler(
+                path=pipeline_config.aux_sft_path,
+                seed=pipeline_config.seed,
+                rank=rank,
+            )
+            self.logger.info(
+                "Loaded %d role-specific auxiliary SFT records from %s (coef=%s, micro_batch=%s)",
+                len(self.aux_sft_sampler),
+                pipeline_config.aux_sft_path,
+                pipeline_config.aux_sft_coef,
+                pipeline_config.aux_sft_micro_batch_size,
+            )
+
+    def _compute_aux_sft_loss(self, device):
+        if self.aux_sft_sampler is None:
+            return None, 0
+        batch = self.aux_sft_sampler.next_batch(
+            tokenizer=self.tokenizer,
+            device=device,
+            batch_size=self.pipeline_config.aux_sft_micro_batch_size,
+            max_length=self.pipeline_config.aux_sft_max_length,
+        )
+        output = self.strategy.model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+        )
+        loss, valid_tokens = self.strategy.op_compute_language_loss_from_logits(
+            logits=output.logits,
+            targets=batch["labels"],
+        )
+        return loss, int(valid_tokens.detach().item())
+
     def loss_func(self, data: DataProto, output_tensor: torch.Tensor):
         """
         loss func接口定义:
@@ -97,6 +139,10 @@ class ActorWorker(BaseActorWorker):
             total_loss = pg_loss + kl_loss * kl_coef
         else:
             total_loss = pg_loss
+
+        aux_sft_loss, aux_sft_valid_tokens = self._compute_aux_sft_loss(output_tensor.device)
+        if aux_sft_loss is not None:
+            total_loss = total_loss + self.pipeline_config.aux_sft_coef * aux_sft_loss
         if self.pipeline_config.entropy_loss_coef > 0:
             entropy = self.strategy.op_compute_entropy(
                 logits=output_tensor, attention_mask=data.batch["response_mask"]
@@ -147,6 +193,8 @@ class ActorWorker(BaseActorWorker):
             "actor/pg_loss@sum": pg_loss.detach().item(),
             "actor/kl_loss@sum": kl_loss.detach().item(),
             "actor/total_loss@sum": total_loss.detach().item(),
+            "actor/aux_sft_loss@mean": 0.0 if aux_sft_loss is None else aux_sft_loss.detach().item(),
+            "actor/aux_sft_valid_tokens@sum": aux_sft_valid_tokens,
             "actor/entropy@sum": entropy_metric.item(),
             "actor/entropy_proxy@sum": entropy_proxy_metric.item(),
             "actor/approxkl@sum": agg_loss(

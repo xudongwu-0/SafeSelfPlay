@@ -36,6 +36,10 @@ max_steps: 100
 save_steps: 10000
 logging_steps: 1
 eval_steps: 0
+aux_sft_path: ""
+aux_sft_coef: 0.0
+aux_sft_micro_batch_size: 1
+aux_sft_max_length: 1536
 resume_from_checkpoint: false
 fsp_save_steps: 50
 fsp_opponent_weight_mode: uniform

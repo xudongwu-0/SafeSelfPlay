@@ -1094,6 +1094,7 @@ class FSDP2TrainStrategy(FSDP2InferStrategy, TrainStrategy):
                 self.worker_config.training_args.max_steps
             ),
             num_training_steps=self.worker_config.training_args.max_steps,
+            scheduler_specific_kwargs=self.worker_config.training_args.lr_scheduler_kwargs,
         )
 
         dist.barrier()

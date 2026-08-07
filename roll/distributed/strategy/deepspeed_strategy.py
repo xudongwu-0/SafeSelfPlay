@@ -424,6 +424,7 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             optimizer,
             num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
             num_training_steps=total_scheduler_steps,
+            scheduler_specific_kwargs=self.worker_config.training_args.lr_scheduler_kwargs,
         )
 
         self.model, self.optimizer, _, self.scheduler = deepspeed.initialize(
@@ -449,6 +450,7 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             sched_opt,
             num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
             num_training_steps=total_scheduler_steps,
+            scheduler_specific_kwargs=self.worker_config.training_args.lr_scheduler_kwargs,
         )
         self.scheduler = new_scheduler
         if hasattr(self.model, "lr_scheduler"):
@@ -654,6 +656,7 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             sched_opt,
             num_warmup_steps=self.worker_config.training_args.get_warmup_steps(total_scheduler_steps),
             num_training_steps=total_scheduler_steps,
+            scheduler_specific_kwargs=self.worker_config.training_args.lr_scheduler_kwargs,
         )
         self.scheduler = new_scheduler
         if hasattr(self.model, "lr_scheduler"):

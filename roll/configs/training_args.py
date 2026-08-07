@@ -29,6 +29,10 @@ class TrainingArguments:
     lr_scheduler_type: str = field(
         default="linear",
         metadata={"help": "The scheduler type to use. Refer to HF"})
+    lr_scheduler_kwargs: Dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"help": "Keyword arguments forwarded to the Transformers learning-rate scheduler."},
+    )
     weight_decay: float = field(
         default=0.0,
         metadata={"help": "Weight decay for AdamW if we apply some."}

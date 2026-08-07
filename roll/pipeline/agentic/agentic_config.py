@@ -216,6 +216,10 @@ class EnvMonitorConfig:
 @dataclass
 class AgenticConfig(PPOConfig):
     # agentic related
+    training_profile: str = field(
+        default="legacy_grpo",
+        metadata={"help": "Human-readable optimizer/reward profile recorded with the experiment."},
+    )
     custom_envs: Dict[str, Any] = field(default_factory=dict, metadata={"help": "List of environment configurations."})
     train_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     val_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
@@ -268,6 +272,22 @@ class AgenticConfig(PPOConfig):
     response_log_steps: int = field(
         default=10,
         metadata={"help": "Log sample rollout responses to wandb every N steps (0 = disabled)."},
+    )
+    aux_sft_path: str = field(
+        default="",
+        metadata={"help": "Role-specific JSONL SFT data mixed into each actor update. Empty disables it."},
+    )
+    aux_sft_coef: float = field(
+        default=0.0,
+        metadata={"help": "Weight of the role-specific auxiliary SFT loss."},
+    )
+    aux_sft_micro_batch_size: int = field(
+        default=1,
+        metadata={"help": "Auxiliary SFT samples used on each actor micro-step."},
+    )
+    aux_sft_max_length: int = field(
+        default=1536,
+        metadata={"help": "Maximum token length for role-specific auxiliary SFT examples."},
     )
     enable_reasoning_filter: bool = field(
         default=False,

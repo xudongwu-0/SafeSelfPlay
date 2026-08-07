@@ -627,11 +627,26 @@ def compute_token_reward(data: "DataProto", pipeline_config: PPOConfig, kl_ctrl:
 
     current_kl = masked_mean(kld, mask=data.batch["response_mask"][:, 1:], dim=-1)
     current_kl = torch.mean(current_kl, dim=0).item()
+    log_ratio = data.batch["old_log_probs"] - data.batch["ref_log_probs"]
+    kl_abs = masked_mean(
+        log_ratio.abs(), mask=data.batch["response_mask"][:, 1:], dim=-1
+    ).mean().item()
+    kl_k3 = masked_mean(
+        torch.exp(-log_ratio) - 1.0 + log_ratio,
+        mask=data.batch["response_mask"][:, 1:],
+        dim=-1,
+    ).mean().item()
 
     kl_ctrl.update(current=current_kl, n_steps=data.batch.batch_size[0])
     if "token_level_rewards" in data.batch.keys():
         data.rename(old_keys="token_level_rewards", new_keys="token_level_scores")
-    metrics = {"critic/kl": current_kl, "critic/kl_coef": beta}
+    metrics = {
+        "critic/kl": current_kl,
+        "critic/kl_signed": current_kl,
+        "critic/kl_abs": kl_abs,
+        "critic/kl_k3": kl_k3,
+        "critic/kl_coef": beta,
+    }
 
     if pipeline_config.reward_clip:
         reward_clip_frac = compute_clip_fraction(
@@ -1331,4 +1346,3 @@ def batch_balance(batch: DataProto, dp_size, minibatch_size, logging_prefix="glo
     metrics = {}
     metrics.update(global_balance_stats)
     return metrics
-
