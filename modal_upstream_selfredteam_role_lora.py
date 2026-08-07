@@ -2106,9 +2106,146 @@ def _patch_upstream_defender_metric_keys() -> None:
     )
 
 
+def _patch_upstream_reference_kl_monitoring() -> None:
+    """Keep a reference policy for diagnostics when its loss weight is zero."""
+    cli_path = UPSTREAM_WORK / "openrlhf/cli/train_ppo_ray.py"
+    _replace_once(
+        cli_path,
+        '    parser.add_argument("--fixed_opponent_lora_path", type=str, default=None)\n',
+        '    parser.add_argument("--fixed_opponent_lora_path", type=str, default=None)\n'
+        '    parser.add_argument(\n'
+        '        "--monitor_reference_kl",\n'
+        '        action="store_true",\n'
+        '        help="Compute role-start KL without requiring a KL penalty.",\n'
+        '    )\n',
+        "reference KL monitoring CLI argument",
+    )
+    _replace_once(
+        cli_path,
+        """        if args.init_kl_coef > 0:
+""",
+        """        if args.init_kl_coef > 0 or args.monitor_reference_kl:
+""",
+        "reference placement validation for KL monitoring",
+    )
+    _replace_once(
+        cli_path,
+        """    if args.init_kl_coef == 0:
+        ref_model = None
+    else:
+""",
+        """    if args.init_kl_coef == 0 and not args.monitor_reference_kl:
+        ref_model = None
+    else:
+""",
+        "keep reference model for unpenalized KL monitoring",
+    )
+
+
+def _patch_upstream_role_specific_online_sft() -> None:
+    """Apply rewrite SFT to A and answer SFT to D with a finite schedule."""
+    actor_path = UPSTREAM_WORK / "openrlhf/trainer/ray/ppo_actor.py"
+    _replace_once(
+        actor_path,
+        (
+            "            sft_strategy.args.apply_chat_template = True\n"
+            "            sft_strategy.args.prompt_input_template = "
+            "DEFENDER_INSTRUCTION_COT_PROMPT\n"
+            "            \n"
+            "            sft_data = blending_datasets(\n"
+        ),
+        """            sft_strategy.args.apply_chat_template = True
+            optimizer_train_role = args.custom_configs.get(
+                "optimizer_train_role"
+            )
+            attacker_role_sft = optimizer_train_role == "attacker"
+            if attacker_role_sft:
+                sft_strategy.args.sft_input_key = "messages"
+                sft_strategy.args.sft_output_key = None
+                sft_strategy.args.prompt_input_template = None
+            else:
+                sft_strategy.args.prompt_input_template = (
+                    DEFENDER_INSTRUCTION_COT_PROMPT
+                )
+
+            sft_data = blending_datasets(
+""",
+        "select role-specific online SFT schema",
+    )
+    _replace_once(
+        actor_path,
+        """                pretrain_mode=False,
+                prompt_input_template=DEFENDER_INSTRUCTION_COT_PROMPT,
+            )
+""",
+        """                pretrain_mode=False,
+                multiturn=attacker_role_sft,
+                prompt_input_template=(
+                    None
+                    if attacker_role_sft
+                    else DEFENDER_INSTRUCTION_COT_PROMPT
+                ),
+            )
+""",
+        "construct role-specific online SFT dataset",
+    )
+    _replace_once(
+        actor_path,
+        """        sft_samples_this_step = 0 # Counter for SFT samples processed in this step on this rank
+        if self.postfill_cot_loss:
+            latest_postfill_cot_loss = None # Initialize here to ensure definition
+""",
+        """        sft_samples_this_step = 0 # Counter for SFT samples processed in this step on this rank
+        postfill_cot_stop_after_step = self.args.custom_configs.get(
+            "postfill_cot_stop_after_step"
+        )
+        effective_postfill_cot_loss_coef = float(
+            self.args.postfill_cot_loss_coef
+        )
+        if (
+            postfill_cot_stop_after_step is not None
+            and global_steps > int(postfill_cot_stop_after_step)
+        ):
+            effective_postfill_cot_loss_coef = 0.0
+        latest_postfill_cot_loss = None
+        if self.postfill_cot_loss and effective_postfill_cot_loss_coef > 0:
+""",
+        "schedule role-specific online SFT coefficient",
+    )
+    actor_text = actor_path.read_text()
+    old_backward = (
+        "self.strategy.backward(self.args.postfill_cot_loss_coef * "
+        "postfill_cot_loss_val, self.actor, self.actor_optim)"
+    )
+    new_backward = (
+        "self.strategy.backward(effective_postfill_cot_loss_coef * "
+        "postfill_cot_loss_val, self.actor, self.actor_optim)"
+    )
+    if actor_text.count(old_backward) != 2:
+        raise RuntimeError(
+            "Expected exactly two online-SFT backward calls, found "
+            f"{actor_text.count(old_backward)}"
+        )
+    actor_path.write_text(actor_text.replace(old_backward, new_backward))
+    _replace_once(
+        actor_path,
+        """        if self.postfill_cot_loss:
+            # Log the SFT loss if it was computed in this step
+""",
+        """        if self.postfill_cot_loss:
+            status["postfill_cot_loss_coef_effective"] = (
+                effective_postfill_cot_loss_coef
+            )
+            # Log the SFT loss if it was computed in this step
+""",
+        "log effective online SFT coefficient",
+    )
+
+
 def _prepare_role_lora_upstream(
     attacker_prompt_profile: str = "optimized",
     strict_upstream_alignment: bool = False,
+    dynamic_role_sft: bool = False,
 ) -> None:
     _prepare_upstream_source()
     _patch_upstream_vllm_version_check()
@@ -2137,6 +2274,9 @@ def _prepare_role_lora_upstream(
     _patch_upstream_remote_rm_retry()
     _patch_upstream_comprehensive_wandb_logging()
     _patch_upstream_defender_metric_keys()
+    if dynamic_role_sft:
+        _patch_upstream_reference_kl_monitoring()
+        _patch_upstream_role_specific_online_sft()
 
 
 def _prepare_peft_compatible_adapter(
@@ -2390,6 +2530,11 @@ def train_upstream_attacker_lora_fixed_seed(
     attacker_init_adapter: str = SFT_ADAPTER,
     attacker_prompt_profile: str = "optimized",
     strict_upstream_alignment: bool = False,
+    lora_rank: int = 32,
+    lora_alpha: int = 32,
+    monitor_reference_kl: bool = False,
+    postfill_cot_stop_after_step: int | None = None,
+    role_specific_aux_sft: bool = False,
 ) -> str:
     """Use the upstream optimizer to train one role-specific LoRA."""
     if train_role not in {"attacker", "defender"}:
@@ -2404,6 +2549,23 @@ def train_upstream_attacker_lora_fixed_seed(
         )
     if init_kl_coef < 0:
         raise ValueError("init_kl_coef must be non-negative")
+    if lora_rank <= 0:
+        raise ValueError("lora_rank must be positive")
+    if lora_alpha <= 0:
+        raise ValueError("lora_alpha must be positive")
+    if postfill_cot_stop_after_step is not None:
+        if postfill_cot_stop_after_step < 0:
+            raise ValueError(
+                "postfill_cot_stop_after_step must be non-negative"
+            )
+        if not enable_aux_sft:
+            raise ValueError(
+                "postfill_cot_stop_after_step requires enable_aux_sft=True"
+            )
+    if role_specific_aux_sft and not enable_aux_sft:
+        raise ValueError(
+            "role_specific_aux_sft requires enable_aux_sft=True"
+        )
     if defender_prompt_profile not in {"upstream", "role_specific"}:
         raise ValueError(
             "defender_prompt_profile must be upstream or role_specific"
@@ -2434,8 +2596,14 @@ def train_upstream_attacker_lora_fixed_seed(
             "micro_rollout_batch_size": (micro_rollout_batch_size, 8),
             "micro_train_batch_size": (micro_train_batch_size, 8),
             "train_batch_size": (train_batch_size, 32),
-            "actor_learning_rate": (actor_learning_rate, 5e-7),
-            "init_kl_coef": (init_kl_coef, 0.01),
+            "actor_learning_rate": (
+                actor_learning_rate,
+                1e-6 if role_specific_aux_sft else 5e-7,
+            ),
+            "init_kl_coef": (
+                init_kl_coef,
+                0.0 if role_specific_aux_sft else 0.01,
+            ),
             "actor_lr_scheduler": (
                 actor_lr_scheduler,
                 "cosine_with_min_lr",
@@ -2455,6 +2623,11 @@ def train_upstream_attacker_lora_fixed_seed(
             ),
             "exact_fixed_attack_text": (exact_fixed_attack_text, False),
         }
+        if role_specific_aux_sft:
+            strict_expected["monitor_reference_kl"] = (
+                monitor_reference_kl,
+                True,
+            )
         mismatches = [
             f"{name}={actual!r} (expected {expected!r})"
             for name, (actual, expected) in strict_expected.items()
@@ -2523,9 +2696,15 @@ def train_upstream_attacker_lora_fixed_seed(
     attacker_start_tag = "fromSFT" if attacker_init_adapter else "fromBase"
     attacker_instruction_tag = f"prompt_{attacker_prompt_profile}"
     alignment_tag = "strictalign_" if strict_upstream_alignment else ""
+    # Preserve historical r32 run names so interrupted legacy runs still resume.
+    lora_tag = (
+        "r32"
+        if lora_rank == 32 and lora_alpha == 32
+        else f"r{lora_rank}_a{lora_alpha}"
+    )
     if train_role == "attacker":
         run_name = (
-            f"upstream_selfredteam_{alignment_tag}{model_tag}_attacker_lora_r32_"
+            f"upstream_selfredteam_{alignment_tag}{model_tag}_attacker_lora_{lora_tag}_"
             f"{attacker_start_tag}_vs_base_"
             f"{attacker_instruction_tag}_"
             f"{prompt_profile}_s{steps}_rb{rollout_batch_size}_"
@@ -2546,7 +2725,7 @@ def train_upstream_attacker_lora_fixed_seed(
             else "fixedAttackerLoRA"
         )
         run_name = (
-            f"upstream_selfredteam_{alignment_tag}{model_tag}_defender_lora_r32_fromBase_"
+            f"upstream_selfredteam_{alignment_tag}{model_tag}_defender_lora_{lora_tag}_fromBase_"
             f"vs_{opponent_tag}_"
             f"{attacker_instruction_tag}_"
             f"{prompt_profile}_s{steps}_rb{rollout_batch_size}_"
@@ -2578,6 +2757,7 @@ def train_upstream_attacker_lora_fixed_seed(
     _prepare_role_lora_upstream(
         attacker_prompt_profile,
         strict_upstream_alignment=strict_upstream_alignment,
+        dynamic_role_sft=role_specific_aux_sft,
     )
     pool_metadata: dict[str, object] | None = None
     if normal_prompt_mix:
@@ -2699,13 +2879,17 @@ def train_upstream_attacker_lora_fixed_seed(
         "trainable_policy": (
             f"{base_model} + "
             f"{'SFT-initialized' if attacker_init_adapter else 'fresh'} "
-            "attacker LoRA r32"
+            f"attacker LoRA r{lora_rank}/alpha{lora_alpha}"
             if train_role == "attacker"
             else (
-                f"{base_model} + fresh defender LoRA r32 with upstream "
+                f"{base_model} + fresh defender LoRA "
+                f"r{lora_rank}/alpha{lora_alpha} with upstream "
                 "online auxiliary SFT"
                 if enable_aux_sft
-                else f"{base_model} + fresh defender LoRA r32"
+                else (
+                    f"{base_model} + fresh defender LoRA "
+                    f"r{lora_rank}/alpha{lora_alpha}"
+                )
             )
         ),
         "fixed_opponent": (
@@ -2767,6 +2951,7 @@ def train_upstream_attacker_lora_fixed_seed(
         "advantage_estimator": "reinforce",
         "actor_learning_rate": actor_learning_rate,
         "init_kl_coef": init_kl_coef,
+        "reference_kl_monitoring": monitor_reference_kl,
         "actor_lr_scheduler": actor_lr_scheduler,
         "filter_invalid_fixed_attacks": (
             not upstream_invalid_handling
@@ -2779,6 +2964,10 @@ def train_upstream_attacker_lora_fixed_seed(
         "upstream_invalid_handling": upstream_invalid_handling,
         "aux_sft_enabled": enable_aux_sft,
         "online_sft_coef": 1.0 if enable_aux_sft else 0.0,
+        "postfill_cot_stop_after_step": postfill_cot_stop_after_step,
+        "role_specific_aux_sft": role_specific_aux_sft,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
         "balance_defender_refusal_replay": balance_defender_refusal_replay,
         "balance_attacker_goal_replay": balance_attacker_goal_replay,
         "attacker_prompt_profile": attacker_prompt_profile,
@@ -2788,7 +2977,8 @@ def train_upstream_attacker_lora_fixed_seed(
             else "Legacy role-specific experimental settings",
             "Only the selected role remains in replay before optimization",
             "The opponent adapter is frozen and selected explicitly in vLLM",
-            "Attacker and defender use independent LoRA r32/alpha32 adapters",
+            f"Attacker and defender use independent LoRA "
+            f"r{lora_rank}/alpha{lora_alpha} adapters",
             "Modal preemption resumes from the latest complete LoRA checkpoint",
         ] if strict_upstream_alignment else [
             "private CoT never exposed on malformed format",
@@ -2835,7 +3025,7 @@ def train_upstream_attacker_lora_fixed_seed(
         json.dumps(manifest, ensure_ascii=False, indent=2)
     )
 
-    sft_data = ",".join(
+    defender_sft_data = ",".join(
         [
             str(
                 UPSTREAM_WORK
@@ -2858,6 +3048,10 @@ def train_upstream_attacker_lora_fixed_seed(
             "actor_lr_scheduler": "cosine_with_min_lr",
             "lightweight_resume_step": resume_step,
         }
+        if postfill_cot_stop_after_step is not None:
+            custom_configs["postfill_cot_stop_after_step"] = int(
+                postfill_cot_stop_after_step
+            )
     else:
         custom_configs = {
             "max_turns": 2,
@@ -2894,20 +3088,32 @@ def train_upstream_attacker_lora_fixed_seed(
         }
     sft_args = []
     if enable_aux_sft:
-        sft_args = [
-            "--sft_data",
-            sft_data,
-            "--sft_data_probs",
-            "0.5,0.5",
-            "--sft_input_key",
-            "vanilla",
-            "--sft_output_key",
-            "completion",
-            "--sft_steps",
-            "1",
-            "--sft_batches_per_step",
-            "1",
-        ]
+        if role_specific_aux_sft and train_role == "attacker":
+            sft_args = [
+                "--sft_data",
+                "/aux_sft/attacker_rewrite_1180.jsonl",
+                "--sft_data_probs",
+                "1.0",
+                "--sft_steps",
+                "1",
+                "--sft_batches_per_step",
+                "1",
+            ]
+        else:
+            sft_args = [
+                "--sft_data",
+                defender_sft_data,
+                "--sft_data_probs",
+                "0.5,0.5",
+                "--sft_input_key",
+                "vanilla",
+                "--sft_output_key",
+                "completion",
+                "--sft_steps",
+                "1",
+                "--sft_batches_per_step",
+                "1",
+            ]
     role_lora_args = []
     if actor_init_adapter is not None:
         role_lora_args.extend(["--lora_init_path", actor_init_adapter])
@@ -2965,9 +3171,9 @@ def train_upstream_attacker_lora_fixed_seed(
         "--pretrain",
         base_model,
         "--lora_rank",
-        "32",
+        str(lora_rank),
         "--lora_alpha",
-        "32",
+        str(lora_alpha),
         "--target_modules",
         "q_proj",
         "k_proj",
@@ -3023,6 +3229,7 @@ def train_upstream_attacker_lora_fixed_seed(
         str(actor_learning_rate),
         "--init_kl_coef",
         str(init_kl_coef),
+        *(["--monitor_reference_kl"] if monitor_reference_kl else []),
         "--normalize_reward",
         "--packing_samples",
         "--gradient_checkpointing",
@@ -3445,6 +3652,241 @@ def train_strict_upstream_aligned_role_round(
     return manifest
 
 
+@app.function(
+    cpu=2,
+    memory=4096,
+    timeout=43200,
+    volumes={"/output": output_vol},
+    secrets=[modal.Secret.from_name("roll-secrets")],
+)
+def train_dynamic_sft_dual_lora_round(
+    steps_per_role: int = 200,
+    attacker_sft_stop_after_step: int = 30,
+    defender_sft_stop_after_step: int = 10,
+    learning_rate: float = 1e-6,
+    lora_rank: int = 64,
+    lora_alpha: int = 64,
+    run_suffix: str = "",
+) -> dict[str, object]:
+    """Reproduce the proven A-then-D schedule with independent LoRAs."""
+    if steps_per_role < 1:
+        raise ValueError("steps_per_role must be positive")
+    if attacker_sft_stop_after_step < 0:
+        raise ValueError("attacker_sft_stop_after_step must be non-negative")
+    if defender_sft_stop_after_step < 0:
+        raise ValueError("defender_sft_stop_after_step must be non-negative")
+    if lora_rank <= 0 or lora_alpha <= 0:
+        raise ValueError("LoRA rank and alpha must be positive")
+
+    suffix = run_suffix or datetime.now().strftime("%Y%m%d_%H%M%S")
+    round_dir = Path(OUTPUT_ROOT) / "dynamic_sft_role_rounds" / (
+        f"duallora_r{lora_rank}a{lora_alpha}_"
+        f"A{steps_per_role}D{steps_per_role}_lr{learning_rate:g}_"
+        f"klpen0_A_sft{attacker_sft_stop_after_step}to0_"
+        f"D_sft{defender_sft_stop_after_step}to0_{suffix}"
+    )
+    round_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = round_dir / "manifest.json"
+    manifest: dict[str, object] = {
+        "method": "two independent LoRA policies; sequential attacker then defender",
+        "source_configuration": (
+            "dynamic_sft_dual_full A200->D200; trainable scope changed to LoRA"
+        ),
+        "base_model": LLAMA_ABLITERATED_MODEL,
+        "attacker_start": LLAMA_ABLITERATED_MODEL,
+        "defender_start": LLAMA_ABLITERATED_MODEL,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        "steps_per_role": steps_per_role,
+        "rollout_batch_size": 128,
+        "micro_rollout_batch_size": 8,
+        "train_batch_size": 32,
+        "micro_train_batch_size": 8,
+        "actor_learning_rate": learning_rate,
+        "actor_lr_scheduler": "cosine_with_min_lr",
+        "init_kl_coef": 0.0,
+        "reference_kl_monitoring": True,
+        "postfill_cot_loss_schedule": {
+            "attacker": {
+                f"steps_1_to_{attacker_sft_stop_after_step}": 1.0,
+                f"steps_{attacker_sft_stop_after_step + 1}_onward": 0.0,
+            },
+            "defender": {
+                f"steps_1_to_{defender_sft_stop_after_step}": 1.0,
+                f"steps_{defender_sft_stop_after_step + 1}_onward": 0.0,
+            },
+        },
+        "attacker_sft": "/aux_sft/attacker_rewrite_1180.jsonl",
+        "defender_sft": [
+            "helpsteer3_8b_T_0.6_topp_0.9_wgclean_postfill_cot_15000",
+            "vanilla_benign_8b_T_0.6_topp_0.9_wgclean_postfill_cot_15000",
+        ],
+        "prompt_distribution": "50% vanilla harmful + 50% vanilla benign",
+        "reward_type": "general_sum",
+        "status": "starting_attacker",
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    output_vol.commit()
+
+    rm_url = _stable_wildguard_rm_url()
+    attacker_suffix = (
+        f"dynamic_r{lora_rank}a{lora_alpha}_{suffix}_"
+        f"A{steps_per_role}_sft{attacker_sft_stop_after_step}to0"
+    )
+    attacker_run_dir = train_upstream_attacker_lora_fixed_seed.remote(
+        remote_rm_url=rm_url,
+        steps=steps_per_role,
+        normal_prompt_mix=True,
+        normal_prompt_pool_size=0,
+        normal_prompt_pool_profile="balanced",
+        rollout_batch_size=128,
+        micro_rollout_batch_size=8,
+        micro_train_batch_size=8,
+        train_batch_size=32,
+        save_steps=steps_per_role,
+        actor_learning_rate=learning_rate,
+        init_kl_coef=0.0,
+        actor_lr_scheduler="cosine_with_min_lr",
+        enable_aux_sft=True,
+        upstream_invalid_handling=True,
+        base_model=LLAMA_ABLITERATED_MODEL,
+        attacker_init_adapter="",
+        attacker_prompt_profile="upstream",
+        strict_upstream_alignment=True,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        monitor_reference_kl=True,
+        postfill_cot_stop_after_step=attacker_sft_stop_after_step,
+        role_specific_aux_sft=True,
+        run_suffix=attacker_suffix,
+        train_role="attacker",
+    )
+    output_vol.reload()
+    attacker_checkpoint = (
+        Path(attacker_run_dir)
+        / "ckpt"
+        / f"global_step{steps_per_role}_hf"
+    )
+    if not attacker_checkpoint.is_dir():
+        raise RuntimeError(f"Missing attacker checkpoint: {attacker_checkpoint}")
+    manifest.update(
+        status="starting_defender",
+        attacker_run_dir=attacker_run_dir,
+        attacker_checkpoint=str(attacker_checkpoint),
+    )
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    output_vol.commit()
+
+    defender_suffix = (
+        f"dynamic_r{lora_rank}a{lora_alpha}_{suffix}_"
+        f"D{steps_per_role}_vs_A{steps_per_role}_"
+        f"sft{defender_sft_stop_after_step}to0"
+    )
+    defender_run_dir = train_upstream_attacker_lora_fixed_seed.remote(
+        remote_rm_url=rm_url,
+        steps=steps_per_role,
+        normal_prompt_mix=True,
+        normal_prompt_pool_size=0,
+        normal_prompt_pool_profile="balanced",
+        rollout_batch_size=128,
+        micro_rollout_batch_size=8,
+        micro_train_batch_size=8,
+        train_batch_size=32,
+        save_steps=steps_per_role,
+        actor_learning_rate=learning_rate,
+        init_kl_coef=0.0,
+        actor_lr_scheduler="cosine_with_min_lr",
+        enable_aux_sft=True,
+        upstream_invalid_handling=True,
+        base_model=LLAMA_ABLITERATED_MODEL,
+        attacker_init_adapter="",
+        attacker_prompt_profile="upstream",
+        run_suffix=defender_suffix,
+        train_role="defender",
+        fixed_attacker_adapter=str(attacker_checkpoint),
+        defender_prompt_profile="upstream",
+        strict_upstream_alignment=True,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        monitor_reference_kl=True,
+        postfill_cot_stop_after_step=defender_sft_stop_after_step,
+        role_specific_aux_sft=True,
+    )
+    output_vol.reload()
+    defender_checkpoint = (
+        Path(defender_run_dir)
+        / "ckpt"
+        / f"global_step{steps_per_role}_hf"
+    )
+    if not defender_checkpoint.is_dir():
+        raise RuntimeError(f"Missing defender checkpoint: {defender_checkpoint}")
+    manifest.update(
+        status="completed",
+        defender_run_dir=defender_run_dir,
+        defender_checkpoint=str(defender_checkpoint),
+    )
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    output_vol.commit()
+    return manifest
+
+
+@app.function(cpu=2, memory=8192, timeout=1800)
+def validate_dynamic_sft_dual_lora_configuration() -> dict[str, object]:
+    """Validate dynamic-SFT patches and mounted role data without a GPU."""
+    _prepare_role_lora_upstream(
+        attacker_prompt_profile="upstream",
+        strict_upstream_alignment=True,
+        dynamic_role_sft=True,
+    )
+    cli_source = (
+        UPSTREAM_WORK / "openrlhf/cli/train_ppo_ray.py"
+    ).read_text()
+    actor_source = (
+        UPSTREAM_WORK / "openrlhf/trainer/ray/ppo_actor.py"
+    ).read_text()
+    required_cli = (
+        "--monitor_reference_kl",
+        "args.init_kl_coef == 0 and not args.monitor_reference_kl",
+    )
+    required_actor = (
+        'attacker_role_sft = optimizer_train_role == "attacker"',
+        "effective_postfill_cot_loss_coef",
+        'status["postfill_cot_loss_coef_effective"]',
+    )
+    missing = [item for item in required_cli if item not in cli_source]
+    missing.extend(item for item in required_actor if item not in actor_source)
+    if missing:
+        raise RuntimeError(f"Dynamic LoRA patch validation failed: {missing}")
+    attacker_sft = Path("/aux_sft/attacker_rewrite_1180.jsonl")
+    if not attacker_sft.is_file():
+        raise FileNotFoundError(attacker_sft)
+    attacker_sft_rows = sum(1 for line in attacker_sft.open() if line.strip())
+    if attacker_sft_rows != 1180:
+        raise RuntimeError(
+            f"Expected 1180 attacker SFT rows, found {attacker_sft_rows}"
+        )
+    return {
+        "status": "validated",
+        "base_model": LLAMA_ABLITERATED_MODEL,
+        "lora_rank": 64,
+        "lora_alpha": 64,
+        "attacker_sft_rows": attacker_sft_rows,
+        "reference_kl_monitoring": True,
+        "kl_loss_coefficient": 0.0,
+        "attacker_sft_stop_after_step": 30,
+        "defender_sft_stop_after_step": 10,
+    }
+
+
 @app.local_entrypoint(name="isolated_quick_round")
 def isolated_quick_round(
     steps_per_role: int = 20,
@@ -3506,6 +3948,36 @@ def strict_upstream_aligned_role_round(
         run_suffix=suffix,
     )
     print(f"COORDINATOR_CALL_ID={call.object_id}", flush=True)
+
+
+@app.local_entrypoint(name="dynamic_sft_dual_lora_round")
+def dynamic_sft_dual_lora_round(
+    steps_per_role: int = 200,
+    attacker_sft_stop_after_step: int = 30,
+    defender_sft_stop_after_step: int = 10,
+    learning_rate: float = 1e-6,
+    lora_rank: int = 64,
+    lora_alpha: int = 64,
+    run_suffix: str = "",
+) -> None:
+    suffix = run_suffix or datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"RUN_SUFFIX={suffix}", flush=True)
+    call = train_dynamic_sft_dual_lora_round.spawn(
+        steps_per_role=steps_per_role,
+        attacker_sft_stop_after_step=attacker_sft_stop_after_step,
+        defender_sft_stop_after_step=defender_sft_stop_after_step,
+        learning_rate=learning_rate,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        run_suffix=suffix,
+    )
+    print(f"COORDINATOR_CALL_ID={call.object_id}", flush=True)
+
+
+@app.local_entrypoint(name="validate_dynamic_sft_dual_lora_configuration")
+def validate_dynamic_sft_dual_lora_configuration_entrypoint() -> None:
+    result = validate_dynamic_sft_dual_lora_configuration.remote()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 @app.local_entrypoint(name="upstream_attacker_lora_fixed_seed")
