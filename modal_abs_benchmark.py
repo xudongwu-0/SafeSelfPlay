@@ -56,11 +56,20 @@ OUTPUT_VOLUME_NAME = "roll-abs-benchmark-output"
 LOCAL_OUTPUT_DIR = "/home/xudong/work/self_play/checkpoints/roll_abs_benchmark"
 SELFPLAY_LOCAL = Path(__file__).resolve().parent.parent / "selfplay-redteaming"
 SELFPLAY_DATA_LOCAL = Path(__file__).resolve().parent.parent / "selfplay-redteaming" / "red_team" / "data"
+ATTACKER_AUX_SFT_LOCAL = (
+    Path(__file__).resolve().parent.parent
+    / "checkpoints"
+    / "abs_attacker_sft_runs"
+    / "abs_attacker_sft_qwen25_3b_lora_r32_1180_20260715_010540_retry1"
+    / "sft_train.cleaned.jsonl"
+)
+ATTACKER_AUX_SFT_REMOTE = "/aux_sft/attacker_rewrite_1180.jsonl"
 
 output_vol = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
 
 image = (
     roll_image.add_local_dir(str(SELFPLAY_DATA_LOCAL), "/redteam_data", copy=False)
+    .add_local_file(str(ATTACKER_AUX_SFT_LOCAL), ATTACKER_AUX_SFT_REMOTE, copy=False)
     .add_local_dir(
         str(SELFPLAY_LOCAL),
         "/selfplay-redteaming",
@@ -223,6 +232,41 @@ def _prepare_common_env() -> None:
         token_file.write_text(token)
 
 
+def _optimizer_profile_defaults(profile: str, train_role: str) -> dict[str, str]:
+    """Return source-aligned defaults without overriding explicit CLI values."""
+    normalized = (profile or "legacy_grpo").strip().lower().replace("-", "_")
+    if normalized in {"legacy", "legacy_grpo"}:
+        return {"name": "legacy_grpo"}
+    if normalized not in {"abs_repp", "selfredteam_repp"}:
+        raise ValueError(
+            "optimizer_profile must be one of: legacy_grpo, abs_repp, selfredteam_repp"
+        )
+
+    if normalized == "abs_repp":
+        role_lr = "1.0e-6" if train_role == "attacker" else "3.0e-6"
+        kl_coef = "0.3"
+    else:
+        role_lr = "5.0e-7"
+        kl_coef = "0.01"
+
+    return {
+        "name": normalized,
+        "actor_lr": role_lr,
+        "lr_scheduler_type": "cosine_with_min_lr",
+        "lr_scheduler_min_ratio": "0.1",
+        "warmup_steps": "0",
+        "warmup_ratio": "0.03",
+        "adv_estimator": "reinforce",
+        "reward_normalization_mode": "identity",
+        "whiten_advantages": "true",
+        "add_token_level_kl": "true",
+        "init_kl_coef": kl_coef,
+        "kl_loss_coef": "0.0",
+        "use_kl_loss": "false",
+        "lora_target": "q_proj,k_proj,v_proj,o_proj,up_proj,gate_proj,down_proj",
+    }
+
+
 def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]:
     logs_dir = f"{run_root}/logs"
     render_dir = f"{run_root}/render"
@@ -235,10 +279,30 @@ def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]
     psro_max_concurrent = int(os.environ.get("ABS_PSRO_MAX_CONCURRENT", "4"))
     psro_episodes_per_pair = int(os.environ.get("ABS_PSRO_EPISODES_PER_PAIR", "2" if smoke else "12"))
     exp_name = os.environ.get("ABS_EXP_NAME", "roll_abs_redteam_vanilla_3b_r32_s100")
-    actor_lr = os.environ.get("ABS_ACTOR_LR", "2.0e-6")
-    init_kl_coef = os.environ.get("ABS_INIT_KL_COEF", "0.3")
-    kl_loss_coef = os.environ.get("ABS_KL_LOSS_COEF", "0.3")
-    use_kl_loss = os.environ.get("ABS_USE_KL_LOSS", "true")
+    train_role = os.environ.get("ABS_TRAIN_ROLE", "").strip()
+    profile = _optimizer_profile_defaults(
+        os.environ.get("ABS_OPTIMIZER_PROFILE", "legacy_grpo"), train_role
+    )
+    actor_lr = os.environ.get("ABS_ACTOR_LR", profile.get("actor_lr", "2.0e-6"))
+    lr_scheduler_type = os.environ.get(
+        "ABS_LR_SCHEDULER_TYPE", profile.get("lr_scheduler_type", "")
+    ).strip()
+    warmup_steps = os.environ.get("ABS_WARMUP_STEPS", profile.get("warmup_steps", "")).strip()
+    warmup_ratio = profile.get("warmup_ratio", "")
+    adv_estimator = os.environ.get("ABS_ADV_ESTIMATOR", profile.get("adv_estimator", "")).strip()
+    reward_normalization_mode = os.environ.get(
+        "ABS_REWARD_NORMALIZATION_MODE", profile.get("reward_normalization_mode", "")
+    ).strip().lower()
+    whiten_advantages = os.environ.get(
+        "ABS_WHITEN_ADVANTAGES", profile.get("whiten_advantages", "")
+    ).strip().lower()
+    add_token_level_kl = os.environ.get(
+        "ABS_ADD_TOKEN_LEVEL_KL", profile.get("add_token_level_kl", "")
+    ).strip().lower()
+    init_kl_coef = os.environ.get("ABS_INIT_KL_COEF", profile.get("init_kl_coef", "0.3"))
+    kl_loss_coef = os.environ.get("ABS_KL_LOSS_COEF", profile.get("kl_loss_coef", "0.3"))
+    use_kl_loss = os.environ.get("ABS_USE_KL_LOSS", profile.get("use_kl_loss", "true"))
+    lora_target = profile.get("lora_target", "q_proj,k_proj,v_proj,o_proj")
     sequence_length = int(os.environ.get("ABS_SEQUENCE_LENGTH", "4096"))
     max_tokens_per_step = int(os.environ.get("ABS_MAX_TOKENS_PER_STEP", "1024"))
     max_new_tokens = int(os.environ.get("ABS_MAX_NEW_TOKENS", str(max_tokens_per_step)))
@@ -251,12 +315,25 @@ def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]
     env_monitor_interval = os.environ.get("ABS_ENV_MONITOR_INTERVAL", "").strip()
     rollout_get_batch_timeout = os.environ.get("ABS_ROLLOUT_GET_BATCH_TIMEOUT", "").strip()
     response_log_steps = int(os.environ.get("ABS_RESPONSE_LOG_STEPS", "10"))
+    filter_zero_variance_groups = os.environ.get("ABS_FILTER_ZERO_VARIANCE_GROUPS", "").strip().lower()
+    num_gpus_per_node = int(os.environ.get("ABS_NUM_GPUS_PER_NODE", "4"))
+    if num_gpus_per_node < 2:
+        raise ValueError("ABS_NUM_GPUS_PER_NODE must provide one train GPU and one rollout GPU")
+    train_devices = list(range(num_gpus_per_node - 1))
+    infer_devices = [num_gpus_per_node - 1]
+    aux_sft_path = os.environ.get("ABS_AUX_SFT_PATH", "").strip()
+    aux_sft_coef = os.environ.get("ABS_AUX_SFT_COEF", "0").strip()
+    aux_sft_micro_batch_size = os.environ.get("ABS_AUX_SFT_MICRO_BATCH_SIZE", "1").strip()
+    aux_sft_max_length = os.environ.get("ABS_AUX_SFT_MAX_LENGTH", "1536").strip()
     overrides = [
         f"exp_name={exp_name}",
         f"logging_dir={logs_dir}",
         f"output_dir={run_root}",
         f"checkpoint_config.output_dir={render_dir}",
         "track_with=wandb",
+        f"num_gpus_per_node={num_gpus_per_node}",
+        f"actor_train.device_mapping=\"{train_devices}\"",
+        f"actor_infer.device_mapping=\"{infer_devices}\"",
         f"max_steps={max_steps}",
         f"sequence_length={sequence_length}",
         f"max_tokens_per_step={max_tokens_per_step}",
@@ -267,6 +344,7 @@ def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]
         f"+response_log_steps={response_log_steps}",
         "eval_steps=0",
         f"save_steps={save_steps}",
+        f"+training_profile={profile['name']}",
         f"fsp_save_steps={fsp_save_interval}",
         "fsp_score_threshold=0.0",
         "fsp_score_timeout=50",
@@ -280,10 +358,73 @@ def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]
         "kl_loss_coef_end=-1.0",
         "actor_train.model_args.lora_rank=32",
         "actor_train.model_args.lora_alpha=32",
+        f"actor_train.model_args.lora_target=\"{lora_target}\"",
         "actor_infer.model_args.lora_rank=32",
         "actor_infer.model_args.lora_alpha=32",
+        f"actor_infer.model_args.lora_target=\"{lora_target}\"",
         f"actor_infer.strategy_args.strategy_config.max_loras={int(os.environ.get('ABS_MAX_LORAS', '8'))}",
+        f"aux_sft_coef={aux_sft_coef}",
+        f"aux_sft_micro_batch_size={aux_sft_micro_batch_size}",
+        f"aux_sft_max_length={aux_sft_max_length}",
     ]
+    if aux_sft_path:
+        overrides.append(f"aux_sft_path={aux_sft_path}")
+    if filter_zero_variance_groups in {"1", "true", "yes"}:
+        overrides.append("+filter_zero_variance_groups=true")
+    if lr_scheduler_type:
+        overrides.append(f"actor_train.training_args.lr_scheduler_type={lr_scheduler_type}")
+    if profile.get("lr_scheduler_min_ratio"):
+        min_lr = float(actor_lr) * float(profile["lr_scheduler_min_ratio"])
+        overrides.append(
+            f"++actor_train.training_args.lr_scheduler_kwargs.min_lr={min_lr}"
+        )
+    if warmup_steps:
+        overrides.append(f"actor_train.training_args.warmup_steps={warmup_steps}")
+    if warmup_ratio:
+        overrides.append(f"++actor_train.training_args.warmup_ratio={warmup_ratio}")
+    if adv_estimator:
+        overrides.append(f"adv_estimator={adv_estimator}")
+    if reward_normalization_mode:
+        if reward_normalization_mode == "identity":
+            overrides.extend(
+                [
+                    "++reward_normalization.grouping=batch",
+                    "++reward_normalization.method=identity",
+                    "++reward_normalization.norm_mean_type=null",
+                    "++reward_normalization.norm_std_type=null",
+                ]
+            )
+        elif reward_normalization_mode == "batch_mean_std":
+            overrides.extend(
+                [
+                    "++reward_normalization.grouping=batch",
+                    "++reward_normalization.norm_mean_type=batch",
+                    "++reward_normalization.norm_std_type=batch",
+                ]
+            )
+        else:
+            raise ValueError(
+                "ABS_REWARD_NORMALIZATION_MODE must be one of: identity, batch_mean_std"
+            )
+    if whiten_advantages in {"1", "true", "yes"}:
+        overrides.append("whiten_advantages=true")
+    elif whiten_advantages in {"0", "false", "no"}:
+        overrides.append("whiten_advantages=false")
+    if add_token_level_kl in {"1", "true", "yes"}:
+        overrides.append("++add_token_level_kl=true")
+    elif add_token_level_kl in {"0", "false", "no"}:
+        overrides.append("++add_token_level_kl=false")
+    if profile["name"] != "legacy_grpo":
+        overrides.extend(
+            [
+                "ppo_epochs=1",
+                "+gamma=1.0",
+                "+kl_penalty=kl",
+                "advantage_clip=null",
+                "+loss_agg_mode=seq-mean-token-mean",
+                "actor_train.training_args.weight_decay=0.0",
+            ]
+        )
     if async_generation_ratio:
         overrides.append(f"async_generation_ratio={async_generation_ratio}")
     if env_hung_timeout:
@@ -293,7 +434,6 @@ def _training_overrides(run_root: str, max_steps: int, smoke: bool) -> list[str]
     if rollout_get_batch_timeout:
         overrides.append(f"+rollout_get_batch_timeout={rollout_get_batch_timeout}")
 
-    train_role = os.environ.get("ABS_TRAIN_ROLE", "").strip()
     if train_role:
         overrides.append(f"custom_envs.RedTeamSafety.env_config.train_role={train_role}")
 
@@ -510,9 +650,9 @@ def check_wildguard_classifier() -> dict[str, Any]:
 
 @app.function(
     gpu=os.environ.get("ABS_TRAIN_GPU", "A100-40GB:4"),
-    cpu=48,
+    cpu=16,
     timeout=43200,
-    memory=131072,
+    memory=49152,
     volumes={"/root/.cache/huggingface": hf_cache, "/output": output_vol},
     secrets=[modal.Secret.from_name("roll-secrets")],
 )
@@ -552,13 +692,27 @@ def train_roll_psro(
     rollout_get_batch_timeout: int = 0,
     actor_infer_max_concurrency: int = 0,
     response_log_steps: int = 0,
+    num_gpus_per_node: int = 0,
+    optimizer_profile: str = "",
     actor_lr: str = "",
+    lr_scheduler_type: str = "",
+    warmup_steps: str = "",
+    adv_estimator: str = "",
+    reward_normalization_mode: str = "",
+    whiten_advantages: str = "",
+    add_token_level_kl: str = "",
     init_kl_coef: str = "",
     kl_loss_coef: str = "",
     use_kl_loss: str = "",
     fixed_sample_index: int = -1,
     fixed_seed_prompt: str = "",
     fixed_seed_label: str = "",
+    filter_zero_variance_groups: bool = False,
+    attacker_on_topic_weight: str = "",
+    aux_sft_path: str = "",
+    aux_sft_coef: float = 0.0,
+    aux_sft_micro_batch_size: int = 1,
+    aux_sft_max_length: int = 1536,
     include_init_as_enemy: bool = True,
 ) -> str:
     import subprocess
@@ -678,10 +832,63 @@ def train_roll_psro(
         os.environ["ABS_RESPONSE_LOG_STEPS"] = str(response_log_steps)
     else:
         os.environ.pop("ABS_RESPONSE_LOG_STEPS", None)
+    if num_gpus_per_node:
+        os.environ["ABS_NUM_GPUS_PER_NODE"] = str(num_gpus_per_node)
+    else:
+        os.environ.pop("ABS_NUM_GPUS_PER_NODE", None)
+    if optimizer_profile:
+        os.environ["ABS_OPTIMIZER_PROFILE"] = str(optimizer_profile)
+    else:
+        os.environ.pop("ABS_OPTIMIZER_PROFILE", None)
+    if filter_zero_variance_groups:
+        os.environ["ABS_FILTER_ZERO_VARIANCE_GROUPS"] = "true"
+    else:
+        os.environ.pop("ABS_FILTER_ZERO_VARIANCE_GROUPS", None)
+    if attacker_on_topic_weight:
+        os.environ["ABS_ATTACKER_ON_TOPIC_WEIGHT"] = str(attacker_on_topic_weight)
+    else:
+        os.environ.pop("ABS_ATTACKER_ON_TOPIC_WEIGHT", None)
+    if aux_sft_path and aux_sft_coef > 0:
+        os.environ["ABS_AUX_SFT_PATH"] = aux_sft_path
+        os.environ["ABS_AUX_SFT_COEF"] = str(aux_sft_coef)
+        os.environ["ABS_AUX_SFT_MICRO_BATCH_SIZE"] = str(aux_sft_micro_batch_size)
+        os.environ["ABS_AUX_SFT_MAX_LENGTH"] = str(aux_sft_max_length)
+    else:
+        for key in (
+            "ABS_AUX_SFT_PATH",
+            "ABS_AUX_SFT_COEF",
+            "ABS_AUX_SFT_MICRO_BATCH_SIZE",
+            "ABS_AUX_SFT_MAX_LENGTH",
+        ):
+            os.environ.pop(key, None)
     if actor_lr:
         os.environ["ABS_ACTOR_LR"] = str(actor_lr)
     else:
         os.environ.pop("ABS_ACTOR_LR", None)
+    if lr_scheduler_type:
+        os.environ["ABS_LR_SCHEDULER_TYPE"] = str(lr_scheduler_type)
+    else:
+        os.environ.pop("ABS_LR_SCHEDULER_TYPE", None)
+    if warmup_steps:
+        os.environ["ABS_WARMUP_STEPS"] = str(warmup_steps)
+    else:
+        os.environ.pop("ABS_WARMUP_STEPS", None)
+    if adv_estimator:
+        os.environ["ABS_ADV_ESTIMATOR"] = str(adv_estimator)
+    else:
+        os.environ.pop("ABS_ADV_ESTIMATOR", None)
+    if reward_normalization_mode:
+        os.environ["ABS_REWARD_NORMALIZATION_MODE"] = str(reward_normalization_mode)
+    else:
+        os.environ.pop("ABS_REWARD_NORMALIZATION_MODE", None)
+    if whiten_advantages:
+        os.environ["ABS_WHITEN_ADVANTAGES"] = str(whiten_advantages)
+    else:
+        os.environ.pop("ABS_WHITEN_ADVANTAGES", None)
+    if add_token_level_kl:
+        os.environ["ABS_ADD_TOKEN_LEVEL_KL"] = str(add_token_level_kl)
+    else:
+        os.environ.pop("ABS_ADD_TOKEN_LEVEL_KL", None)
     if init_kl_coef:
         os.environ["ABS_INIT_KL_COEF"] = str(init_kl_coef)
     else:
@@ -1238,8 +1445,13 @@ def _warmup_wildguard_endpoint(rm_url: str, max_attempts: int = 6) -> None:
         try:
             response = requests.post(rm_url, json=payload, timeout=600)
             if response.ok:
-                print(f"WildGuard reward warmup succeeded on attempt {attempt}: {rm_url}")
-                return
+                body = response.json()
+                labels = body.get("labels") if isinstance(body, dict) else None
+                if isinstance(labels, list) and labels:
+                    print(f"WildGuard reward warmup succeeded on attempt {attempt}: {rm_url}")
+                    return
+                last_error = f"200 with invalid payload: {str(body)[:500]}"
+                raise requests.RequestException(last_error)
             last_error = f"{response.status_code}: {response.text[:500]}"
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -1993,6 +2205,8 @@ def eval_ai2_safety(
     eval_suffix: str = "",
     eval_limit_samples: int = 5,
 ) -> str:
+    import hashlib
+    import shutil
     import subprocess
     import sys
 
@@ -2004,6 +2218,35 @@ def eval_ai2_safety(
     if checkpoint.exists() and not (checkpoint / "adapter_config.json").exists():
         raise FileNotFoundError(f"Expected PEFT adapter_config.json under {checkpoint_path}")
 
+    # PEFT saves named adapters below the shared checkpoint directory while
+    # keeping tokenizer assets in their parent.  safety-eval loads both the
+    # adapter and tokenizer from one path, so stage a self-contained copy.
+    model_path = checkpoint_path
+    if checkpoint.exists() and not (checkpoint / "tokenizer_config.json").exists():
+        tokenizer_parent = checkpoint.parent
+        if (tokenizer_parent / "tokenizer_config.json").exists():
+            digest = hashlib.sha1(checkpoint_path.encode("utf-8")).hexdigest()[:12]
+            staged_checkpoint = Path(f"/tmp/safety_eval_adapter_{digest}")
+            if staged_checkpoint.exists():
+                shutil.rmtree(staged_checkpoint)
+            shutil.copytree(checkpoint, staged_checkpoint)
+            tokenizer_files = (
+                "tokenizer_config.json",
+                "tokenizer.json",
+                "special_tokens_map.json",
+                "added_tokens.json",
+                "chat_template.jinja",
+                "vocab.json",
+                "merges.txt",
+                "config.json",
+                "generation_config.json",
+            )
+            for filename in tokenizer_files:
+                source = tokenizer_parent / filename
+                if source.exists():
+                    shutil.copy2(source, staged_checkpoint / filename)
+            model_path = str(staged_checkpoint)
+
     eval_dir = _eval_output_dir(checkpoint_path=checkpoint_path, eval_suffix=eval_suffix)
     eval_dir.mkdir(parents=True, exist_ok=True)
     report_path = str(eval_dir / ("report_limit.json" if limit else "report.json"))
@@ -2014,7 +2257,7 @@ def eval_ai2_safety(
         "evaluation/eval.py",
         "generators",
         "--model_name_or_path",
-        checkpoint_path,
+        model_path,
         "--model_input_template_path_or_name",
         "hf",
         "--tasks",
@@ -2045,6 +2288,7 @@ def main(
     mode: str = "smoke",
     max_steps: int = 100,
     checkpoint_path: str = "",
+    init_lora_path: str = "",
     initial_enemy_pool: str = "",
     limit_eval: bool = False,
     eval_limit_samples: int = 5,
@@ -2085,9 +2329,17 @@ def main(
     defender_checkpoint_path: str = "",
     train_role: str = "",
     actor_lr: str = "",
+    lr_scheduler_type: str = "",
+    warmup_steps: str = "",
     init_kl_coef: str = "",
     kl_loss_coef: str = "",
     use_kl_loss: str = "",
+    whiten_advantages: str = "",
+    fixed_seed_prompt: str = "",
+    fixed_seed_label: str = "",
+    filter_zero_variance_groups: bool = False,
+    aux_sft_path: str = "",
+    aux_sft_coef: float = 0.0,
     payoff_attacker_paths: str = "",
     payoff_defender_paths: str = "",
     payoff_attacker_labels: str = "",
@@ -2172,6 +2424,7 @@ def main(
             smoke=False,
             reward_backend="wildguard_remote",
             remote_rm_url=rm_url,
+            init_lora_path=init_lora_path,
             train_role=train_role,
             disable_inner_psro=disable_inner_psro,
             skip_final_arena=skip_final_arena,
@@ -2198,9 +2451,17 @@ def main(
             rollout_get_batch_timeout=rollout_get_batch_timeout,
             actor_infer_max_concurrency=actor_infer_max_concurrency,
             actor_lr=actor_lr,
+            lr_scheduler_type=lr_scheduler_type,
+            warmup_steps=warmup_steps,
             init_kl_coef=init_kl_coef,
             kl_loss_coef=kl_loss_coef,
             use_kl_loss=use_kl_loss,
+            whiten_advantages=whiten_advantages,
+            fixed_seed_prompt=fixed_seed_prompt,
+            fixed_seed_label=fixed_seed_label,
+            filter_zero_variance_groups=filter_zero_variance_groups,
+            aux_sft_path=aux_sft_path,
+            aux_sft_coef=aux_sft_coef,
         )
         print(f"Training checkpoint: {ckpt}")
         if download:

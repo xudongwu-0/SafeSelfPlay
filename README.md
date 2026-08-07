@@ -61,17 +61,36 @@ Check access to the gated WildGuard assets:
 modal run modal_abs_benchmark.py --mode check-token
 ```
 
-Run the main long-GPU PSRO loop from an SFT attacker and a base defender:
+Run the canonical A10Gx4 entrypoint. It calls the same direct Modal training
+function used by the completed A10Gx4 probes, uses the Self-RedTeam
+optimization pipeline, and trains the attacker and defender as separate
+ABS-style LoRA policies:
 
 ```bash
-ABS_TRAIN_GPU=A10G:4 modal run -d modal_sft_base_psro_once.py::sft_base_psro_long \
-  --iterations 5 \
-  --role-steps 50 \
-  --payoff-episodes-per-pair 12
+ITERATIONS=1 ./run_selfredteam_abs_a10g4.sh
 ```
 
-For the cold-start ABS-style PSRO protocol and comparable vanilla baseline, see
-`ABS_PSRO_README.md`.
+Each iteration is `A50 -> D50 -> cached payoff update`. Set `ITERATIONS=5` for
+the full five-round PSRO run. The script fixes the known-good A10Gx4 resource
+and batch topology so experiments do not accidentally use a different Modal
+function or training profile. For the full protocol and comparable vanilla
+baseline, see `ABS_PSRO_README.md`.
+
+For a compute-efficient check that both independent policies receive a useful
+learning signal, run the validated short sequential probe:
+
+```bash
+./run_upstream_normalmix_one_round_a10g4.sh
+```
+
+This probe trains `A1` for five updates from the attacker SFT initialization,
+then trains `D1` for two updates from the base model against the frozen `A1`.
+It uses the upstream Self-RedTeam `general_sum` reward unchanged. Harmful-only
+seed allocation is used for the short attacker phase; the defender phase uses
+balanced harmful/benign seeds and label-balanced replay. Checkpoints are saved
+only at role boundaries. Override `ATTACKER_STEPS`, `DEFENDER_STEPS`, or
+`ROLLOUT_BATCH_SIZE` for diagnostics. This is a learning-signal probe, not a
+replacement for the full `A50 -> D50` PSRO comparison.
 
 ---
 
