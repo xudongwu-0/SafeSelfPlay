@@ -3126,11 +3126,14 @@ def train_upstream_attacker_lora_fixed_seed(
             ["--fixed_opponent_lora_path", compatible_fixed_attacker]
         )
 
-    memory_args = (
-        []
-        if strict_upstream_alignment
-        else ["--adam_offload", "--gradient_checkpointing_use_reentrant"]
-    )
+    # ZeRO-3 releases base tensors between LoRA forward/backward passes. The
+    # non-reentrant checkpoint implementation then compares gathered forward
+    # tensors with empty ZeRO shards during recomputation and aborts before the
+    # first optimizer step. Reentrant checkpointing is required for both strict
+    # and experimental LoRA paths; Adam offload remains experimental-only.
+    memory_args = ["--gradient_checkpointing_use_reentrant"]
+    if not strict_upstream_alignment:
+        memory_args.insert(0, "--adam_offload")
     eval_args = (
         [
             "--eval_data",
