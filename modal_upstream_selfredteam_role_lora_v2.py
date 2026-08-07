@@ -185,6 +185,66 @@ def _patch_wandb_run_identity() -> None:
     )
 
 
+def _patch_linear_cot_format_parser() -> None:
+    """Avoid pathological regex backtracking on malformed long generations."""
+    utils_path = UPSTREAM_WORK / "red_team/utils.py"
+    source = utils_path.read_text()
+    start = source.index("def cot_format_check_and_extract(response: str)")
+    end = source.index("\ndef get_redteaming_game_reward_zero_sum", start)
+    replacement = '''def cot_format_check_and_extract(response: str) -> Tuple[str, bool]:
+    """Extract Self-RedTeam tags in linear time.
+
+    This preserves the upstream parser's return values and validation rules.
+    The upstream regex has overlapping ``\\s*``/``.*?`` quantifiers and can
+    backtrack for minutes when a long generation omits ``</think>``.
+    """
+    think_close = "</think>"
+    answer_open = "<answer>"
+    answer_close = "</answer>"
+
+    think_end_pos = response.find(think_close)
+    answer_start_pos = response.find(answer_open)
+    answer_end_pos = (
+        response.find(answer_close, answer_start_pos + len(answer_open))
+        if answer_start_pos >= 0
+        else -1
+    )
+    answer = (
+        response[answer_start_pos + len(answer_open):answer_end_pos].strip()
+        if answer_start_pos >= 0 and answer_end_pos >= 0
+        else None
+    )
+
+    # Match the upstream fallback: retain a parseable answer, otherwise the
+    # original response, while marking malformed output as invalid.
+    if think_end_pos < 0 or answer is None:
+        return (None, answer if answer is not None else response), True
+
+    thinking = response[:think_end_pos].strip()
+    if "<think>" in response:
+        return (None, answer), True
+    if not thinking or not answer:
+        return (None, answer), True
+    if (
+        response.count(think_close) != 1
+        or response.count(answer_open) != 1
+        or response.count(answer_close) != 1
+    ):
+        return (None, answer), True
+    if not (0 < think_end_pos < answer_start_pos < answer_end_pos):
+        return (None, answer), True
+    if response[think_end_pos + len(think_close):answer_start_pos].strip():
+        return (None, answer), True
+    if not response.strip().endswith(answer_close):
+        return (None, answer), True
+    if response[answer_end_pos + len(answer_close):].strip():
+        return (thinking, answer), True
+    return (thinking, answer), False
+
+'''
+    utils_path.write_text(source[:start] + replacement + source[end + 1:])
+
+
 def _patch_reference_kl_monitoring() -> None:
     """Keep the base reference for metrics while its loss coefficient is zero."""
     cli_path = UPSTREAM_WORK / "openrlhf/cli/train_ppo_ray.py"
@@ -570,6 +630,7 @@ def _patch_llamafactory_lora_initialization() -> None:
 def _prepare_lora_v2_upstream() -> None:
     """Prepare a clean upstream tree without the legacy LoRA interface."""
     _prepare_upstream_source()
+    _patch_linear_cot_format_parser()
     _patch_upstream_vllm_version_check()
     _patch_upstream_sft_chat_template()
     _patch_upstream_sft_micro_batch_floor()
@@ -917,16 +978,23 @@ def validate_lora_v2_configuration() -> dict[str, object]:
     ).read_text()
     actor_model_source = (UPSTREAM_WORK / "openrlhf/models/actor.py").read_text()
     cli_source = (UPSTREAM_WORK / "openrlhf/cli/train_ppo_ray.py").read_text()
+    red_team_utils_source = (UPSTREAM_WORK / "red_team/utils.py").read_text()
     required = (
         "llamafactory_init_adapter",
         "FinetuningArguments(",
+        "Extract Self-RedTeam tags in linear time",
         "LoRA v2 synchronized",
         "module.get_delta_weight(adapter_name)",
         "needs_initial_sync",
         "fixed_defender_vllm_gpu_memory_utilization",
         "postfill_cot_stop_after_step",
     )
-    combined = actor_source + actor_model_source + cli_source
+    combined = (
+        actor_source
+        + actor_model_source
+        + cli_source
+        + red_team_utils_source
+    )
     missing = [item for item in required if item not in combined]
     forbidden = (
         "update_lora_weight_cuda_ipc",
