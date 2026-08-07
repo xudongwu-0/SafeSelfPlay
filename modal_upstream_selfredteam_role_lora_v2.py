@@ -195,7 +195,8 @@ def _patch_linear_cot_format_parser() -> None:
     """Extract Self-RedTeam tags in linear time.
 
     This preserves the upstream parser's return values and validation rules.
-    The upstream regex has overlapping ``\\s*``/``.*?`` quantifiers and can
+    The upstream regex has overlapping whitespace and lazy wildcard
+    quantifiers and can
     backtrack for minutes when a long generation omits ``</think>``.
     """
     think_close = "</think>"
