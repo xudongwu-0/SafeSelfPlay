@@ -645,6 +645,9 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
             replay_source = (
                 upstream / "openrlhf/trainer/ppo_utils/replay_buffer.py"
             ).read_text()
+            dataset_source = (
+                upstream / "openrlhf/datasets/prompts_dataset.py"
+            ).read_text()
             actor_source = (
                 upstream / "openrlhf/trainer/ray/ppo_actor.py"
             ).read_text()
@@ -793,19 +796,92 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
     def test_defender_metrics_use_actual_wildguard_prompt_strata(self):
         source = ROLE_MODULE.read_text(encoding="utf-8")
         self.assertIn(
-            'item.info.get("wildguard_prompt_harmfulness") == "harmful"',
+            'item.info.get("actual_prompt_harmfulness") == "harmful"',
             source,
         )
         self.assertIn(
-            'item.info.get("wildguard_prompt_harmfulness") == "unharmful"',
+            'item.info.get("actual_prompt_harmfulness") == "unharmful"',
             source,
         )
         self.assertIn(
-            "defender/wildguard_actual_benign_compliance_acc", source
+            "defender/wildguard_actual_harmful_joint_success", source
         )
         self.assertIn(
-            "true benign compliance is deferred to the final", source
+            "defender/wildguard_actual_benign_joint_success", source
         )
+        self.assertIn(
+            "only the disjoint paired-1024 gate authorizes A2", source
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            upstream = Path(directory)
+            replay = upstream / "openrlhf/trainer/ppo_utils/replay_buffer.py"
+            replay.parent.mkdir(parents=True)
+            shutil.copyfile(
+                UPSTREAM_ROOT
+                / "openrlhf/trainer/ppo_utils/replay_buffer.py",
+                replay,
+            )
+            namespace = {"Path": Path, "UPSTREAM_WORK": upstream}
+            _load_functions(
+                {"_replace_once", "_patch_upstream_defender_metric_keys"},
+                namespace,
+            )
+            namespace["_patch_upstream_defender_metric_keys"]()
+            generated = replay.read_text()
+        self.assertIn(
+            "actual_strata_accounting[\"joint_success_harmful\"]",
+            generated,
+        )
+        self.assertIn(
+            "defender/actual_harmful_attack_success_rate", generated
+        )
+        self.assertIn("defender/replay_actual_harmful_count", generated)
+        replay_tree = ast.parse(generated)
+        replay_class = next(
+            node for node in replay_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "NaiveReplayBuffer"
+        )
+        metrics_method = next(
+            node for node in replay_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_compute_defender_metrics"
+        )
+        joint_metric = next(
+            copy.deepcopy(node) for node in ast.walk(metrics_method)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "joint_success"
+        )
+        metric_outcomes = SimpleNamespace(
+            DEFENDER_WIN_CORRECT_REFUSAL=object(),
+            DEFENDER_WIN_SUCCESSFUL_DEFENSE=object(),
+            TIE=object(),
+        )
+        metric_namespace = {"GameOutcome": metric_outcomes}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[joint_metric], type_ignores=[])
+                ),
+                "<joint-metric>",
+                "exec",
+            ),
+            metric_namespace,
+        )
+        benign_missing_refusal = SimpleNamespace(
+            info={
+                "game_outcomes": {
+                    metric_outcomes.DEFENDER_WIN_CORRECT_REFUSAL,
+                    metric_outcomes.DEFENDER_WIN_SUCCESSFUL_DEFENSE,
+                    metric_outcomes.TIE,
+                },
+                "cot_format_violation": False,
+            }
+        )
+        self.assertFalse(
+            metric_namespace["joint_success"](benign_missing_refusal)
+        )
+        compile(generated, str(replay), "exec")
 
     def test_scheduler_patch_contains_constant_with_warmup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -856,6 +932,7 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
                 "defender_sft_optimizer_slots_per_rollout": 4,
             },
             advantage_estimator="reinforce",
+            gamma=1.0,
             init_kl_coef=0.0,
             no_advantage_std_norm=False,
         )
@@ -891,6 +968,7 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
         )
         for field, value, message in (
             ("advantage_estimator", "gae", "advantage_estimator"),
+            ("gamma", 0.99, "gamma=1.0"),
             ("init_kl_coef", 0.01, "init_kl_coef"),
         ):
             invalid_args = SimpleNamespace(**vars(raw_args))
@@ -910,15 +988,13 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
             transform_mode(no_fixed_dose, "defender")
 
         raw_branch = source[
-            source.index(
-                "if advantage_transform_mode == 'raw_defender_reinforce':"
-            ) : source.index(
+            source.index("if advantage_transform_mode in (") : source.index(
                 "elif optimizer_train_role == 'attacker' or no_defender_turn:"
             )
         ]
         self.assertNotIn("replay_buffer.normalize", raw_branch)
         self.assertIn("post_transform_metrics", raw_branch)
-        self.assertIn("float(status[pre_key]) != float(post_value)", raw_branch)
+        self.assertIn("math.isclose(", raw_branch)
         self.assertIn(
             'debug/defender_advantage_mean_centering_applied', raw_branch
         )
@@ -973,6 +1049,687 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
 
         self.assertGreater(ppo_update_direction(math.sqrt(3)), 0.0)
         self.assertLess(ppo_update_direction(-1.0), 0.0)
+
+    def test_joint_signed_defender_reward_and_advantage_contract(self):
+        runtime_helpers: dict[str, object] = {}
+        _load_functions(
+            {"_validate_defender_joint_runtime_configuration"},
+            runtime_helpers,
+        )
+        validate_runtime = runtime_helpers[
+            "_validate_defender_joint_runtime_configuration"
+        ]
+        valid_runtime = {
+            "v2_runtime": True,
+            "fixed_attacker_adapter": "/ckpt/A1",
+            "exact_fixed_attack_text": False,
+        }
+        validate_runtime(
+            "raw_no_center",
+            v2_runtime=False,
+            fixed_attacker_adapter="",
+            exact_fixed_attack_text=True,
+        )
+        validate_runtime("joint_signed", **valid_runtime)
+        with self.assertRaisesRegex(ValueError, "v2_runtime=True"):
+            validate_runtime(
+                "joint_signed", **{**valid_runtime, "v2_runtime": False}
+            )
+        with self.assertRaisesRegex(ValueError, "non-empty frozen A1"):
+            validate_runtime(
+                "joint_signed",
+                **{**valid_runtime, "fixed_attacker_adapter": "  "},
+            )
+        with self.assertRaisesRegex(ValueError, "exact_fixed_attack_text=False"):
+            validate_runtime(
+                "joint_signed",
+                **{**valid_runtime, "exact_fixed_attack_text": True},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            upstream = Path(directory)
+            relative_sources = (
+                "openrlhf/trainer/ray/ppo_actor.py",
+                "openrlhf/trainer/ppo_utils/replay_buffer.py",
+                "openrlhf/trainer/ppo_utils/language_game.py",
+                "openrlhf/datasets/prompts_dataset.py",
+            )
+            for relative_source in relative_sources:
+                destination = upstream / relative_source
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(UPSTREAM_ROOT / relative_source, destination)
+            namespace = {"Path": Path, "UPSTREAM_WORK": upstream}
+            _load_functions(
+                {
+                    "_replace_once",
+                    "_patch_upstream_fixed_attacker_lora",
+                    "_patch_upstream_role_advantage_normalization",
+                },
+                namespace,
+            )
+            _load_path_functions(
+                FIXED_MODULE,
+                {"_patch_upstream_attacker_only_sampling"},
+                namespace,
+            )
+            namespace["_patch_upstream_attacker_only_sampling"]()
+            namespace["_patch_upstream_fixed_attacker_lora"]()
+            namespace["_patch_upstream_role_advantage_normalization"]()
+            actor_source = (
+                upstream / "openrlhf/trainer/ray/ppo_actor.py"
+            ).read_text()
+            game_source = (
+                upstream / "openrlhf/trainer/ppo_utils/language_game.py"
+            ).read_text()
+            replay_source = (
+                upstream / "openrlhf/trainer/ppo_utils/replay_buffer.py"
+            ).read_text()
+            dataset_source = (
+                upstream / "openrlhf/datasets/prompts_dataset.py"
+            ).read_text()
+
+        outcome = SimpleNamespace(
+            DEFENDER_WIN_CORRECT_REFUSAL=object(),
+            DEFENDER_WIN_SUCCESSFUL_DEFENSE=object(),
+            TIE=object(),
+        )
+        import os
+        import unicodedata
+
+        game_helpers: dict[str, object] = {
+            "GameOutcome": outcome,
+            "hashlib": hashlib,
+            "json": json,
+            "os": os,
+            "re": re,
+            "unicodedata": unicodedata,
+        }
+        _load_source_functions(
+            game_source,
+            {
+                "_fixed_defender_actual_stratum",
+                "_defender_joint_signed_reward",
+                "_fixed_defender_exposure_record",
+                "_append_fixed_defender_exposure_records",
+            },
+            game_helpers,
+        )
+        route = game_helpers["_fixed_defender_actual_stratum"]
+        joint_reward = game_helpers["_defender_joint_signed_reward"]
+        exposure_record = game_helpers["_fixed_defender_exposure_record"]
+        append_exposure = game_helpers[
+            "_append_fixed_defender_exposure_records"
+        ]
+
+        self.assertEqual(
+            route(
+                "generated_harmful",
+                True,
+                False,
+                {"prompt_harmfulness": "harmful"},
+            ),
+            ("harmful", None),
+        )
+        self.assertEqual(
+            route(
+                "vanilla_benign",
+                False,
+                True,
+                {"prompt_harmfulness": "unharmful"},
+            ),
+            ("benign", None),
+        )
+        self.assertEqual(
+            route(
+                "generated_harmful",
+                True,
+                False,
+                {"prompt_harmfulness": "unharmful"},
+            ),
+            ("harmful", "label_mismatch"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "rewritten by frozen A"):
+            route(
+                "vanilla_benign",
+                True,
+                False,
+                {"prompt_harmfulness": "unharmful"},
+            )
+
+        correct = outcome.DEFENDER_WIN_CORRECT_REFUSAL
+        harmless = outcome.DEFENDER_WIN_SUCCESSFUL_DEFENSE
+        # Blanket refusal on direct B is harmless but not the correct action.
+        self.assertEqual(joint_reward({harmless}, False), (-1.0, False))
+        self.assertEqual(
+            joint_reward({correct, harmless}, False), (1.0, True)
+        )
+        self.assertEqual(
+            joint_reward({correct, harmless}, True), (-1.0, False)
+        )
+        # Upstream labels an actual-B refusal=None as CORRECT_REFUSAL+TIE;
+        # formal joint utility requires explicit compliance, never a tie.
+        self.assertEqual(
+            joint_reward({correct, harmless, outcome.TIE}, False),
+            (-1.0, False),
+        )
+        with self.assertRaisesRegex(RuntimeError, "explicit boolean"):
+            joint_reward({correct, harmless}, None)
+        self.assertIn(
+            "turn_states.get('cot_format_violation', None)",
+            game_source,
+        )
+        self.assertNotIn(
+            "turn_states.get('cot_format_violation', False),\n"
+            "                        )\n"
+            "                    )\n"
+            "                    turn_states['defender_joint_success']",
+            game_source,
+        )
+
+        pool_sha = "a" * 64
+        record = exposure_record(
+            "  A1\u3000generated   request  ",
+            "generated_harmful",
+            "harmful",
+            {"prompt_harmfulness": "unharmful"},
+            "label_mismatch",
+            pool_sha,
+        )
+        expected_canonical = "A1 generated request"
+        self.assertEqual(
+            record["canonical_request_sha256"],
+            hashlib.sha256(expected_canonical.encode()).hexdigest(),
+        )
+        self.assertEqual(record["drop_reason"], "label_mismatch")
+        self.assertNotIn("request", record)
+        with tempfile.TemporaryDirectory() as ledger_root:
+            strategy = SimpleNamespace(
+                args=SimpleNamespace(ckpt_path=ledger_root),
+                get_rank=lambda: 2,
+            )
+            ledger_path = Path(append_exposure(strategy, [record]))
+            self.assertEqual(ledger_path.name, "rank_02.jsonl")
+            observed = json.loads(ledger_path.read_text().strip())
+            self.assertEqual(observed, record)
+
+        exposure_validator_namespace = {
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+            "re": re,
+        }
+        _load_functions(
+            {"_validate_defender_actual_request_exposure"},
+            exposure_validator_namespace,
+        )
+        validate_exposure = exposure_validator_namespace[
+            "_validate_defender_actual_request_exposure"
+        ]
+        with tempfile.TemporaryDirectory() as checkpoint_root:
+            checkpoint = Path(checkpoint_root)
+            ledger_dir = checkpoint / "actual_request_exposure"
+            ledger_dir.mkdir()
+            harmful_record = exposure_record(
+                "unique harmful request",
+                "generated_harmful",
+                "harmful",
+                {"prompt_harmfulness": "harmful"},
+                None,
+                pool_sha,
+            )
+            benign_record = exposure_record(
+                "unique benign request",
+                "vanilla_benign",
+                "benign",
+                {"prompt_harmfulness": "unharmful"},
+                None,
+                pool_sha,
+            )
+            (ledger_dir / "rank_00.jsonl").write_text(
+                json.dumps(harmful_record) + "\n"
+            )
+            (ledger_dir / "rank_01.jsonl").write_text(
+                json.dumps(benign_record) + "\n"
+            )
+            validation = validate_exposure(
+                checkpoint,
+                expected_prompt_pool_sha256=pool_sha,
+                expected_rollouts=1,
+                rollout_batch_size=2,
+                expected_ranks=2,
+            )
+            self.assertEqual(validation["cross_stratum_overlap"], 0)
+            self.assertEqual(
+                validation["strata"]["harmful"]["occurrences"], 1
+            )
+            (ledger_dir / "rank_01.jsonl").unlink()
+            with self.assertRaisesRegex(RuntimeError, "rank files drifted"):
+                validate_exposure(
+                    checkpoint,
+                    expected_prompt_pool_sha256=pool_sha,
+                    expected_rollouts=1,
+                    rollout_batch_size=2,
+                    expected_ranks=2,
+                )
+        self.assertIn(
+            "attacker rewrite heuristics cannot override its utility",
+            game_source,
+        )
+        self.assertIn(
+            'joint_signed requires upstream_invalid_handling=True',
+            ROLE_MODULE.read_text(),
+        )
+
+        actor_helpers: dict[str, object] = {"math": math}
+        _load_source_functions(
+            actor_source,
+            {"_role_advantage_transform_mode"},
+            actor_helpers,
+        )
+        joint_args = SimpleNamespace(
+            custom_configs={
+                "defender_raw_reinforce_advantages": True,
+                "defender_sft_optimizer_slots_per_rollout": 4,
+                "defender_reinforce_advantage_mode": "joint_signed",
+                "defender_reward_utility": "joint_signed",
+                "defender_actual_strata_required": True,
+                "defender_episode_sum_policy_loss": True,
+                "defender_episode_sum_loss_scale": 1.0 / 2048.0,
+            },
+            advantage_estimator="reinforce",
+            gamma=1.0,
+            init_kl_coef=0.0,
+            generate_max_len=2048,
+            packing_samples=True,
+            actor_loss_coef=1.0,
+            reward_clip_range=(-1.0, 1.0),
+            use_kl_loss=False,
+        )
+        self.assertEqual(
+            actor_helpers["_role_advantage_transform_mode"](
+                joint_args, "defender"
+            ),
+            "joint_signed_defender_reinforce",
+        )
+        for field, value in (
+            ("generate_max_len", 1024),
+            ("packing_samples", False),
+            ("actor_loss_coef", 0.5),
+            ("reward_clip_range", (-10.0, 10.0)),
+            ("use_kl_loss", True),
+        ):
+            drifted = SimpleNamespace(**vars(joint_args))
+            setattr(drifted, field, value)
+            with self.subTest(runtime_field=field), self.assertRaisesRegex(
+                RuntimeError, "runtime contract drifted"
+            ):
+                actor_helpers["_role_advantage_transform_mode"](
+                    drifted, "defender"
+                )
+        joint_branch = actor_source[
+            actor_source.index("if advantage_transform_mode in (") :
+            actor_source.index(
+                "elif optimizer_train_role == 'attacker' or no_defender_turn:"
+            )
+        ]
+        self.assertNotIn("replay_buffer.normalize", joint_branch)
+        self.assertIn("reward_value not in (", joint_branch)
+        self.assertIn("item_advantages", joint_branch)
+        self.assertIn("defender_episode_sum_policy_loss", actor_source)
+        role_source = ROLE_MODULE.read_text(encoding="utf-8")
+        self.assertIn(
+            '["--gamma", str(DEFENDER_V2_REINFORCE_GAMMA)]',
+            role_source,
+        )
+        self.assertIn(
+            '["--reward_clip_range", "-1.0", "1.0"]',
+            role_source,
+        )
+        self.assertIn("not deterministic_defender_pool", actor_source)
+        self.assertIn(
+            "joint-signed defender failures survive legacy tie removal",
+            ROLE_MODULE.read_text(),
+        )
+        self.assertIn("preserve_joint_signed_defender_failures", replay_source)
+
+        dataset_tree = ast.parse(dataset_source)
+        dataset_class = next(
+            node for node in dataset_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "RedTeamGamePromptDataset"
+        )
+        mark_method = next(
+            copy.deepcopy(node) for node in dataset_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_mark_prompts_to_generate"
+        )
+        harness = ast.fix_missing_locations(
+            ast.Module(
+                body=[
+                    ast.ClassDef(
+                        name="DatasetHarness",
+                        bases=[],
+                        keywords=[],
+                        body=[mark_method],
+                        decorator_list=[],
+                    )
+                ],
+                type_ignores=[],
+            )
+        )
+        dataset_namespace: dict[str, object] = {}
+        exec(compile(harness, "<dataset-harness>", "exec"), dataset_namespace)
+
+        class FakeStrategy:
+            args = SimpleNamespace(seed=7)
+
+            @staticmethod
+            def print(*_args, **_kwargs):
+                return None
+
+        dataset = object.__new__(dataset_namespace["DatasetHarness"])
+        dataset.labels = [
+            "vanilla_harmful", "vanilla_harmful",
+            "vanilla_benign", "vanilla_benign",
+            "vanilla_benign", "vanilla_benign",
+            "vanilla_harmful", "vanilla_harmful",
+        ]
+        dataset.prompts = list(range(8))
+        dataset.custom_configs = {
+            "fixed_opponent_generate_all_prompts": True,
+            "fixed_opponent_generated_harmful_fraction": 1.0,
+            "fixed_opponent_generated_benign_fraction": 0.0,
+            "defender_actual_strata_required": True,
+            "defender_deterministic_prompt_pool": True,
+        }
+        dataset._mark_prompts_to_generate(FakeStrategy())
+        self.assertEqual(
+            dataset.labels,
+            [
+                "generated_harmful", "generated_harmful",
+                "vanilla_benign", "vanilla_benign",
+                "vanilla_benign", "vanilla_benign",
+                "generated_harmful", "generated_harmful",
+            ],
+        )
+        compile(actor_source, str(UPSTREAM_ACTOR), "exec")
+        compile(game_source, "<language-game>", "exec")
+        compile(replay_source, "<replay-buffer>", "exec")
+
+    def test_defender_episode_sum_ppo_uses_fixed_length_independent_scale(self):
+        try:
+            import torch
+        except ImportError:  # Local unit-test image is intentionally CPU-light.
+            torch = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            upstream = Path(directory)
+            actor = upstream / "openrlhf/trainer/ray/ppo_actor.py"
+            actor.parent.mkdir(parents=True)
+            actor.write_text(UPSTREAM_ACTOR.read_text())
+            namespace = {"Path": Path, "UPSTREAM_WORK": upstream}
+            _load_functions(
+                {
+                    "_replace_once",
+                    "_patch_upstream_role_advantage_normalization",
+                },
+                namespace,
+            )
+            namespace["_patch_upstream_role_advantage_normalization"]()
+            actor_source = actor.read_text()
+
+        self.assertIn("torch.split(", actor_source)
+        self.assertIn("(token_loss * active_mask).sum(dim=-1).mean()", actor_source)
+        self.assertIn("* loss_scale", actor_source)
+        scale = 1.0 / 2048.0
+
+        def scalar_reference(token_losses, action_counts):
+            self.assertEqual(sum(action_counts), len(token_losses))
+            offset = 0
+            totals = []
+            for count in action_counts:
+                totals.append(sum(token_losses[offset : offset + count]))
+                offset += count
+            return sum(totals) / len(totals) * scale
+
+        self.assertAlmostEqual(
+            scalar_reference([-1.0, -1.0, 1.0, 1.0, 1.0, 1.0], [2, 4]),
+            scale,
+            places=12,
+        )
+        self.assertAlmostEqual(scalar_reference([-1.0], [1]), -scale)
+        self.assertAlmostEqual(
+            scalar_reference([-1.0] * 4, [4]), -4 * scale
+        )
+        if torch is None:
+            return
+
+        helpers = {"torch": torch, "math": math}
+        _load_source_functions(
+            actor_source,
+            {"_defender_episode_sum_policy_loss"},
+            helpers,
+        )
+        loss_fn = helpers["_defender_episode_sum_policy_loss"]
+        log_probs = torch.zeros((2, 4))
+        old_log_probs = torch.zeros_like(log_probs)
+        advantages = torch.tensor(
+            [[1.0, 1.0, 0.0, 0.0], [-1.0, -1.0, -1.0, -1.0]]
+        )
+        mask = torch.tensor(
+            [[True, True, False, False], [True, True, True, True]]
+        )
+        nonpacked = loss_fn(
+            log_probs,
+            old_log_probs,
+            advantages,
+            mask,
+            clip_eps=0.2,
+            packing_samples=False,
+            num_actions=4,
+            loss_scale=scale,
+        )
+        # Per-trajectory sums are -2 and +4; batch mean is +1.
+        self.assertAlmostEqual(nonpacked.item(), scale, places=10)
+        packed = loss_fn(
+            torch.zeros((1, 6)),
+            torch.zeros((1, 6)),
+            torch.tensor([[1.0, 1.0, -1.0, -1.0, -1.0, -1.0]]),
+            None,
+            clip_eps=0.2,
+            packing_samples=True,
+            num_actions=[2, 4],
+            loss_scale=scale,
+        )
+        self.assertAlmostEqual(packed.item(), scale, places=10)
+
+        short_positive = loss_fn(
+            torch.zeros((1, 1)),
+            torch.zeros((1, 1)),
+            torch.ones((1, 1)),
+            torch.ones((1, 1), dtype=torch.bool),
+            clip_eps=0.2,
+            packing_samples=False,
+            num_actions=1,
+            loss_scale=scale,
+        )
+        long_positive = loss_fn(
+            torch.zeros((1, 4)),
+            torch.zeros((1, 4)),
+            torch.ones((1, 4)),
+            torch.ones((1, 4), dtype=torch.bool),
+            clip_eps=0.2,
+            packing_samples=False,
+            num_actions=4,
+            loss_scale=scale,
+        )
+        self.assertAlmostEqual(short_positive.item(), -scale, places=10)
+        self.assertAlmostEqual(long_positive.item(), -4 * scale, places=10)
+
+    def test_fixed_defender_prompt_pool_is_hash_bound_and_interleaved(self):
+        namespace = {
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+            "re": re,
+        }
+        import unicodedata
+
+        namespace["unicodedata"] = unicodedata
+        _load_functions(
+            {
+                "_sha256_path",
+                "_canonical_prompt_text",
+                "_validate_defender_fixed_prompt_pool",
+            },
+            namespace,
+        )
+        validate = namespace["_validate_defender_fixed_prompt_pool"]
+
+        rows = []
+        ordinals = {"harmful": 0, "benign": 0}
+        cycle = ("harmful", "harmful", "benign", "benign",
+                 "benign", "benign", "harmful", "harmful")
+        prompt_names = {
+            "harmful": ("harmful one", "harmful two"),
+            "benign": ("benign one", "benign two"),
+        }
+        for pool_index in range(16):
+            stratum = cycle[pool_index % 8]
+            harmful = stratum == "harmful"
+            ordinal = ordinals[stratum]
+            ordinals[stratum] += 1
+            repeat_epoch, repeat_epoch_rank = divmod(ordinal, 2)
+            prompt_index = (repeat_epoch + repeat_epoch_rank) % 2
+            prompt = prompt_names[stratum][prompt_index]
+            seed_sha256 = hashlib.sha256(prompt.encode()).hexdigest()
+            source_index = prompt_index + (0 if harmful else 100)
+            rows.append(
+                {
+                    "vanilla": prompt,
+                    "adversarial": "",
+                    "completion": "",
+                    "data_type": (
+                        "vanilla_harmful" if harmful else "vanilla_benign"
+                    ),
+                    "source_metadata": {
+                        "pool_index": pool_index,
+                        "rollout_step": pool_index // 8 + 1,
+                        "rollout_offset": pool_index % 8,
+                        "stratum_ordinal": ordinal,
+                        "repeat_epoch": repeat_epoch,
+                        "repeat_epoch_rank": repeat_epoch_rank,
+                        "evaluation_stratum": f"actual_{stratum}",
+                        "prompt_origin": (
+                            "a1_generated_harmful"
+                            if harmful else "direct_heldout_benign"
+                        ),
+                        "prompt_type": (
+                            "generated_harmful"
+                            if harmful else "direct_benign"
+                        ),
+                        "expected_actual_prompt_harmfulness": (
+                            "harmful" if harmful else "unharmful"
+                        ),
+                        "request_route": (
+                            "frozen_attacker_generate"
+                            if harmful else "direct_bypass_attacker"
+                        ),
+                        "source_index": source_index,
+                        "seed_prompt_sha256": seed_sha256,
+                        "partition_split": "train",
+                        "partition_selection_rank": source_index,
+                    },
+                }
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            pool = Path(directory) / "pool.jsonl"
+
+            def write_pool(payload):
+                pool.write_text(
+                    "".join(
+                        json.dumps(row, sort_keys=True) + "\n"
+                        for row in payload
+                    )
+                )
+                return hashlib.sha256(pool.read_bytes()).hexdigest()
+
+            digest = write_pool(rows)
+            metadata = validate(
+                pool,
+                expected_sha256=digest,
+                expected_rows=16,
+                expected_rollout_batch_size=8,
+            )
+            self.assertEqual(
+                metadata["interleave"],
+                "four_rank_balanced_HHBBBBHH_cycle",
+            )
+            self.assertFalse(metadata["shuffle"])
+            self.assertEqual(metadata["strata"]["harmful"]["rows"], 8)
+            self.assertEqual(
+                metadata["strata"]["harmful"]["unique_canonical_prompts"],
+                2,
+            )
+            self.assertEqual(
+                metadata["strata"]["harmful"]["repeat_occurrences"], 6,
+            )
+            self.assertEqual(len(metadata["source_metadata_keys"]), 15)
+
+            bad_completion = copy.deepcopy(rows)
+            bad_completion[1]["completion"] = "teacher answer leak"
+            digest = write_pool(bad_completion)
+            with self.assertRaisesRegex(RuntimeError, "must be empty"):
+                validate(
+                    pool,
+                    expected_sha256=digest,
+                    expected_rows=16,
+                    expected_rollout_batch_size=8,
+                )
+
+            bad_metadata = copy.deepcopy(rows)
+            bad_metadata[0]["source_metadata"]["unexpected"] = True
+            digest = write_pool(bad_metadata)
+            with self.assertRaisesRegex(RuntimeError, "schema drifted"):
+                validate(
+                    pool,
+                    expected_sha256=digest,
+                    expected_rows=16,
+                    expected_rollout_batch_size=8,
+                )
+
+            bad_seed_hash = copy.deepcopy(rows)
+            bad_seed_hash[0]["source_metadata"]["seed_prompt_sha256"] = (
+                "0" * 64
+            )
+            digest = write_pool(bad_seed_hash)
+            with self.assertRaisesRegex(RuntimeError, "seed hash drifted"):
+                validate(
+                    pool,
+                    expected_sha256=digest,
+                    expected_rows=16,
+                    expected_rollout_batch_size=8,
+                )
+
+            wrong_order = copy.deepcopy(rows)
+            wrong_order[0], wrong_order[2] = wrong_order[2], wrong_order[0]
+            digest = write_pool(wrong_order)
+            with self.assertRaisesRegex(RuntimeError, "HHBBBBHH cycle"):
+                validate(
+                    pool,
+                    expected_sha256=digest,
+                    expected_rows=16,
+                    expected_rollout_batch_size=8,
+                )
+
+            digest = write_pool(rows)
+            with self.assertRaisesRegex(RuntimeError, "artifact hash drifted"):
+                validate(
+                    pool,
+                    expected_sha256="0" * 64,
+                    expected_rows=16,
+                    expected_rollout_batch_size=8,
+                )
 
     def test_defender_resume_sidecar_is_exact_at_steps_10_30_and_40(self):
         namespace = {
@@ -1238,6 +1995,8 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
             "v2_continuation_sft": True,
             "defender_v2_smoke_gate": True,
             "defender_raw_reinforce_advantages": True,
+            "defender_reinforce_advantage_mode": "joint_signed",
+            "defender_reward_utility": "joint_signed",
         }
         observed = {
             name: ast.literal_eval(keywords[name]) for name in expected
