@@ -13,6 +13,7 @@ from typing import Tuple
 
 import numpy as np
 
+
 # Hedge regret bound is O(sqrt(T log n)); 50k iters is enough for ~1e-3 accuracy on
 # the < 20-strategy meta-games we hit. eta is the canonical sqrt(log n / T) step.
 _HEDGE_NUM_ITERATIONS: int = 50_000
@@ -45,9 +46,19 @@ def compute_nash(payoff_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if m == 1 and n == 1:
         return np.array([1.0]), np.array([1.0])
     if m == 1:
-        return np.array([1.0]), np.full(n, 1.0 / n)
+        # The row player has no choice, so every minimizing column is a best
+        # response. Mix uniformly only across tied minimizers.
+        best_columns = A[0] == np.min(A[0])
+        p2_strategy = best_columns.astype(np.float64)
+        p2_strategy /= p2_strategy.sum()
+        return np.array([1.0]), p2_strategy
     if n == 1:
-        return np.full(m, 1.0 / m), np.array([1.0])
+        # The column player has no choice, so every maximizing row is a best
+        # response. Mix uniformly only across tied maximizers.
+        best_rows = A[:, 0] == np.max(A[:, 0])
+        p1_strategy = best_rows.astype(np.float64)
+        p1_strategy /= p1_strategy.sum()
+        return p1_strategy, np.array([1.0])
 
     eta = _HEDGE_ETA_SCALE * np.sqrt(np.log(max(m, n) + 1) / _HEDGE_NUM_ITERATIONS)
 
