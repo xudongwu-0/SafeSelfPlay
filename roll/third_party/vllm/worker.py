@@ -15,6 +15,10 @@ from roll.third_party.vllm.vllm_utils import TensorLoRARequest, patch_vllm_lora_
 from roll.utils.collective import collective
 from roll.utils.cuda_ipc_utils import MultiprocessingSerializer
 from roll.utils.logging import get_logger
+from roll.utils.lora_sync_contract import (
+    validate_lora_runtime_module_mapping,
+    validate_lora_tensor_specs,
+)
 from roll.utils.send_recv_utils import monkey_patch_torch_reductions, named_tensors_from_bucket
 
 logger = get_logger()
@@ -43,12 +47,23 @@ class TensorLoraManager:
 
     def build_request(self, peft_config: dict) -> TensorLoRARequest:
         """Build LoRA request using the fixed training slot ID."""
+        tensor_items = list(self.lora_params.items())
+        normalized_specs = validate_lora_tensor_specs(
+            [(name, tensor.shape) for name, tensor in tensor_items],
+            target_modules=peft_config.get("target_modules"),
+        )
+        normalized_params = OrderedDict(
+            (normalized_name, tensor)
+            for (normalized_name, _), (_, tensor) in zip(
+                normalized_specs, tensor_items
+            )
+        )
         lora_request = TensorLoRARequest(
             lora_name="training_lora",
             lora_int_id=_TRAINING_LORA_INT_ID,
             lora_path=_training_lora_path(),
             peft_config=peft_config,
-            lora_tensors=self.lora_params,
+            lora_tensors=normalized_params,
         )
         self.lora_params = OrderedDict()
         return lora_request
@@ -166,11 +181,88 @@ class WorkerV1(WorkerBase):
 
     # Use custom prefix because worker_extension_cls can not has
     # conflicting method name with vllm worker.
-    def custom_add_lora(self, peft_config) -> bool:
+    def custom_add_lora(self, peft_config, expected_tensor_count=None) -> dict:
         lora_request = self.tensor_lora_manager.build_request(peft_config)
+        observed_tensor_count = len(lora_request.lora_tensors)
+        if (
+            expected_tensor_count is not None
+            and observed_tensor_count != expected_tensor_count
+        ):
+            raise RuntimeError(
+                "vLLM worker received an incomplete LoRA update: "
+                f"{observed_tensor_count} tensors != {expected_tensor_count}"
+            )
+        from vllm.lora.utils import parse_fine_tuned_lora_name
+
+        worker_manager = getattr(self.model_runner, "lora_manager", None)
+        adapter_manager = getattr(worker_manager, "_adapter_manager", None)
+        if adapter_manager is None:
+            raise RuntimeError(
+                "vLLM LoRA manager is unavailable; refusing to register the "
+                "training adapter"
+            )
+
+        model = getattr(adapter_manager, "model", None)
+        weights_mapper = getattr(model, "hf_to_vllm_mapper", None)
+        parsed_modules = {
+            parse_fine_tuned_lora_name(name, weights_mapper)[0]
+            for name in lora_request.lora_tensors
+        }
+        runtime_modules = set(getattr(adapter_manager, "modules", {}))
+        packed_module_sources = {
+            source
+            for sources in getattr(adapter_manager, "packed_modules", {}).values()
+            for source in sources
+        }
+        validate_lora_runtime_module_mapping(
+            parsed_modules,
+            runtime_modules,
+            packed_module_sources,
+        )
+
         super().reload_model()
         # Evict the previous training adapter so vLLM loads fresh weights.
         # add_adapter() skips _load_adapter when the ID is already in the LRU
         # cache; remove_lora returns False (no-op) on the very first call.
         self.model_runner.remove_lora(lora_request.lora_int_id)
-        return self.model_runner.add_lora(lora_request)
+        if not self.model_runner.add_lora(lora_request):
+            raise RuntimeError(
+                "vLLM rejected the synchronized training LoRA; refusing to "
+                "generate with base or stale weights"
+            )
+        if hasattr(self.model_runner, "list_loras"):
+            loaded_loras = self.model_runner.list_loras()
+            if lora_request.lora_int_id not in loaded_loras:
+                raise RuntimeError(
+                    "vLLM reported LoRA success but the training adapter is "
+                    "not registered"
+                )
+        loaded_adapter = adapter_manager.get_adapter(lora_request.lora_int_id)
+        if loaded_adapter is None:
+            raise RuntimeError(
+                "vLLM registered the training LoRA ID without retaining its "
+                "adapter weights"
+            )
+        loaded_modules = set(getattr(loaded_adapter, "loras", {}))
+        unmatched_loaded_modules = loaded_modules - runtime_modules
+        if not loaded_modules or unmatched_loaded_modules:
+            self.model_runner.remove_lora(lora_request.lora_int_id)
+            raise RuntimeError(
+                "vLLM loaded LoRA tensors that cannot activate rollout "
+                "modules: "
+                f"loaded={len(loaded_modules)}, "
+                f"unmatched={sorted(unmatched_loaded_modules)[:8]!r}"
+            )
+        logger.info(
+            "Verified training LoRA registration: %d tensors -> %d parsed "
+            "modules -> %d active runtime modules",
+            len(lora_request.lora_tensors),
+            len(parsed_modules),
+            len(loaded_modules),
+        )
+        return {
+            "ok": True,
+            "tensor_count": observed_tensor_count,
+            "parsed_module_count": len(parsed_modules),
+            "loaded_module_count": len(loaded_modules),
+        }

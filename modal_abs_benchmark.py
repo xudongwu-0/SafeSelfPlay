@@ -56,26 +56,36 @@ OUTPUT_VOLUME_NAME = "roll-abs-benchmark-output"
 LOCAL_OUTPUT_DIR = "/home/xudong/work/self_play/checkpoints/roll_abs_benchmark"
 SELFPLAY_LOCAL = Path(__file__).resolve().parent.parent / "selfplay-redteaming"
 SELFPLAY_DATA_LOCAL = Path(__file__).resolve().parent.parent / "selfplay-redteaming" / "red_team" / "data"
-ATTACKER_AUX_SFT_LOCAL = (
-    Path(__file__).resolve().parent.parent
-    / "checkpoints"
-    / "abs_attacker_sft_runs"
-    / "abs_attacker_sft_qwen25_3b_lora_r32_1180_20260715_010540_retry1"
-    / "sft_train.cleaned.jsonl"
+ATTACKER_AUX_SFT_LOCAL = Path(
+    os.environ.get(
+        "ATTACKER_AUX_SFT_LOCAL",
+        str(
+            Path(__file__).resolve().parent.parent
+            / "checkpoints"
+            / "abs_attacker_sft_runs"
+            / "abs_attacker_sft_qwen25_3b_lora_r32_1180_20260715_010540_retry1"
+            / "sft_train.cleaned.jsonl"
+        ),
+    )
 )
 ATTACKER_AUX_SFT_REMOTE = "/aux_sft/attacker_rewrite_1180.jsonl"
 
 output_vol = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
 
-image = (
-    roll_image.add_local_dir(str(SELFPLAY_DATA_LOCAL), "/redteam_data", copy=False)
-    .add_local_file(str(ATTACKER_AUX_SFT_LOCAL), ATTACKER_AUX_SFT_REMOTE, copy=False)
-    .add_local_dir(
-        str(SELFPLAY_LOCAL),
-        "/selfplay-redteaming",
+image = roll_image.add_local_dir(
+    str(SELFPLAY_DATA_LOCAL), "/redteam_data", copy=False
+)
+if ATTACKER_AUX_SFT_LOCAL.is_file():
+    image = image.add_local_file(
+        str(ATTACKER_AUX_SFT_LOCAL),
+        ATTACKER_AUX_SFT_REMOTE,
         copy=False,
-        ignore=[".git", "__pycache__", "**/*.pyc", "**/*.egg-info", "logs/", "wandb/"],
     )
+image = image.add_local_dir(
+    str(SELFPLAY_LOCAL),
+    "/selfplay-redteaming",
+    copy=False,
+    ignore=[".git", "__pycache__", "**/*.pyc", "**/*.egg-info", "logs/", "wandb/"],
 )
 
 app = modal.App("roll-abs-benchmark", image=image)

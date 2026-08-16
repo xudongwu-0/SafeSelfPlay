@@ -9,6 +9,10 @@ from roll.configs.base_config import PPOConfig
 from roll.configs.worker_config import is_actor_infer_overlapping_with_any_cluster
 from roll.utils.collective import collective
 from roll.utils.logging import get_logger
+from roll.utils.lora_sync_contract import (
+    normalize_peft_lora_name,
+    validate_lora_tensor_specs,
+)
 from roll.utils.network_utils import collect_free_port, get_node_ip
 from roll.utils.send_recv_utils import serialize_named_weights
 
@@ -32,24 +36,30 @@ def _gather_weights(is_zero3, named_params):
 
 
 def _strip_peft_prefix(name: str) -> str:
-    """Strip PEFT wrapper prefixes and adapter suffixes from parameter names.
+    """Normalize PEFT adapter suffixes while retaining its native prefix.
 
     Converts e.g. 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight'
-    to 'model.layers.0.self_attn.q_proj.lora_A.weight'
+    to 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight'.
+
+    The historical function name is retained for compatibility.  vLLM 0.8.x
+    parses LoRA names by dropping the first two components unconditionally, so
+    stripping ``base_model.model.`` here can load an adapter whose modules never
+    match the rollout model.
     """
-    if name.startswith("base_model.model."):
-        name = name[len("base_model.model."):]
-    name = name.replace(".default.", ".")
-    return name
+    return normalize_peft_lora_name(name)
 
 
 def _is_training_lora_param(name: str) -> bool:
-    if "lora_" not in name:
+    supported_markers = (
+        ".lora_A.",
+        ".lora_B.",
+        ".lora_embedding_A.",
+        ".lora_embedding_B.",
+    )
+    if not any(marker in name for marker in supported_markers):
         return False
     if ".role_start." in name:
         return False
-    if ".default." in name:
-        return True
     return True
 
 
@@ -57,7 +67,28 @@ def gather_deepspeed_weights(model, ds_config, buffer_size, lora_only: bool = Fa
     is_zero3 = ds_config.is_zero3()
     named_params = [(name, param) for name, param in model.named_parameters()]
     if lora_only:
-        named_params = [(_strip_peft_prefix(n), p) for n, p in named_params if _is_training_lora_param(n)]
+        selected_params = [
+            (name, param)
+            for name, param in named_params
+            if _is_training_lora_param(name)
+        ]
+        normalized_specs = validate_lora_tensor_specs(
+            [
+                (
+                    name,
+                    param.ds_shape
+                    if is_zero3 and hasattr(param, "ds_shape")
+                    else param.shape,
+                )
+                for name, param in selected_params
+            ]
+        )
+        named_params = [
+            (normalized_name, param)
+            for (normalized_name, _), (_, param) in zip(
+                normalized_specs, selected_params
+            )
+        ]
 
     waiting_params, waiting_params_size = [], 0
     for name, param in named_params:
