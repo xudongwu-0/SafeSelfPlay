@@ -96,9 +96,9 @@ image = (
         "'cupy-cuda12x==13.6.0' 'opencv-python-headless==4.11.0.86' "
         "'typer==0.16.1'"
     )
-    # transformers>=4.50 loads Qwen2 with the fast tokenizer which lacks all_special_tokens_extended;
-    # vllm 0.10.2 accesses that property — patch PreTrainedTokenizerFast in-place so all
-    # Ray worker processes see the fix without needing a code change in vllm or ROLL.
+    # vLLM 0.10.2 accesses all_special_tokens_extended. Preserve the native
+    # Transformers descriptor; the compatibility script only adds a
+    # non-recursive fallback for older backends that truly lack it.
     .add_local_file(
         os.path.join(ROLL_LOCAL, "_modal_patches/patch_vllm_tokenizer.py"),
         "/tmp/patch_vllm_tokenizer.py",

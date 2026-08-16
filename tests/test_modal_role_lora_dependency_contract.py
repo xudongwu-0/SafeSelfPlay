@@ -10,6 +10,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ModalRoleLoraDependencyContractTests(unittest.TestCase):
+    def test_tokenizer_compat_patch_cannot_recurse_through_public_property(
+        self,
+    ) -> None:
+        source = (
+            REPO_ROOT / "_modal_patches" / "patch_vllm_tokenizer.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("self.all_special_tokens", source)
+        self.assertIn('getattr(self, "special_tokens_map_extended", {{}})', source)
+        self.assertIn(
+            'inspect.getattr_static(\n        cls, "all_special_tokens_extended", None',
+            source,
+        )
+        self.assertIn("ROLL Modal vLLM compat v2", source)
+
     def test_image_reasserts_roll_compatible_stack_after_vllm(self) -> None:
         source = (REPO_ROOT / "modal_fsp_demo.py").read_text(encoding="utf-8")
         vllm_offset = source.index('.pip_install("vllm==0.10.2")')
