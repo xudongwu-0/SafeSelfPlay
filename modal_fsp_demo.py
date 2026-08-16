@@ -82,9 +82,20 @@ image = (
     # Fixes applied after vllm (to avoid busting flash-attn cache):
     # - click==8.1.7: vllm upgrades click to 8.2+ breaking ray CLI (deepcopy/Sentinel bug)
     # - imageio: imported by agentic utils, not pulled in transitively
-    # - accelerate>=1.1.0: transformers requires this; we pinned 0.34.2 earlier
-    # No transformers pin: allow vllm's preferred version (needs qwen2_5_omni from >=4.50)
-    .run_commands("pip install 'click==8.1.7' imageio 'accelerate>=1.1.0'")
+    # - Reassert a stable ROLL/role-LoRA stack before mounting local sources.
+    #   An unconstrained rebuild resolved transformers 5.x and numpy 2.x;
+    #   installing sentence-transformers later then rewrote transformers on
+    #   disk after the training process had imported the 5.x modules.
+    # - Preinstall replay-buffer dependencies so the existing runtime install
+    #   is an idempotent no-op rather than a site-packages mutation.
+    .run_commands(
+        "pip install 'click==8.1.7' imageio "
+        "'numpy==1.26.4' 'transformers==4.57.6' "
+        "'accelerate==0.34.2' 'peft==0.12.0' 'trl==0.9.6' "
+        "'sacrebleu==2.5.1' 'sentence-transformers==3.4.1' "
+        "'cupy-cuda12x==13.6.0' 'opencv-python-headless==4.11.0.86' "
+        "'typer==0.16.1'"
+    )
     # transformers>=4.50 loads Qwen2 with the fast tokenizer which lacks all_special_tokens_extended;
     # vllm 0.10.2 accesses that property — patch PreTrainedTokenizerFast in-place so all
     # Ray worker processes see the fix without needing a code change in vllm or ROLL.
