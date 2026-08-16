@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from roll.utils.upstream_v2_payoff import (
@@ -55,6 +56,67 @@ D1_JOINT_DEFAULT_SAMPLE_COUNTS = (
     14336,
     16384,
 )
+
+
+def verify_d1_joint_source_bundle(
+    *,
+    audit_paths: Mapping[str, str | Path],
+    active_paths: Mapping[str, str | Path],
+    frozen_expected: Mapping[str, str],
+) -> dict[str, str]:
+    """Verify a fixed audit mount against the sources Python actually loaded.
+
+    Modal does not guarantee that sibling modules are materialized next to a
+    serialized function entrypoint.  The caller therefore supplies two
+    independent, explicit mappings: files mounted into the convergence image at
+    a fixed audit path, and source files resolved from the live imported
+    objects.  Every live source must byte-match its audit copy; protocol-frozen
+    dependencies additionally have to match their preregistered digest.
+    """
+
+    audit_labels = set(audit_paths)
+    active_labels = set(active_paths)
+    if not audit_labels or active_labels != audit_labels:
+        raise RuntimeError(
+            "D joint source-bundle labels drifted: "
+            f"audit={sorted(audit_labels)}, active={sorted(active_labels)}"
+        )
+    unknown_frozen = set(frozen_expected) - audit_labels
+    if unknown_frozen:
+        raise RuntimeError(
+            "Frozen D joint sources are absent from the audit bundle: "
+            f"{sorted(unknown_frozen)}"
+        )
+
+    hashes: dict[str, str] = {}
+    for label in sorted(audit_labels):
+        audit_path = Path(audit_paths[label])
+        active_path = Path(active_paths[label])
+        if not audit_path.is_file():
+            raise FileNotFoundError(
+                f"Missing mounted D joint audit source {label}: {audit_path}"
+            )
+        if not active_path.is_file():
+            raise FileNotFoundError(
+                f"Missing active D joint runtime source {label}: {active_path}"
+            )
+        audit_digest = hashlib.sha256(audit_path.read_bytes()).hexdigest()
+        active_digest = hashlib.sha256(active_path.read_bytes()).hexdigest()
+        if active_digest != audit_digest:
+            raise RuntimeError(
+                f"Active D joint source differs from audit mount for {label}: "
+                f"active={active_digest}, audit={audit_digest}"
+            )
+        hashes[label] = audit_digest
+
+    drift = {
+        label: {"observed": hashes[label], "expected": expected}
+        for label, expected in frozen_expected.items()
+        if hashes[label] != expected
+    }
+    if drift:
+        raise RuntimeError(f"Frozen D joint dependency drifted: {drift}")
+    return hashes
 
 
 def _canonical_sha256(value: Any) -> str:

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +20,7 @@ from roll.utils.d1_joint_payoff_convergence import (
     build_d1_joint_convergence_specs,
     is_request_like_d1_attack,
     summarize_d1_joint_payoff_cell,
+    verify_d1_joint_source_bundle,
 )
 from roll.utils.upstream_v2_payoff import (
     D1_ACTUAL_HARMFUL,
@@ -307,6 +313,124 @@ class D1JointModalContractTest(unittest.TestCase):
         self.assertIn('"normalization": "none"', source)
         self.assertIn('"candidate_episodes.jsonl"', source)
         self.assertIn('"artifact_sha256": artifact_sha256', source)
+        self.assertIn("D1_JOINT_AUDIT_ROOT", source)
+        self.assertIn(".add_local_file(", source)
+        self.assertIn("copy=False", source)
+        self.assertIn("image=d1_joint_payoff_image", source)
+
+    def test_fixed_audit_mount_does_not_depend_on_function_sibling_files(self):
+        repository = Path(__file__).resolve().parents[1]
+        labels = (
+            "modal_d1_joint_payoff_convergence.py",
+            "roll/utils/d1_joint_payoff_convergence.py",
+            "modal_upstream_selfredteam_role_lora.py",
+            "modal_upstream_v2_payoff.py",
+            "roll/utils/upstream_v2_payoff.py",
+        )
+        frozen_labels = labels[2:]
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            audit_root = temporary_root / "fixed_audit_mount"
+            function_root = temporary_root / "root"
+            function_root.mkdir()
+            audit_paths: dict[str, Path] = {}
+            active_paths: dict[str, Path] = {}
+            for label in labels:
+                source = repository / label
+                audit_path = audit_root / label
+                audit_path.parent.mkdir(parents=True, exist_ok=True)
+                audit_path.write_bytes(source.read_bytes())
+                audit_paths[label] = audit_path
+                if label == "modal_d1_joint_payoff_convergence.py":
+                    active_path = function_root / label
+                    active_path.write_bytes(source.read_bytes())
+                    active_paths[label] = active_path
+                else:
+                    # Imported modules may resolve under /roll even when Modal
+                    # did not put sibling files beside /root/the_entrypoint.py.
+                    active_paths[label] = source
+
+            self.assertFalse(
+                (function_root / "modal_upstream_selfredteam_role_lora.py").exists()
+            )
+            frozen_expected = {
+                label: hashlib.sha256((repository / label).read_bytes()).hexdigest()
+                for label in frozen_labels
+            }
+            observed = verify_d1_joint_source_bundle(
+                audit_paths=audit_paths,
+                active_paths=active_paths,
+                frozen_expected=frozen_expected,
+            )
+            self.assertEqual(set(observed), set(labels))
+            self.assertEqual(
+                observed["modal_upstream_selfredteam_role_lora.py"],
+                frozen_expected["modal_upstream_selfredteam_role_lora.py"],
+            )
+
+            modal_pythonpath = Path(
+                os.environ.get(
+                    "SELFPLAY_MODAL_PYTHONPATH", "/tmp/selfplay-modal-python"
+                )
+            )
+            if modal_pythonpath.is_dir():
+                environment = dict(os.environ)
+                environment["PYTHONPATH"] = os.pathsep.join(
+                    (
+                        str(modal_pythonpath),
+                        str(repository),
+                        environment.get("PYTHONPATH", ""),
+                    )
+                )
+                environment["SIMULATED_D1_ENTRYPOINT"] = str(
+                    active_paths["modal_d1_joint_payoff_convergence.py"]
+                )
+                environment["SIMULATED_D1_AUDIT_ROOT"] = str(audit_root)
+                script = """
+import json
+import os
+from pathlib import Path
+
+import modal_d1_joint_payoff_convergence as entrypoint
+
+entrypoint.__file__ = os.environ["SIMULATED_D1_ENTRYPOINT"]
+entrypoint.D1_JOINT_AUDIT_ROOT = Path(
+    os.environ["SIMULATED_D1_AUDIT_ROOT"]
+)
+print("IMPLEMENTATION_HASHES=" + json.dumps(
+    entrypoint._implementation_hashes(), sort_keys=True
+))
+"""
+                completed = subprocess.run(
+                    [sys.executable, "-c", script],
+                    cwd=repository,
+                    env=environment,
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                output_line = next(
+                    line
+                    for line in completed.stdout.splitlines()
+                    if line.startswith("IMPLEMENTATION_HASHES=")
+                )
+                entrypoint_hashes = json.loads(output_line.split("=", 1)[1])
+                self.assertEqual(entrypoint_hashes, observed)
+            else:
+                self.skipTest(
+                    "real entrypoint wiring requires SELFPLAY_MODAL_PYTHONPATH"
+                )
+
+            audit_paths["modal_upstream_v2_payoff.py"].unlink()
+            with self.assertRaisesRegex(
+                FileNotFoundError, "Missing mounted D joint audit source"
+            ):
+                verify_d1_joint_source_bundle(
+                    audit_paths=audit_paths,
+                    active_paths=active_paths,
+                    frozen_expected=frozen_expected,
+                )
 
     def test_frozen_dependency_hashes_match_current_frozen_files(self):
         repository = Path(__file__).resolve().parents[1]

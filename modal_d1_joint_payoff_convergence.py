@@ -34,6 +34,7 @@ import modal
 if os.path.isdir("/roll") and "/roll" not in sys.path:
     sys.path.insert(0, "/roll")
 
+from modal_abs_benchmark import image as roll_abs_image  # noqa: E402
 from modal_upstream_selfredteam_role_lora import (  # noqa: E402
     LLAMA_ABLITERATED_MODEL,
     OUTPUT_ROOT,
@@ -71,6 +72,7 @@ from roll.utils.d1_joint_payoff_convergence import (  # noqa: E402
     assess_d1_joint_convergence_feasibility,
     build_d1_joint_convergence_specs,
     is_request_like_d1_attack,
+    verify_d1_joint_source_bundle,
 )
 from roll.utils.upstream_v2_payoff import (  # noqa: E402
     D1_ACTUAL_BENIGN,
@@ -102,42 +104,80 @@ FROZEN_UPSTREAM_PAYOFF_HELPER_SHA256 = (
     "a57552c6d5b42e8fcbdf7ae3cb1beafd53032c36fdd15bc79aa60b440f389b93"
 )
 
+# Modal serializes the entrypoint under /root, but imported siblings are not
+# guaranteed to be materialized beside it.  Explicitly mount every audited
+# source into a derived image at a fixed path instead of guessing from
+# ``Path(__file__)``.  The inherited ROLL image already has runtime mounts, so
+# these must also be runtime mounts; Modal forbids adding a copy/build layer on
+# top of an image with deferred mounts.
+D1_JOINT_AUDIT_ROOT = Path("/opt/d1_joint_payoff_audit_v1")
+D1_JOINT_AUDIT_RELATIVE_PATHS = {
+    "modal_d1_joint_payoff_convergence.py": Path(
+        "modal_d1_joint_payoff_convergence.py"
+    ),
+    "roll/utils/d1_joint_payoff_convergence.py": Path(
+        "roll/utils/d1_joint_payoff_convergence.py"
+    ),
+    "modal_upstream_selfredteam_role_lora.py": Path(
+        "modal_upstream_selfredteam_role_lora.py"
+    ),
+    "modal_upstream_v2_payoff.py": Path("modal_upstream_v2_payoff.py"),
+    "roll/utils/upstream_v2_payoff.py": Path(
+        "roll/utils/upstream_v2_payoff.py"
+    ),
+}
+_D1_JOINT_LOCAL_ROOT = Path(__file__).resolve().parent
+d1_joint_payoff_image = roll_abs_image
+for _label, _relative_path in D1_JOINT_AUDIT_RELATIVE_PATHS.items():
+    _local_source = _D1_JOINT_LOCAL_ROOT / _relative_path
+    if not _local_source.is_file():
+        raise FileNotFoundError(
+            f"Missing local D joint audit source {_label}: {_local_source}"
+        )
+    d1_joint_payoff_image = d1_joint_payoff_image.add_local_file(
+        str(_local_source),
+        str(D1_JOINT_AUDIT_ROOT / _relative_path),
+        copy=False,
+    )
+
 
 def _implementation_hashes() -> dict[str, str]:
+    core_source = inspect.getsourcefile(_prepare_peft_compatible_adapter)
+    payoff_modal_source = inspect.getsourcefile(_generate)
     helper_source = inspect.getsourcefile(analyze_d1_joint_payoff_convergence)
     frozen_helper_source = inspect.getsourcefile(
         compute_d1_joint_signed_defender_reward
     )
-    if not helper_source or not frozen_helper_source:
+    if not all(
+        (
+            core_source,
+            payoff_modal_source,
+            helper_source,
+            frozen_helper_source,
+        )
+    ):
         raise RuntimeError("Cannot resolve payoff-convergence helper sources")
-    runtime_dir = Path(__file__).resolve().parent
-    paths = {
+    audit_paths = {
+        label: D1_JOINT_AUDIT_ROOT / relative_path
+        for label, relative_path in D1_JOINT_AUDIT_RELATIVE_PATHS.items()
+    }
+    active_paths = {
         "modal_d1_joint_payoff_convergence.py": Path(__file__).resolve(),
         "roll/utils/d1_joint_payoff_convergence.py": Path(helper_source).resolve(),
-        "modal_upstream_selfredteam_role_lora.py": (
-            runtime_dir / "modal_upstream_selfredteam_role_lora.py"
-        ),
-        "modal_upstream_v2_payoff.py": runtime_dir / "modal_upstream_v2_payoff.py",
+        "modal_upstream_selfredteam_role_lora.py": Path(core_source).resolve(),
+        "modal_upstream_v2_payoff.py": Path(payoff_modal_source).resolve(),
         "roll/utils/upstream_v2_payoff.py": Path(frozen_helper_source).resolve(),
     }
-    hashes: dict[str, str] = {}
-    for label, path in paths.items():
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing convergence dependency {label}: {path}")
-        hashes[label] = _sha256_file(path)
     frozen_expected = {
         "modal_upstream_selfredteam_role_lora.py": FROZEN_ROLE_LORA_CORE_SHA256,
         "modal_upstream_v2_payoff.py": FROZEN_UPSTREAM_PAYOFF_MODAL_SHA256,
         "roll/utils/upstream_v2_payoff.py": FROZEN_UPSTREAM_PAYOFF_HELPER_SHA256,
     }
-    drift = {
-        label: {"observed": hashes[label], "expected": expected}
-        for label, expected in frozen_expected.items()
-        if hashes[label] != expected
-    }
-    if drift:
-        raise RuntimeError(f"Frozen payoff dependency drifted: {drift}")
-    return hashes
+    return verify_d1_joint_source_bundle(
+        audit_paths=audit_paths,
+        active_paths=active_paths,
+        frozen_expected=frozen_expected,
+    )
 
 
 def _safe_suffix(raw: str) -> str:
@@ -261,6 +301,7 @@ def _default_sample_counts(episodes: int) -> list[int]:
 
 
 @app.function(
+    image=d1_joint_payoff_image,
     gpu=os.environ.get("D1_JOINT_PAYOFF_GPU", "H200"),
     cpu=8,
     timeout=86400,
