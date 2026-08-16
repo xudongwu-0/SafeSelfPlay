@@ -126,19 +126,20 @@ D1_JOINT_AUDIT_RELATIVE_PATHS = {
         "roll/utils/upstream_v2_payoff.py"
     ),
 }
-_D1_JOINT_LOCAL_ROOT = Path(__file__).resolve().parent
 d1_joint_payoff_image = roll_abs_image
-for _label, _relative_path in D1_JOINT_AUDIT_RELATIVE_PATHS.items():
-    _local_source = _D1_JOINT_LOCAL_ROOT / _relative_path
-    if not _local_source.is_file():
-        raise FileNotFoundError(
-            f"Missing local D joint audit source {_label}: {_local_source}"
+if modal.is_local():
+    _d1_joint_local_root = Path(__file__).resolve().parent
+    for _label, _relative_path in D1_JOINT_AUDIT_RELATIVE_PATHS.items():
+        _local_source = _d1_joint_local_root / _relative_path
+        if not _local_source.is_file():
+            raise FileNotFoundError(
+                f"Missing local D joint audit source {_label}: {_local_source}"
+            )
+        d1_joint_payoff_image = d1_joint_payoff_image.add_local_file(
+            str(_local_source),
+            str(D1_JOINT_AUDIT_ROOT / _relative_path),
+            copy=False,
         )
-    d1_joint_payoff_image = d1_joint_payoff_image.add_local_file(
-        str(_local_source),
-        str(D1_JOINT_AUDIT_ROOT / _relative_path),
-        copy=False,
-    )
 
 
 def _implementation_hashes() -> dict[str, str]:

@@ -314,6 +314,7 @@ class D1JointModalContractTest(unittest.TestCase):
         self.assertIn('"candidate_episodes.jsonl"', source)
         self.assertIn('"artifact_sha256": artifact_sha256', source)
         self.assertIn("D1_JOINT_AUDIT_ROOT", source)
+        self.assertIn("if modal.is_local():", source)
         self.assertIn(".add_local_file(", source)
         self.assertIn("copy=False", source)
         self.assertIn("image=d1_joint_payoff_image", source)
@@ -387,16 +388,32 @@ class D1JointModalContractTest(unittest.TestCase):
                 )
                 environment["SIMULATED_D1_AUDIT_ROOT"] = str(audit_root)
                 script = """
+import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 
-import modal_d1_joint_payoff_convergence as entrypoint
+import modal
 
-entrypoint.__file__ = os.environ["SIMULATED_D1_ENTRYPOINT"]
+entrypoint_path = Path(os.environ["SIMULATED_D1_ENTRYPOINT"])
+spec = importlib.util.spec_from_file_location(
+    "simulated_remote_d1_joint_entrypoint", entrypoint_path
+)
+assert spec is not None and spec.loader is not None
+entrypoint = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = entrypoint
+original_is_local = modal.is_local
+modal.is_local = lambda: False
+try:
+    spec.loader.exec_module(entrypoint)
+finally:
+    modal.is_local = original_is_local
+
 entrypoint.D1_JOINT_AUDIT_ROOT = Path(
     os.environ["SIMULATED_D1_AUDIT_ROOT"]
 )
+print("REMOTE_IMPORT_OK=1")
 print("IMPLEMENTATION_HASHES=" + json.dumps(
     entrypoint._implementation_hashes(), sort_keys=True
 ))
@@ -415,6 +432,7 @@ print("IMPLEMENTATION_HASHES=" + json.dumps(
                     for line in completed.stdout.splitlines()
                     if line.startswith("IMPLEMENTATION_HASHES=")
                 )
+                self.assertIn("REMOTE_IMPORT_OK=1", completed.stdout.splitlines())
                 entrypoint_hashes = json.loads(output_line.split("=", 1)[1])
                 self.assertEqual(entrypoint_hashes, observed)
             else:
