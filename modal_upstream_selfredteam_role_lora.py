@@ -6222,9 +6222,9 @@ def _prepare_role_lora_upstream(
     _patch_upstream_fixed_attacker_lora()
     _patch_upstream_defender_role_prompt()
     _patch_upstream_role_lr_scheduler()
+    _patch_upstream_comprehensive_wandb_logging()
     _patch_upstream_role_advantage_normalization()
     _patch_upstream_remote_rm_retry()
-    _patch_upstream_comprehensive_wandb_logging()
     _patch_upstream_role_early_stopping()
     _patch_upstream_defender_metric_keys()
     if dynamic_role_sft:

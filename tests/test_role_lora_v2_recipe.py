@@ -1566,6 +1566,174 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
         self.assertAlmostEqual(short_positive.item(), -scale, places=10)
         self.assertAlmostEqual(long_positive.item(), -4 * scale, places=10)
 
+    def test_fresh_upstream_full_formal_defender_patch_chain_compiles(self):
+        """Exercise the production patch order on an actual fresh source copy."""
+        import os
+        import unicodedata
+
+        fixed_patch_names = {
+            "_prepare_upstream_source",
+            "_patch_upstream_vllm_version_check",
+            "_patch_upstream_sft_chat_template",
+            "_patch_upstream_sft_micro_batch_floor",
+            "_patch_upstream_release_rl_logits_before_sft",
+            "_patch_upstream_zero3_sync_active_params",
+            "_patch_upstream_replay_buffer_diagnostics",
+            "_patch_upstream_deepspeed_buckets",
+            "_patch_only_attacker_instruction",
+            "_patch_upstream_cot_privacy",
+            "_patch_upstream_attacker_only_sampling",
+            "_patch_upstream_fixed_defender_model",
+        }
+        role_patch_names = {
+            "_replace_once",
+            "_prepare_role_lora_upstream",
+            "_patch_upstream_lora_initialization",
+            "_patch_upstream_lightweight_resume",
+            "_patch_upstream_vllm_lora_sync",
+            "_patch_upstream_peft_checkpoint_save",
+            "_patch_upstream_fixed_defender_direct_chat",
+            "_patch_upstream_fixed_attacker_lora",
+            "_patch_upstream_defender_role_prompt",
+            "_patch_upstream_role_lr_scheduler",
+            "_patch_upstream_comprehensive_wandb_logging",
+            "_patch_upstream_role_advantage_normalization",
+            "_patch_upstream_remote_rm_retry",
+            "_patch_upstream_role_early_stopping",
+            "_patch_upstream_defender_metric_keys",
+            "_patch_upstream_reference_kl_monitoring",
+            "_patch_upstream_role_specific_online_sft",
+            "_patch_upstream_defender_fixed_sft_dose",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            fresh_work = Path(directory) / "fresh-upstream"
+            namespace = {
+                "Path": Path,
+                "hashlib": hashlib,
+                "json": json,
+                "math": math,
+                "os": os,
+                "re": re,
+                "shutil": shutil,
+                "unicodedata": unicodedata,
+                "UPSTREAM_SOURCE": UPSTREAM_ROOT,
+                "UPSTREAM_WORK": fresh_work,
+            }
+            # Patch functions use several immutable prompt/config constants.
+            # Load only literal assignments; filesystem roots remain bound to
+            # this temporary fresh-source simulation.
+            for module_path in (FIXED_MODULE, ROLE_MODULE):
+                module_tree = ast.parse(
+                    module_path.read_text(), filename=str(module_path)
+                )
+                for node in module_tree.body:
+                    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                        continue
+                    targets = (
+                        node.targets
+                        if isinstance(node, ast.Assign)
+                        else [node.target]
+                    )
+                    try:
+                        value = ast.literal_eval(node.value)
+                    except (TypeError, ValueError):
+                        continue
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            namespace.setdefault(target.id, value)
+            namespace["UPSTREAM_SOURCE"] = UPSTREAM_ROOT
+            namespace["UPSTREAM_WORK"] = fresh_work
+
+            _load_path_functions(
+                FIXED_MODULE, fixed_patch_names, namespace
+            )
+            _load_functions(role_patch_names, namespace)
+            namespace["_prepare_role_lora_upstream"](
+                attacker_prompt_profile="optimized",
+                strict_upstream_alignment=False,
+                dynamic_role_sft=True,
+                v2_runtime=True,
+                v2_continuation_sft=True,
+            )
+
+            for generated_path in fresh_work.rglob("*.py"):
+                compile(
+                    generated_path.read_text(),
+                    str(generated_path),
+                    "exec",
+                )
+            actor_path = (
+                fresh_work / "openrlhf/trainer/ray/ppo_actor.py"
+            )
+            actor_source = actor_path.read_text()
+            self.assertEqual(actor_source.count("policy_diagnostics = {"), 1)
+            self.assertEqual(
+                actor_source.count("status.update(policy_diagnostics)"), 1
+            )
+            actor_tree = ast.parse(actor_source, filename=str(actor_path))
+            actor_class = next(
+                node for node in actor_tree.body
+                if isinstance(node, ast.ClassDef)
+                and node.name == "ActorPPOTrainer"
+            )
+            training_step = next(
+                node for node in actor_class.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "training_step"
+            )
+            episode_sum_if = next(
+                node for node in ast.walk(training_step)
+                if isinstance(node, ast.If)
+                and "defender_episode_sum_policy_loss" in ast.unparse(node.test)
+            )
+            diagnostics_assignment = next(
+                node for node in ast.walk(training_step)
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "policy_diagnostics"
+                    for target in node.targets
+                )
+            )
+            later_kl_if = min(
+                (
+                    node for node in ast.walk(training_step)
+                    if isinstance(node, ast.If)
+                    and "self.args.use_kl_loss" in ast.unparse(node.test)
+                    and node.lineno > diagnostics_assignment.lineno
+                ),
+                key=lambda node: node.lineno,
+            )
+            self.assertLess(
+                episode_sum_if.lineno, diagnostics_assignment.lineno
+            )
+            self.assertLess(diagnostics_assignment.lineno, later_kl_if.lineno)
+
+        role_tree = ast.parse(
+            ROLE_MODULE.read_text(), filename=str(ROLE_MODULE)
+        )
+        prepare_function = next(
+            node for node in role_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_prepare_role_lora_upstream"
+        )
+        production_calls = [
+            statement.value.func.id
+            for statement in prepare_function.body
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+        ]
+        self.assertLess(
+            production_calls.index(
+                "_patch_upstream_comprehensive_wandb_logging"
+            ),
+            production_calls.index(
+                "_patch_upstream_role_advantage_normalization"
+            ),
+        )
+
     def test_fixed_defender_prompt_pool_is_hash_bound_and_interleaved(self):
         namespace = {
             "Path": Path,
