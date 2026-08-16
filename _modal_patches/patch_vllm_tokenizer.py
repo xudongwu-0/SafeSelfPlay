@@ -39,7 +39,23 @@ def _roll_all_special_tokens_extended(self):
     print(f"Patched {cls.__name__} in {fn}")
 
 
-for tokenizer_cls_name in ["PreTrainedTokenizerBase", "PreTrainedTokenizer", "PreTrainedTokenizerFast"]:
+tokenizer_classes = []
+for tokenizer_cls_name in [
+    "PreTrainedTokenizerBase",
+    "PreTrainedTokenizer",
+    "PreTrainedTokenizerFast",
+    "TokenizersBackend",
+]:
     tokenizer_cls = getattr(transformers, tokenizer_cls_name, None)
-    if tokenizer_cls is not None:
-        patch_class(tokenizer_cls)
+    if tokenizer_cls is not None and tokenizer_cls not in tokenizer_classes:
+        tokenizer_classes.append(tokenizer_cls)
+
+try:
+    from transformers.tokenization_utils_tokenizers import TokenizersBackend
+except (ImportError, AttributeError):
+    TokenizersBackend = None
+if TokenizersBackend is not None and TokenizersBackend not in tokenizer_classes:
+    tokenizer_classes.append(TokenizersBackend)
+
+for tokenizer_cls in tokenizer_classes:
+    patch_class(tokenizer_cls)
