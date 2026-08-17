@@ -2,11 +2,13 @@
 """Recover a budget-exhausted A2--D8 gate without changing frozen sources.
 
 This entrypoint is deliberately additive.  It never edits the original stage
-claim or the eight hash-bound training files.  Each retry starts from the most
-recent immutable candidate, keeps the same frozen opponent, and uses a new
-deterministic trainer suffix.  A write-ahead journal and Linux ``renameat2``
-exchange make the successful adapter the canonical same-label population only
-after its complete five-rollout gate has been independently recomputed.
+claim or the eight hash-bound training files.  Exactly one PPO-only retry starts
+from the immutable budget-exhausted candidate, keeps the same frozen opponent,
+and uses a new deterministic trainer suffix.  A second raw-PPO attempt is
+durably forbidden: another miss records a hash-bound objective-migration
+handoff.  A write-ahead journal and Linux ``renameat2`` exchange make a
+successful adapter canonical only after its complete five-rollout gate has
+been independently recomputed.
 """
 
 from __future__ import annotations
@@ -52,9 +54,12 @@ from role_lora_selfplay8 import (  # noqa: E402
 )
 from roll.utils import selfplay_gate_retry as gate_retry_contract  # noqa: E402
 from roll.utils.selfplay_gate_retry import (  # noqa: E402
+    OBJECTIVE_MIGRATION_REQUIRED_STATE_STATUS,
     RECOVERY_KEY,
     RECOVERY_HISTORY_KEY,
+    RAW_PPO_EXHAUSTED_RECOVERY_STATUS,
     PPO_ONLY_RECOVERY_TRAINER_POLICY,
+    build_objective_migration_requirement,
     build_attempt_contract,
     build_ppo_only_recovery_trainer_source,
     build_recovery_history_entry,
@@ -66,12 +71,14 @@ from roll.utils.selfplay_gate_retry import (  # noqa: E402
     reconcile_atomic_population_swap,
     validate_exhausted_attempt,
     validate_final_population_state,
+    validate_raw_ppo_attempt_capacity,
     validate_ppo_only_recovery_manifest,
     validate_recovery_eligibility,
     validate_successful_gate,
     verify_attempt_contract,
     verify_recovery_history,
     verify_recovery_plan,
+    verify_objective_migration_requirement,
 )
 
 
@@ -337,10 +344,8 @@ def train_role_lora_gate_retry_ppo_only(
         early_stop_threshold=float(config["early_stop_threshold"]),
         early_stop_patience=int(config["early_stop_patience"]),
         early_stop_min_steps=int(
-            config[
+            contract["bounded_raw_ppo_retry_policy"][
                 "early_stop_min_steps"
-                if is_attacker
-                else "defender_early_stop_min_steps"
             ]
         ),
     )
@@ -391,6 +396,9 @@ def train_role_lora_gate_retry_ppo_only(
         "frozen_training_implementation_sha256": frozen,
         "recovery_implementation_sha256": current_recovery,
         "effective_trainer_contract": effective_contract,
+        "bounded_raw_ppo_retry_policy": contract[
+            "bounded_raw_ppo_retry_policy"
+        ],
         "implementation_identity": {
             "frozen_core": {
                 "path": "modal_upstream_selfredteam_role_lora.py",
@@ -468,6 +476,7 @@ def _verify_existing_recovery(
         "swap_prepared",
         "promoted_pending_prune",
         "qualified_ready_to_release",
+        RAW_PPO_EXHAUSTED_RECOVERY_STATUS,
         "released",
         "completed",
     }:
@@ -545,7 +554,11 @@ def _verify_existing_recovery(
         or stage.get("transition_state") != "retained"
     ):
         raise RuntimeError("Gate-retry stage is no longer retained")
-    if recovery.get("status") in {"active", "swap_prepared"}:
+    if recovery.get("status") in {
+        "active",
+        "swap_prepared",
+        RAW_PPO_EXHAUSTED_RECOVERY_STATUS,
+    }:
         original = plan["original_nonqualifying_population"]
         if (
             stage.get("population_checkpoint") != original["checkpoint"]
@@ -580,6 +593,49 @@ def _verify_existing_recovery(
     released = recovery.get("status") in {"released", "completed"}
     if bool(recovery.get("official_population_released")) != released:
         raise RuntimeError("Gate-retry release flag/status drifted")
+    successor_release = stage.get("successor_release")
+    if not isinstance(successor_release, dict):
+        raise RuntimeError("Gate-retry successor-release receipt is missing")
+    if released:
+        if (
+            successor_release.get("approved") is not True
+            or successor_release.get("plan_id") != plan_id
+        ):
+            raise RuntimeError("Released gate-retry authorization drifted")
+    elif successor_release.get("approved") is not False:
+        raise RuntimeError("Unqualified gate retry released its successor")
+    if recovery.get("status") == RAW_PPO_EXHAUSTED_RECOVERY_STATUS:
+        attempts = recovery.get("attempts")
+        requirement = recovery.get("objective_migration_requirement")
+        if not isinstance(attempts, list) or not isinstance(requirement, dict):
+            raise RuntimeError("Raw-PPO exhaustion handoff is incomplete")
+        if (
+            state.get("status") != OBJECTIVE_MIGRATION_REQUIRED_STATE_STATUS
+            or state.get("active_stage") != label
+            or stage.get("work_status")
+            != "raw_ppo_retry_exhausted_objective_migration_required"
+            or recovery.get("next_required_action")
+            != requirement.get("required_next_objective")
+        ):
+            raise RuntimeError("Raw-PPO exhaustion state status drifted")
+        verify_objective_migration_requirement(requirement, plan, attempts)
+        _strict_checkpoint(
+            Path(str(requirement["trainable_init_checkpoint"])),
+            expected_sha256=str(requirement["trainable_init_sha256"]),
+        )
+        if recovery.get("active_attempt_id") is not None:
+            raise RuntimeError("Raw-PPO exhaustion retained an active attempt")
+        artifact = recovery.get("objective_migration_requirement_artifact")
+        if not isinstance(artifact, dict):
+            raise RuntimeError("Raw-PPO exhaustion artifact receipt is missing")
+        artifact_path = Path(str(artifact.get("path") or ""))
+        if (
+            _read_json_object(artifact_path) != requirement
+            or file_sha256(artifact_path) != artifact.get("file_sha256")
+            or artifact.get("requirement_id")
+            != requirement.get("requirement_id")
+        ):
+            raise RuntimeError("Raw-PPO exhaustion artifact drifted")
     return recovery
 
 
@@ -676,14 +732,24 @@ def _audit_released_recovery_artifacts(
                 role=str(contract["role"]),
                 threshold=float(state["config"]["early_stop_threshold"]),
                 patience=int(state["config"]["early_stop_patience"]),
-                attacker_min_steps=int(state["config"]["early_stop_min_steps"]),
+                attacker_min_steps=int(
+                    plan["bounded_raw_ppo_retry_policy"][
+                        "early_stop_min_steps"
+                    ]
+                ),
                 defender_min_steps=int(
-                    state["config"]["defender_early_stop_min_steps"]
+                    plan["bounded_raw_ppo_retry_policy"][
+                        "early_stop_min_steps"
+                    ]
                 ),
                 rollout_batch_size=128,
                 expected_budget=int(contract["per_attempt_budget"]),
                 save_steps=int(state["config"]["save_steps"]),
                 expected_final_sha256=str(journal["new_sha256"]),
+                allow_single_checkpoint_change_proof=True,
+                expected_initial_sha256=str(
+                    contract["trainable_init_sha256"]
+                ),
             )
             if successful_gate != attempt.get("gate_result"):
                 raise RuntimeError("Released retry successful gate proof drifted")
@@ -880,6 +946,7 @@ def _create_attempt(
     recovery = _verify_existing_recovery(root, state)
     plan = recovery["plan"]
     attempts = recovery["attempts"]
+    validate_raw_ppo_attempt_capacity(plan, attempts)
     if attempts:
         last = attempts[-1]
         if last.get("status") != "gate_not_reached":
@@ -1015,10 +1082,8 @@ def _validate_attempt_output(
         "threshold": float(state["config"]["early_stop_threshold"]),
         "patience": int(state["config"]["early_stop_patience"]),
         "min_steps": int(
-            state["config"][
+            contract["bounded_raw_ppo_retry_policy"][
                 "early_stop_min_steps"
-                if contract["role"] == "attacker"
-                else "defender_early_stop_min_steps"
             ]
         ),
     }
@@ -1356,6 +1421,86 @@ def _finish_pending_failed_prune(
     return updated, new_sha
 
 
+def _mark_raw_ppo_exhausted(
+    root: Path,
+    state: dict[str, Any],
+    state_sha256: str,
+) -> tuple[dict[str, Any], str]:
+    """Durably stop after one failed raw-PPO retry and require migration."""
+
+    recovery = _verify_existing_recovery(root, state)
+    if recovery.get("status") == RAW_PPO_EXHAUSTED_RECOVERY_STATUS:
+        return state, state_sha256
+    if recovery.get("status") != "active":
+        raise RuntimeError("Raw-PPO exhaustion requires an active recovery")
+    attempts = recovery.get("attempts")
+    if not isinstance(attempts, list):
+        raise RuntimeError("Raw-PPO exhaustion has no attempts list")
+    requirement = build_objective_migration_requirement(
+        recovery["plan"], attempts
+    )
+    _strict_checkpoint(
+        Path(str(requirement["trainable_init_checkpoint"])),
+        expected_sha256=str(requirement["trainable_init_sha256"]),
+    )
+    requirement_path = _recovery_root(
+        root, str(recovery["plan"]["stage_label"])
+    ) / "objective_migration_requirement.json"
+    _write_exact_json(requirement_path, requirement)
+    output_vol.commit()
+    output_vol.reload()
+    current, current_sha = _load_state_snapshot(root)
+    if current_sha != state_sha256 or current != state:
+        raise RuntimeError("State changed while sealing raw-PPO exhaustion")
+    updated = copy.deepcopy(state)
+    updated_recovery = updated[RECOVERY_KEY]
+    updated_recovery.update(
+        {
+            "status": RAW_PPO_EXHAUSTED_RECOVERY_STATUS,
+            "active_attempt_id": None,
+            "objective_migration_requirement": requirement,
+            "objective_migration_requirement_artifact": {
+                "path": str(requirement_path),
+                "file_sha256": file_sha256(requirement_path),
+                "requirement_id": requirement["requirement_id"],
+            },
+            "next_required_action": requirement["required_next_objective"],
+        }
+    )
+    label = str(recovery["plan"]["stage_label"])
+    updated["status"] = OBJECTIVE_MIGRATION_REQUIRED_STATE_STATUS
+    updated["active_stage"] = label
+    updated["stages"][label]["work_status"] = (
+        "raw_ppo_retry_exhausted_objective_migration_required"
+    )
+    new_sha = _persist_state_cas(
+        root,
+        updated,
+        expected_file_sha256=current_sha,
+    )
+    return updated, new_sha
+
+
+def _raw_ppo_exhausted_result(
+    root: Path,
+    state: dict[str, Any],
+    state_sha256: str,
+) -> dict[str, Any]:
+    recovery = _verify_existing_recovery(root, state)
+    if recovery.get("status") != RAW_PPO_EXHAUSTED_RECOVERY_STATUS:
+        raise RuntimeError("Raw-PPO exhaustion result requested too early")
+    return {
+        "root": str(root),
+        "state": state,
+        "state_file_sha256": state_sha256,
+        "spawned": False,
+        "reason": "raw_ppo_retry_exhausted_objective_migration_required",
+        "objective_migration_requirement": recovery[
+            "objective_migration_requirement"
+        ],
+    }
+
+
 def _prepare_successful_swap(
     root: Path,
     state: dict[str, Any],
@@ -1374,12 +1519,18 @@ def _prepare_successful_swap(
         role=str(contract["role"]),
         threshold=float(state["config"]["early_stop_threshold"]),
         patience=int(state["config"]["early_stop_patience"]),
-        attacker_min_steps=int(state["config"]["early_stop_min_steps"]),
-        defender_min_steps=int(state["config"]["defender_early_stop_min_steps"]),
+        attacker_min_steps=int(
+            plan["bounded_raw_ppo_retry_policy"]["early_stop_min_steps"]
+        ),
+        defender_min_steps=int(
+            plan["bounded_raw_ppo_retry_policy"]["early_stop_min_steps"]
+        ),
         rollout_batch_size=128,
         expected_budget=int(contract["per_attempt_budget"]),
         save_steps=int(state["config"]["save_steps"]),
         expected_final_sha256=str(artifact["source_sha256"]),
+        allow_single_checkpoint_change_proof=True,
+        expected_initial_sha256=str(contract["trainable_init_sha256"]),
     )
     label = str(plan["stage_label"])
     staging_root = _recovery_root(root, label) / "swap_staging" / str(
@@ -1509,6 +1660,11 @@ def _reconcile_successful_swap(
             "strict_audit": canonical_audit,
             "gate_retry_plan_id": updated_recovery["plan_id"],
             "gate_retry_attempt_id": attempt["attempt_id"],
+            "gate_retry_early_stop_min_steps": int(
+                updated_recovery["plan"]["bounded_raw_ppo_retry_policy"][
+                    "early_stop_min_steps"
+                ]
+            ),
             "displaced_nonqualifying_population": {
                 "checkpoint": journal["archive"],
                 "sha256": journal["old_sha256"],
@@ -1572,6 +1728,37 @@ def _prune_promoted_attempt(
     return updated, new_sha
 
 
+def _released_retry_plan_for_stage(
+    state: dict[str, Any],
+    stage_label: str,
+) -> dict[str, Any] | None:
+    stage = (state.get("stages") or {}).get(stage_label)
+    if not isinstance(stage, dict):
+        raise RuntimeError(f"Missing stage while resolving retry plan: {stage_label}")
+    expected_plan_id = stage.get("gate_retry_plan_id")
+    if expected_plan_id is None:
+        return None
+    recoveries = [
+        row.get("recovery")
+        for row in (state.get(RECOVERY_HISTORY_KEY) or [])
+        if isinstance(row, dict)
+    ]
+    if isinstance(state.get(RECOVERY_KEY), dict):
+        recoveries.append(state[RECOVERY_KEY])
+    matches = []
+    for recovery in recoveries:
+        if not isinstance(recovery, dict):
+            continue
+        plan = recovery.get("plan")
+        if not isinstance(plan, dict):
+            continue
+        if verify_recovery_plan(plan) == expected_plan_id:
+            matches.append(plan)
+    if len(matches) != 1 or matches[0].get("stage_label") != stage_label:
+        raise RuntimeError(f"Released retry plan is ambiguous: {stage_label}")
+    return matches[0]
+
+
 def _build_final_population_audit(
     root: Path,
     state: dict[str, Any],
@@ -1611,19 +1798,45 @@ def _build_final_population_audit(
             or stage.get("source_sha256") != stage.get("sha256")
         ):
             raise RuntimeError(f"Final validation/state binding drifted: {label}")
+        retry_plan = _released_retry_plan_for_stage(state, label)
+        if retry_plan is None:
+            attacker_min_steps = int(state["config"]["early_stop_min_steps"])
+            defender_min_steps = int(
+                state["config"]["defender_early_stop_min_steps"]
+            )
+            allow_single_checkpoint_change_proof = False
+            expected_initial_sha256 = None
+        else:
+            retry_min_steps = int(
+                retry_plan["bounded_raw_ppo_retry_policy"][
+                    "early_stop_min_steps"
+                ]
+            )
+            if stage.get("gate_retry_early_stop_min_steps") != retry_min_steps:
+                raise RuntimeError(
+                    f"Released retry min-step binding drifted: {label}"
+                )
+            attacker_min_steps = retry_min_steps
+            defender_min_steps = retry_min_steps
+            allow_single_checkpoint_change_proof = True
+            expected_initial_sha256 = str(
+                retry_plan["original_nonqualifying_population"]["sha256"]
+            )
         proof = validate_successful_gate(
             validation,
             role=role,
             threshold=float(state["config"]["early_stop_threshold"]),
             patience=int(state["config"]["early_stop_patience"]),
-            attacker_min_steps=int(state["config"]["early_stop_min_steps"]),
-            defender_min_steps=int(
-                state["config"]["defender_early_stop_min_steps"]
-            ),
+            attacker_min_steps=attacker_min_steps,
+            defender_min_steps=defender_min_steps,
             rollout_batch_size=128,
             expected_budget=budget,
             save_steps=int(state["config"]["save_steps"]),
             expected_final_sha256=str(stage["source_sha256"]),
+            allow_single_checkpoint_change_proof=(
+                allow_single_checkpoint_change_proof
+            ),
+            expected_initial_sha256=expected_initial_sha256,
         )
         gate_proofs[label] = {
             **proof,
@@ -1839,6 +2052,15 @@ def _continue_existing_phase(
         return _prune_promoted_attempt(root, state, state_sha256)
     if status in {"qualified_ready_to_release", "released"}:
         return _release_or_complete(root, state, state_sha256)
+    if status == "active":
+        attempts = recovery.get("attempts")
+        if (
+            isinstance(attempts, list)
+            and attempts
+            and attempts[-1].get("status") == "gate_not_reached"
+            and attempts[-1].get("pruning_complete") is True
+        ):
+            return _mark_raw_ppo_exhausted(root, state, state_sha256)
     return _finish_pending_failed_prune(root, state, state_sha256)
 
 
@@ -1860,6 +2082,7 @@ def _drain_recovery_phase(
             return state, state_sha256
         status = _verify_existing_recovery(root, state).get("status")
         if status not in {
+            "active",
             "swap_prepared",
             "promoted_pending_prune",
             "qualified_ready_to_release",
@@ -1940,14 +2163,11 @@ def _audit_completed_population(
 )
 def resume_role_lora_selfplay8_gate_retry(
     run_suffix: str,
-    attempt_limit: int = 0,
 ) -> dict[str, Any]:
-    """Retry one blocked stage and recursively continue until its gate passes."""
+    """Run at most one hash-bound PPO-only retry for the blocked stage."""
 
     if not _SAFE_SUFFIX_RE.fullmatch(run_suffix or ""):
         raise ValueError("run_suffix must be one safe path component")
-    if attempt_limit < 0:
-        raise ValueError("attempt_limit must be non-negative; zero means unlimited")
     output_vol.reload()
     root = SELFPLAY_ROOT / run_suffix
     state, state_sha = _load_state_snapshot(root)
@@ -1962,7 +2182,9 @@ def resume_role_lora_selfplay8_gate_retry(
     if RECOVERY_KEY not in state:
         state, state_sha = _initialize_recovery(root, state, state_sha)
     else:
-        _verify_existing_recovery(root, state)
+        recovery = _verify_existing_recovery(root, state)
+        if recovery.get("status") == RAW_PPO_EXHAUSTED_RECOVERY_STATUS:
+            return _raw_ppo_exhausted_result(root, state, state_sha)
         state, state_sha = _rollover_released_recovery(
             root,
             state,
@@ -1976,18 +2198,13 @@ def resume_role_lora_selfplay8_gate_retry(
         return phase_result
     state, state_sha = phase_result
     recovery = _verify_existing_recovery(root, state)
+    if recovery.get("status") == RAW_PPO_EXHAUSTED_RECOVERY_STATUS:
+        return _raw_ppo_exhausted_result(root, state, state_sha)
 
     attempts = recovery["attempts"]
     if attempts and attempts[-1].get("status") == "training":
         attempt = attempts[-1]
     else:
-        if attempt_limit and len(attempts) >= attempt_limit:
-            return {
-                "root": str(root),
-                "state": state,
-                "spawned": False,
-                "reason": "attempt_limit_reached",
-            }
         state, state_sha, attempt = _create_attempt(root, state, state_sha)
         recovery = _verify_existing_recovery(root, state)
 
@@ -2028,41 +2245,8 @@ def resume_role_lora_selfplay8_gate_retry(
         source_checkpoint=source_checkpoint,
         artifact=artifact,
     )
-    completed_attempts = len(state[RECOVERY_KEY]["attempts"])
-    if attempt_limit and completed_attempts >= attempt_limit:
-        return {
-            "root": str(root),
-            "state": state,
-            "spawned": False,
-            "reason": "attempt_limit_reached_after_gate_failure",
-        }
-    state, state_sha, next_attempt = _create_attempt(root, state, state_sha)
-    try:
-        call = resume_role_lora_selfplay8_gate_retry.spawn(
-            run_suffix=run_suffix,
-            attempt_limit=attempt_limit,
-        )
-        call_id = call.object_id
-    except BaseException as error:
-        return {
-            "root": str(root),
-            "state": state,
-            "spawned": False,
-            "reason": "next_attempt_dispatch_unknown",
-            "next_attempt_id": next_attempt["attempt_id"],
-            "dispatch_error": {
-                "type": type(error).__name__,
-                "message": str(error),
-            },
-        }
-    return {
-        "root": str(root),
-        "state": state,
-        "spawned": True,
-        "call_id": call_id,
-        "next_attempt_id": next_attempt["attempt_id"],
-        "next_attempt_number": completed_attempts + 1,
-    }
+    state, state_sha = _mark_raw_ppo_exhausted(root, state, state_sha)
+    return _raw_ppo_exhausted_result(root, state, state_sha)
 
 
 @app.function(
@@ -2089,7 +2273,6 @@ def audit_and_finalize_role_lora_selfplay8_population(
 @app.local_entrypoint(name="resume_role_lora_selfplay8_gate_retry")
 def resume_role_lora_selfplay8_gate_retry_local(
     run_suffix: str,
-    attempt_limit: int = 0,
     wait_for_completion: bool = False,
 ) -> None:
     invoke = (
@@ -2097,7 +2280,7 @@ def resume_role_lora_selfplay8_gate_retry_local(
         if wait_for_completion
         else resume_role_lora_selfplay8_gate_retry.spawn
     )
-    result = invoke(run_suffix=run_suffix, attempt_limit=attempt_limit)
+    result = invoke(run_suffix=run_suffix)
     if wait_for_completion:
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     else:

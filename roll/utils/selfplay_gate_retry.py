@@ -2,10 +2,11 @@
 
 The frozen eight-round coordinator intentionally stops when a role exhausts
 its configured budget without a five-rollout success streak.  This module
-defines an additive recovery protocol: failed attempts are immutable
-candidates, the original stage claim remains part of the lineage, and an
-atomically exchanged canonical population directory is released only after a
-later attempt proves the original gate.
+defines an additive recovery protocol: the sole failed raw-PPO retry is an
+immutable candidate, the original stage claim remains part of the lineage, and
+an atomically exchanged canonical population directory is released only if
+that bounded retry proves the original gate.  A second miss fails closed with
+a hash-bound objective-migration requirement.
 
 No Modal, torch, PEFT, or trainer imports belong here.  The remote entrypoint
 is :mod:`modal_role_lora_selfplay8_gate_retry`.
@@ -30,6 +31,15 @@ RECOVERY_KEY = "gate_retry_recovery_v1"
 RECOVERY_HISTORY_KEY = "gate_retry_recovery_history_v1"
 RECOVERY_POLICY = "same-label-gate-retry-v1"
 PPO_ONLY_RECOVERY_TRAINER_POLICY = "same-label-ppo-only-dynamic-clone-v1"
+RAW_PPO_RETRY_POLICY = "single-bounded-raw-ppo-retry-v1"
+RAW_PPO_MAX_ATTEMPTS_PER_STAGE = 1
+RAW_PPO_EXHAUSTED_RECOVERY_STATUS = "raw_ppo_exhausted"
+OBJECTIVE_MIGRATION_REQUIRED_STATE_STATUS = (
+    "stage_objective_migration_required"
+)
+OBJECTIVE_MIGRATION_REQUIREMENT_POLICY = (
+    "binary-joint-objective-migration-required-v1"
+)
 _STAGE_LABEL_RE = re.compile(r"^[AD]([2-8])$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _AT_FDCWD = -100
@@ -61,15 +71,40 @@ def bytes_sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def bounded_raw_ppo_retry_policy() -> dict[str, Any]:
+    """Return the exact immutable policy for one same-stage PPO-only retry."""
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "policy": RAW_PPO_RETRY_POLICY,
+        "max_attempts_per_stage": RAW_PPO_MAX_ATTEMPTS_PER_STAGE,
+        "per_attempt_budget": "the frozen role-specific stage budget",
+        "objective": "unchanged frozen role reward and advantage semantics",
+        "official_payoff_evaluation": (
+            "unchanged official environment reward with no normalization"
+        ),
+        "sft": "disabled from the first retry optimizer step",
+        "early_stop_threshold": 0.95,
+        "early_stop_patience": 5,
+        "early_stop_min_steps": 1,
+        "earliest_possible_stop_step": 5,
+        "single_checkpoint_change_proof": (
+            "final checkpoint SHA256 must differ from the hash-bound initializer"
+        ),
+        "on_exhaustion": "fail closed for binary joint objective migration",
+    }
+
+
 def build_ppo_only_recovery_trainer_source(
     frozen_core_source: str,
 ) -> tuple[str, dict[str, Any]]:
     """Build the narrowly patched, additive PPO-only recovery trainer.
 
-    The frozen module is parsed but never edited.  Exactly two validation
+    The frozen module is parsed but never edited.  Exactly three validation
     guards are narrowed in the cloned function: ``stop_after_step=0`` becomes
-    the explicit no-SFT sentinel, and joint-signed raw defender advantages are
-    allowed only under the otherwise exact PPO-only recipe.
+    the explicit no-SFT sentinel, joint-signed raw defender advantages are
+    allowed under the exact PPO-only recipe, and that same hash-bound recipe
+    alone may start its five-step gate at optimizer step one.
     """
 
     module = ast.parse(frozen_core_source)
@@ -90,7 +125,14 @@ def build_ppo_only_recovery_trainer_source(
         "defender_raw_reinforce_advantages is restricted to defender v2 "
         "continuation training"
     )
-    replacements = {"ppo_only_stop_zero": 0, "ppo_only_joint_signed_raw": 0}
+    minimum_message = (
+        "early_stop_min_steps must be at least early_stop_patience"
+    )
+    replacements = {
+        "ppo_only_stop_zero": 0,
+        "ppo_only_joint_signed_raw": 0,
+        "ppo_only_gate_from_step_one": 0,
+    }
 
     def direct_raise_messages(node: ast.If) -> list[str]:
         values: list[str] = []
@@ -131,10 +173,23 @@ def build_ppo_only_recovery_trainer_source(
                 mode="eval",
             ).body
             replacements["ppo_only_joint_signed_raw"] += 1
+        if minimum_message in messages:
+            node.test = ast.parse(
+                "early_stop_min_steps < early_stop_patience and not ("
+                "early_stop_min_steps == 1 and early_stop_patience == 5 and "
+                "early_stop_threshold == 0.95 and v2_runtime and "
+                "not enable_aux_sft and not role_specific_aux_sft and "
+                "not v2_continuation_sft and "
+                "postfill_cot_stop_after_step == 0 and "
+                "defender_sft_optimizer_slots_per_rollout == 0)",
+                mode="eval",
+            ).body
+            replacements["ppo_only_gate_from_step_one"] += 1
     _require(
         replacements == {
             "ppo_only_stop_zero": 1,
             "ppo_only_joint_signed_raw": 1,
+            "ppo_only_gate_from_step_one": 1,
         },
         f"PPO-only recovery patch surface drifted: {replacements}",
     )
@@ -158,6 +213,9 @@ def build_ppo_only_recovery_trainer_source(
             "v2_continuation_sft": False,
             "postfill_cot_stop_after_step": 0,
             "defender_sft_optimizer_slots_per_rollout": 0,
+            "early_stop_threshold": 0.95,
+            "early_stop_patience": 5,
+            "early_stop_min_steps": 1,
         },
     }
     descriptor["patch_descriptor_sha256"] = canonical_json_sha256(descriptor)
@@ -221,6 +279,7 @@ def verify_ppo_only_recovery_trainer_contract(
         == {
             "ppo_only_stop_zero": 1,
             "ppo_only_joint_signed_raw": 1,
+            "ppo_only_gate_from_step_one": 1,
         },
         "PPO-only patch replacement surface drifted",
     )
@@ -232,6 +291,9 @@ def verify_ppo_only_recovery_trainer_contract(
             "v2_continuation_sft": False,
             "postfill_cot_stop_after_step": 0,
             "defender_sft_optimizer_slots_per_rollout": 0,
+            "early_stop_threshold": 0.95,
+            "early_stop_patience": 5,
+            "early_stop_min_steps": 1,
         },
         "PPO-only trainer recipe drifted",
     )
@@ -279,6 +341,12 @@ def validate_ppo_only_recovery_manifest(
         recovery_manifest.get("recovery_implementation_sha256")
         == contract["recovery_implementation_sha256"],
         "PPO-only additive implementation identity drifted",
+    )
+    _require(
+        recovery_manifest.get("bounded_raw_ppo_retry_policy")
+        == contract["bounded_raw_ppo_retry_policy"]
+        == plan["bounded_raw_ppo_retry_policy"],
+        "PPO-only bounded retry policy drifted",
     )
     effective = recovery_manifest.get("effective_trainer_contract")
     _require(
@@ -537,6 +605,14 @@ def build_recovery_plan(
             )
         ),
     )
+    retry_policy = bounded_raw_ppo_retry_policy()
+    _require(
+        float(state["config"].get("early_stop_threshold", -1.0))
+        == float(retry_policy["early_stop_threshold"])
+        and int(state["config"].get("early_stop_patience", -1))
+        == int(retry_policy["early_stop_patience"]),
+        "Frozen stage gate differs from the bounded raw-PPO retry gate",
+    )
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "policy": RECOVERY_POLICY,
@@ -558,6 +634,7 @@ def build_recovery_plan(
             recovery_implementation_sha256
         ),
         "recovery_trainer_contract": trainer_contract,
+        "bounded_raw_ppo_retry_policy": retry_policy,
         "frozen_selfplay_config": dict(state["config"]),
         "original_failure_evidence": dict(original_failure_evidence),
         "plan_path": plan_path,
@@ -589,6 +666,11 @@ def verify_recovery_plan(plan: Mapping[str, Any]) -> str:
         "Recovery plan stage role drifted",
     )
     _require(int(plan.get("per_attempt_budget", 0)) > 0, "Bad retry budget")
+    _require(
+        plan.get("bounded_raw_ppo_retry_policy")
+        == bounded_raw_ppo_retry_policy(),
+        "Bounded raw-PPO retry policy drifted",
+    )
     _require_sha(plan.get("initial_state_file_sha256"), "initial state file")
     _require_sha(
         plan.get("original_stage_spawn_claim_id"),
@@ -632,6 +714,15 @@ def verify_recovery_plan(plan: Mapping[str, Any]) -> str:
         isinstance(plan.get("frozen_selfplay_config"), Mapping),
         "Recovery plan has no frozen self-play config",
     )
+    retry_policy = plan["bounded_raw_ppo_retry_policy"]
+    frozen_config = plan["frozen_selfplay_config"]
+    _require(
+        float(frozen_config.get("early_stop_threshold", -1.0))
+        == float(retry_policy["early_stop_threshold"])
+        and int(frozen_config.get("early_stop_patience", -1))
+        == int(retry_policy["early_stop_patience"]),
+        "Recovery plan frozen gate differs from its bounded retry gate",
+    )
     trainer_contract = plan.get("recovery_trainer_contract")
     _require(
         isinstance(trainer_contract, Mapping),
@@ -659,6 +750,15 @@ def build_attempt_contract(
 
     plan_id = verify_recovery_plan(plan)
     _require(attempt_number >= 1, "Attempt number must be positive")
+    _require(
+        attempt_number
+        <= int(
+            plan["bounded_raw_ppo_retry_policy"][
+                "max_attempts_per_stage"
+            ]
+        ),
+        "Attempt number exceeds the bounded raw-PPO retry policy",
+    )
     init_sha = _require_sha(trainable_init_sha256, "attempt initializer")
     _require(bool(trainable_init_checkpoint), "Attempt initializer path is empty")
     _require(bool(trainer_run_suffix), "Attempt trainer suffix is empty")
@@ -678,6 +778,9 @@ def build_attempt_contract(
             "original_stage_spawn_claim_id"
         ],
         "per_attempt_budget": int(plan["per_attempt_budget"]),
+        "bounded_raw_ppo_retry_policy": dict(
+            plan["bounded_raw_ppo_retry_policy"]
+        ),
         "trainer_run_suffix": trainer_run_suffix,
         "optimizer_policy": (
             "cold optimizer/scheduler for the first entry of this unique "
@@ -716,6 +819,9 @@ def verify_attempt_contract(
             "original_stage_spawn_claim_id"
         ],
         "per_attempt_budget": plan["per_attempt_budget"],
+        "bounded_raw_ppo_retry_policy": plan[
+            "bounded_raw_ppo_retry_policy"
+        ],
         "fixed_opponent": plan["fixed_opponent"],
         "frozen_training_implementation_sha256": plan[
             "frozen_training_implementation_sha256"
@@ -730,9 +836,16 @@ def verify_attempt_contract(
             contract.get(key) == expected,
             f"Attempt/plan provenance drifted at {key}",
         )
+    attempt_number = int(contract.get("attempt_number", 0))
+    _require(attempt_number >= 1, "Attempt number must be positive")
     _require(
-        int(contract.get("attempt_number", 0)) >= 1,
-        "Attempt number must be positive",
+        attempt_number
+        <= int(
+            plan["bounded_raw_ppo_retry_policy"][
+                "max_attempts_per_stage"
+            ]
+        ),
+        "Attempt number exceeds the bounded raw-PPO retry policy",
     )
     _require(
         bool(contract.get("trainable_init_checkpoint"))
@@ -742,6 +855,133 @@ def verify_attempt_contract(
     )
     _require_sha(contract.get("trainable_init_sha256"), "attempt initializer")
     return stored
+
+
+def validate_raw_ppo_attempt_capacity(
+    plan: Mapping[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+) -> int:
+    """Fail closed before a second raw-PPO attempt can be claimed."""
+
+    verify_recovery_plan(plan)
+    _require(
+        not isinstance(attempts, (str, bytes)),
+        "Raw-PPO attempts must be a sequence of objects",
+    )
+    limit = int(
+        plan["bounded_raw_ppo_retry_policy"]["max_attempts_per_stage"]
+    )
+    _require(
+        len(attempts) < limit,
+        "Bounded raw-PPO retry is exhausted; objective migration is required",
+    )
+    return limit - len(attempts)
+
+
+def build_objective_migration_requirement(
+    plan: Mapping[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Seal the sole failed retry as the initializer for a new objective."""
+
+    plan_id = verify_recovery_plan(plan)
+    _require(
+        not isinstance(attempts, (str, bytes)),
+        "Raw-PPO attempts must be a sequence of objects",
+    )
+    limit = int(
+        plan["bounded_raw_ppo_retry_policy"]["max_attempts_per_stage"]
+    )
+    _require(
+        len(attempts) == limit,
+        "Objective migration requires the exact raw-PPO retry budget",
+    )
+    for index, attempt in enumerate(attempts, start=1):
+        _require(isinstance(attempt, Mapping), "Raw-PPO attempt is not an object")
+        contract = attempt.get("contract")
+        _require(isinstance(contract, Mapping), "Raw-PPO attempt has no contract")
+        attempt_id = verify_attempt_contract(contract, plan)
+        _require(
+            attempt.get("attempt_id") == attempt_id
+            and int(attempt.get("attempt_number", -1)) == index
+            and int(contract.get("attempt_number", -1)) == index,
+            "Raw-PPO attempt ordering or identity drifted",
+        )
+    last = attempts[-1]
+    _require(
+        last.get("status") == "gate_not_reached"
+        and last.get("pruning_complete") is True,
+        "Objective migration requires a fully archived failed raw-PPO retry",
+    )
+    gate = last.get("gate_result")
+    _require(
+        isinstance(gate, Mapping)
+        and gate.get("passed") is True
+        and gate.get("classification")
+        == "gate_not_reached_after_complete_budget",
+        "Objective migration has no complete raw-PPO failure proof",
+    )
+    checkpoint = str(last.get("candidate_checkpoint") or "")
+    _require(bool(checkpoint), "Objective migration initializer path is empty")
+    checkpoint_sha256 = _require_sha(
+        last.get("candidate_sha256"),
+        "objective migration initializer",
+    )
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "policy": OBJECTIVE_MIGRATION_REQUIREMENT_POLICY,
+        "plan_id": plan_id,
+        "stage_label": plan["stage_label"],
+        "role": plan["role"],
+        "completed_raw_ppo_attempts": len(attempts),
+        "raw_ppo_attempt_limit": limit,
+        "source_attempt_id": last["attempt_id"],
+        "trainable_init_checkpoint": checkpoint,
+        "trainable_init_sha256": checkpoint_sha256,
+        "fixed_opponent": dict(plan["fixed_opponent"]),
+        "required_next_objective": (
+            "attacker_binary_joint_goal_and_cot_raw_no_center_no_std"
+            if plan["role"] == "attacker"
+            else "separately_versioned_gate_aligned_objective"
+        ),
+        "required_next_objective_contract": (
+            {
+                "positive_iff": (
+                    "attacker goal success AND CoT valid AND not tie"
+                ),
+                "optimization_reward": {"positive": 1.0, "negative": -1.0},
+                "advantage": "raw_no_center_no_std",
+                "policy_loss": "episode_balanced",
+                "aux_sft": "disabled from the first optimizer step",
+            }
+            if plan["role"] == "attacker"
+            else {
+                "status": "must be designed and separately versioned",
+                "aux_sft": "disabled from the first optimizer step",
+            }
+        ),
+        "official_payoff_evaluation": (
+            "unchanged official environment reward with no normalization; "
+            "the optimization surrogate must not replace or mix with the "
+            "historical PSRO payoff matrix"
+        ),
+        "sft": "permanently disabled",
+        "successor_release": "forbidden until a new objective passes the gate",
+    }
+    payload["requirement_id"] = canonical_json_sha256(payload)
+    return payload
+
+
+def verify_objective_migration_requirement(
+    requirement: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+) -> str:
+    """Verify the durable handoff without accepting caller-provided defaults."""
+
+    expected = build_objective_migration_requirement(plan, attempts)
+    _require(dict(requirement) == expected, "Objective migration handoff drifted")
+    return str(expected["requirement_id"])
 
 
 def build_recovery_history_entry(
@@ -867,6 +1107,8 @@ def validate_checkpoint_cadence(
     expected_final_step: int,
     save_steps: int,
     expected_final_sha256: str | None = None,
+    allow_single_checkpoint_change_proof: bool = False,
+    expected_initial_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Hard-check the real self-play validation shape (required is false)."""
 
@@ -937,10 +1179,31 @@ def validate_checkpoint_cadence(
             expected_digests[str(expected_final_step)] == final_sha,
             "Final checkpoint validation/population digest drifted",
         )
-    _require(
-        validation.get("changed_across_checkpoints") is True,
-        "Checkpoint sequence did not prove changing LoRA weights",
+    changed_across_checkpoints = (
+        validation.get("changed_across_checkpoints") is True
     )
+    single_checkpoint_change_proof = False
+    if not changed_across_checkpoints:
+        _require(
+            allow_single_checkpoint_change_proof
+            and len(expected_steps) == 1
+            and expected_final_sha256 is not None
+            and expected_initial_sha256 is not None,
+            "Checkpoint sequence did not prove changing LoRA weights",
+        )
+        initial_sha = _require_sha(
+            expected_initial_sha256,
+            "single-checkpoint initializer",
+        )
+        final_sha = _require_sha(
+            expected_final_sha256,
+            "single-checkpoint final checkpoint",
+        )
+        _require(
+            final_sha != initial_sha,
+            "Single-checkpoint retry did not change from its initializer",
+        )
+        single_checkpoint_change_proof = True
     return {
         "passed": True,
         "save_steps": save_steps,
@@ -948,6 +1211,8 @@ def validate_checkpoint_cadence(
         "expected_checkpoint_steps": expected_steps,
         "complete_cadence_required": False,
         "complete_cadence_verified": True,
+        "changed_across_checkpoints": changed_across_checkpoints,
+        "single_checkpoint_change_proof": single_checkpoint_change_proof,
     }
 
 
@@ -963,6 +1228,8 @@ def validate_successful_gate(
     expected_budget: int | None = None,
     save_steps: int = 10,
     expected_final_sha256: str | None = None,
+    allow_single_checkpoint_change_proof: bool = False,
+    expected_initial_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Recompute the exact frozen A or joint-H/B D early-stop proof."""
 
@@ -1017,6 +1284,10 @@ def validate_successful_gate(
         expected_final_step=actual_final_step,
         save_steps=save_steps,
         expected_final_sha256=expected_final_sha256,
+        allow_single_checkpoint_change_proof=(
+            allow_single_checkpoint_change_proof
+        ),
+        expected_initial_sha256=expected_initial_sha256,
     )
     tail = _tail_rows(early_stop, patience)
     expected_steps = list(range(actual_final_step - patience + 1, actual_final_step + 1))

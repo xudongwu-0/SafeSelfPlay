@@ -14,7 +14,12 @@ from tempfile import TemporaryDirectory
 
 from role_lora_selfplay8 import build_selfplay8_schedule, population_labels
 from roll.utils.selfplay_gate_retry import (
+    OBJECTIVE_MIGRATION_REQUIRED_STATE_STATUS,
+    RAW_PPO_EXHAUSTED_RECOVERY_STATUS,
+    RAW_PPO_MAX_ATTEMPTS_PER_STAGE,
+    bounded_raw_ppo_retry_policy,
     build_attempt_contract,
+    build_objective_migration_requirement,
     build_ppo_only_recovery_trainer_source,
     build_recovery_history_entry,
     build_recovery_plan,
@@ -25,12 +30,14 @@ from roll.utils.selfplay_gate_retry import (
     validate_final_population_state,
     validate_checkpoint_cadence,
     validate_ppo_only_recovery_manifest,
+    validate_raw_ppo_attempt_capacity,
     validate_recovery_eligibility,
     validate_successful_gate,
     verify_attempt_contract,
     verify_recovery_history,
     verify_recovery_plan,
     verify_ppo_only_recovery_trainer_contract,
+    verify_objective_migration_requirement,
 )
 
 
@@ -81,6 +88,10 @@ def _retry_state() -> tuple[dict, list]:
             "attacker_max_steps": 100,
             "defender_max_steps": 200,
             "save_steps": 10,
+            "early_stop_threshold": 0.95,
+            "early_stop_patience": 5,
+            "early_stop_min_steps": 30,
+            "defender_early_stop_min_steps": 32,
         },
         "stages": {
             "A1": {
@@ -155,6 +166,10 @@ def _d2_plan() -> dict:
             "attacker_max_steps": 100,
             "defender_max_steps": 200,
             "save_steps": 10,
+            "early_stop_threshold": 0.95,
+            "early_stop_patience": 5,
+            "early_stop_min_steps": 30,
+            "defender_early_stop_min_steps": 32,
         },
         "stages": {
             label: {
@@ -346,11 +361,11 @@ class RecoveryIdentityTests(unittest.TestCase):
         self.assertEqual(verify_recovery_plan(plan), plan["plan_id"])
         contract = build_attempt_contract(
             plan,
-            attempt_number=2,
-            trainable_init_checkpoint="/output/attempt_1/A2",
-            trainable_init_sha256=_sha("attempt-1"),
-            trainer_run_suffix="test_A2_gate_retry_002",
-            contract_path="/output/attempt_2/contract.json",
+            attempt_number=1,
+            trainable_init_checkpoint="/output/run/population/A2",
+            trainable_init_sha256=_sha("A2-failed"),
+            trainer_run_suffix="test_A2_gate_retry_001",
+            contract_path="/output/attempt_1/contract.json",
         )
         self.assertEqual(verify_attempt_contract(contract, plan), contract["attempt_id"])
         self.assertIn("cold optimizer", contract["optimizer_policy"])
@@ -363,6 +378,93 @@ class RecoveryIdentityTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "provenance drifted"):
             verify_attempt_contract(changed, plan)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the bounded"):
+            build_attempt_contract(
+                plan,
+                attempt_number=2,
+                trainable_init_checkpoint="/output/attempt_1/A2",
+                trainable_init_sha256=_sha("attempt-1"),
+                trainer_run_suffix="test_A2_gate_retry_002",
+                contract_path="/output/attempt_2/contract.json",
+            )
+        forged_second = copy.deepcopy(contract)
+        forged_second["attempt_number"] = 2
+        forged_second["attempt_id"] = canonical_json_sha256(
+            {
+                key: value
+                for key, value in forged_second.items()
+                if key != "attempt_id"
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "exceeds the bounded"):
+            verify_attempt_contract(forged_second, plan)
+
+    def test_single_raw_retry_capacity_and_migration_handoff_are_hash_bound(self):
+        plan = _plan()
+        self.assertEqual(
+            plan["bounded_raw_ppo_retry_policy"],
+            bounded_raw_ppo_retry_policy(),
+        )
+        self.assertEqual(
+            plan["bounded_raw_ppo_retry_policy"]["early_stop_min_steps"],
+            1,
+        )
+        self.assertEqual(
+            plan["bounded_raw_ppo_retry_policy"][
+                "earliest_possible_stop_step"
+            ],
+            5,
+        )
+        self.assertEqual(RAW_PPO_MAX_ATTEMPTS_PER_STAGE, 1)
+        self.assertEqual(validate_raw_ppo_attempt_capacity(plan, []), 1)
+        contract = build_attempt_contract(
+            plan,
+            attempt_number=1,
+            trainable_init_checkpoint="/output/run/population/A2",
+            trainable_init_sha256=_sha("A2-failed"),
+            trainer_run_suffix="test_A2_gate_retry_001",
+            contract_path="/output/attempt_1/contract.json",
+        )
+        attempt = {
+            "attempt_id": contract["attempt_id"],
+            "attempt_number": 1,
+            "status": "gate_not_reached",
+            "contract": contract,
+            "candidate_checkpoint": "/output/attempt_1/population/A2",
+            "candidate_sha256": _sha("A2-retry-failed"),
+            "pruning_complete": True,
+            "gate_result": {
+                "passed": True,
+                "classification": "gate_not_reached_after_complete_budget",
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "objective migration"):
+            validate_raw_ppo_attempt_capacity(plan, [attempt])
+        requirement = build_objective_migration_requirement(plan, [attempt])
+        self.assertEqual(
+            requirement["trainable_init_sha256"],
+            _sha("A2-retry-failed"),
+        )
+        self.assertEqual(
+            requirement["required_next_objective_contract"][
+                "optimization_reward"
+            ],
+            {"positive": 1.0, "negative": -1.0},
+        )
+        self.assertIn(
+            "must not replace or mix",
+            requirement["official_payoff_evaluation"],
+        )
+        self.assertEqual(
+            verify_objective_migration_requirement(
+                requirement, plan, [attempt]
+            ),
+            requirement["requirement_id"],
+        )
+        changed = copy.deepcopy(requirement)
+        changed["trainable_init_checkpoint"] = "/output/wrong/A2"
+        with self.assertRaisesRegex(RuntimeError, "handoff drifted"):
+            verify_objective_migration_requirement(changed, plan, [attempt])
 
     def test_released_recovery_history_preserves_prior_stage_provenance(self):
         recovery = _released_recovery()
@@ -379,6 +481,50 @@ class RecoveryIdentityTests(unittest.TestCase):
 
 
 class GateValidationTests(unittest.TestCase):
+    def test_retry_gate_can_stop_at_step_five_with_initializer_change_proof(self):
+        validation = _early_stop_validation("attacker")
+        validation["actual_final_step"] = 5
+        validation["final_checkpoint"] = (
+            "/output/run/ckpt/global_step5_hf"
+        )
+        early = validation["early_stop"]
+        early["min_steps"] = 1
+        early["actual_final_step"] = 5
+        early["last_step"] = 5
+        early["checkpoint_tag"] = "global_step5"
+        early["history"] = [
+            {**row, "step": step}
+            for row, step in zip(early["history"], range(1, 6))
+        ]
+        _with_cadence(validation, final_step=5)
+        validation["changed_across_checkpoints"] = False
+        final_sha = _sha("checkpoint-5")
+        proof = validate_successful_gate(
+            validation,
+            role="attacker",
+            attacker_min_steps=1,
+            expected_budget=100,
+            expected_final_sha256=final_sha,
+            allow_single_checkpoint_change_proof=True,
+            expected_initial_sha256=_sha("initializer"),
+        )
+        self.assertEqual(proof["tail_steps"], [1, 2, 3, 4, 5])
+        self.assertTrue(
+            proof["checkpoint_cadence"][
+                "single_checkpoint_change_proof"
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "did not change"):
+            validate_successful_gate(
+                validation,
+                role="attacker",
+                attacker_min_steps=1,
+                expected_budget=100,
+                expected_final_sha256=final_sha,
+                allow_single_checkpoint_change_proof=True,
+                expected_initial_sha256=final_sha,
+            )
+
     def test_captured_live_d1_tail_recomputes_and_rejects_b_companion_drift(self):
         fixture_path = (
             ROOT
@@ -836,6 +982,13 @@ class PpoOnlyRecoveryTrainerTests(unittest.TestCase):
         compile(effective_source, "<effective-ppo-only>", "exec")
         self.assertIn("postfill_cot_stop_after_step == 0", effective_source)
         self.assertIn("defender_sft_optimizer_slots_per_rollout == 0", effective_source)
+        self.assertIn("early_stop_min_steps == 1", effective_source)
+        self.assertEqual(
+            descriptor["patch_replacements"][
+                "ppo_only_gate_from_step_one"
+            ],
+            1,
+        )
         self.assertEqual(frozen_path.read_bytes(), before)
         changed = copy.deepcopy(descriptor)
         changed["ppo_only_recipe"]["enable_aux_sft"] = True
@@ -917,7 +1070,7 @@ class PpoOnlyRecoveryTrainerTests(unittest.TestCase):
             "defender_prompt_pool_sha256": "a" * 64,
             "early_stop_threshold": 0.95,
             "early_stop_patience": 5,
-            "early_stop_min_steps": 32,
+            "early_stop_min_steps": 1,
         }
         attacker = {
             **defender,
@@ -932,12 +1085,23 @@ class PpoOnlyRecoveryTrainerTests(unittest.TestCase):
             "defender_reward_utility": "upstream_additive",
             "defender_prompt_pool_path": "",
             "defender_prompt_pool_sha256": "",
-            "early_stop_min_steps": 30,
+            "early_stop_min_steps": 1,
         }
         for role, recipe in (("defender", defender), ("attacker", attacker)):
             with self.subTest(role=role), self.assertRaises(ReachedRuntimeSetup):
                 train(**recipe)
-        invalid = {**defender, "role_specific_aux_sft": True}
+        for role, recipe in (("defender", defender), ("attacker", attacker)):
+            invalid_minimum = {**recipe, "early_stop_min_steps": 0}
+            with self.subTest(role=role), self.assertRaisesRegex(
+                ValueError,
+                "at least early_stop_patience",
+            ):
+                train(**invalid_minimum)
+        invalid = {
+            **defender,
+            "role_specific_aux_sft": True,
+            "early_stop_min_steps": 5,
+        }
         with self.assertRaisesRegex(ValueError, "requires enable_aux_sft"):
             train(**invalid)
 
@@ -986,6 +1150,9 @@ class PpoOnlyRecoveryTrainerTests(unittest.TestCase):
                         "recovery_implementation_sha256"
                     ],
                     "effective_trainer_contract": effective,
+                    "bounded_raw_ppo_retry_policy": contract[
+                        "bounded_raw_ppo_retry_policy"
+                    ],
                     "implementation_identity": {
                         "frozen_core": {
                             "path": "modal_upstream_selfredteam_role_lora.py",
@@ -1153,6 +1320,7 @@ class AdditiveEntrypointTests(unittest.TestCase):
             "'joint_signed'",
             "config['d1_data_contract']['training_prompt_pool_path']",
             "config['d1_data_contract']['training_prompt_pool_sha256']",
+            "contract['bounded_raw_ppo_retry_policy']['early_stop_min_steps']",
         ):
             self.assertIn(required, rendered_call)
         rendered_function = ast.unparse(function)
@@ -1233,17 +1401,283 @@ class AdditiveEntrypointTests(unittest.TestCase):
             history[0]["recovery"]["release_preservation_audit"]["passed"]
         )
 
-    def test_next_attempt_is_claimed_before_recursive_dispatch(self):
+    def test_raw_retry_has_no_unbounded_argument_or_recursive_dispatch(self):
         source = (ROOT / "modal_role_lora_selfplay8_gate_retry.py").read_text()
-        claim = source.index(
-            "state, state_sha, next_attempt = _create_attempt",
-            source.index("completed_attempts ="),
+        tree = ast.parse(source)
+        remote = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "resume_role_lora_selfplay8_gate_retry"
         )
-        dispatch = source.index(
-            "call = resume_role_lora_selfplay8_gate_retry.spawn",
-            claim,
+        self.assertEqual([arg.arg for arg in remote.args.args], ["run_suffix"])
+        self.assertNotIn("attempt_limit", ast.unparse(remote))
+        self.assertNotIn(
+            "resume_role_lora_selfplay8_gate_retry.spawn",
+            ast.unparse(remote),
         )
-        self.assertLess(claim, dispatch)
+        self.assertIn("_mark_raw_ppo_exhausted", ast.unparse(remote))
+
+    def test_create_attempt_checks_durable_capacity_before_claim(self):
+        source = (ROOT / "modal_role_lora_selfplay8_gate_retry.py").read_text()
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_create_attempt"
+        )
+        rendered = ast.unparse(function)
+        self.assertLess(
+            rendered.index("validate_raw_ppo_attempt_capacity"),
+            rendered.index("build_attempt_contract"),
+        )
+
+    def test_success_and_failure_paths_use_matching_gate_validator_apis(self):
+        source = (
+            ROOT / "modal_role_lora_selfplay8_gate_retry.py"
+        ).read_text()
+        tree = ast.parse(source)
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        def call_keywords(function_name, callee_name):
+            calls = [
+                node
+                for node in ast.walk(functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == callee_name
+            ]
+            self.assertEqual(len(calls), 1)
+            return {keyword.arg for keyword in calls[0].keywords}
+
+        success_keywords = call_keywords(
+            "_prepare_successful_swap",
+            "validate_successful_gate",
+        )
+        self.assertIn(
+            "allow_single_checkpoint_change_proof",
+            success_keywords,
+        )
+        self.assertIn("expected_initial_sha256", success_keywords)
+        failure_keywords = call_keywords(
+            "_archive_failed_attempt",
+            "validate_exhausted_attempt",
+        )
+        self.assertNotIn(
+            "allow_single_checkpoint_change_proof",
+            failure_keywords,
+        )
+        self.assertNotIn("expected_initial_sha256", failure_keywords)
+
+    def test_failed_retry_seals_terminal_objective_migration_state(self):
+        plan = _plan()
+        contract = build_attempt_contract(
+            plan,
+            attempt_number=1,
+            trainable_init_checkpoint="/output/run/population/A2",
+            trainable_init_sha256=_sha("A2-failed"),
+            trainer_run_suffix="test_A2_gate_retry_001",
+            contract_path="/output/attempt_1/contract.json",
+        )
+        attempt = {
+            "attempt_id": contract["attempt_id"],
+            "attempt_number": 1,
+            "status": "gate_not_reached",
+            "contract": contract,
+            "candidate_checkpoint": "/output/attempt_1/population/A2",
+            "candidate_sha256": _sha("A2-retry-failed"),
+            "pruning_complete": True,
+            "gate_result": {
+                "passed": True,
+                "classification": "gate_not_reached_after_complete_budget",
+            },
+        }
+        state = {
+            "status": "stage_target_not_reached",
+            "active_stage": "A2",
+            "stages": {"A2": {"work_status": "retained"}},
+            "gate_retry_recovery_v1": {
+                "status": "active",
+                "plan": plan,
+                "attempts": [attempt],
+                "active_attempt_id": None,
+            },
+        }
+        source_path = ROOT / "modal_role_lora_selfplay8_gate_retry.py"
+        tree = ast.parse(source_path.read_text())
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_mark_raw_ppo_exhausted"
+        )
+
+        class Volume:
+            def commit(self):
+                return None
+
+            def reload(self):
+                return None
+
+        captured = {}
+
+        def persist(_root, value, *, expected_file_sha256):
+            self.assertEqual(expected_file_sha256, _sha("state"))
+            captured["state"] = copy.deepcopy(value)
+            return _sha("terminal-state")
+
+        namespace = {
+            "Any": object,
+            "Path": Path,
+            "RuntimeError": RuntimeError,
+            "copy": copy,
+            "RECOVERY_KEY": "gate_retry_recovery_v1",
+            "RAW_PPO_EXHAUSTED_RECOVERY_STATUS": (
+                RAW_PPO_EXHAUSTED_RECOVERY_STATUS
+            ),
+            "OBJECTIVE_MIGRATION_REQUIRED_STATE_STATUS": (
+                OBJECTIVE_MIGRATION_REQUIRED_STATE_STATUS
+            ),
+            "_verify_existing_recovery": (
+                lambda _root, value: value["gate_retry_recovery_v1"]
+            ),
+            "build_objective_migration_requirement": (
+                build_objective_migration_requirement
+            ),
+            "_strict_checkpoint": lambda *_args, **_kwargs: {},
+            "_recovery_root": lambda _root, _label: Path("/recovery/A2"),
+            "_write_exact_json": (
+                lambda path, value: captured.update(
+                    artifact_path=str(path), artifact=copy.deepcopy(value)
+                )
+            ),
+            "output_vol": Volume(),
+            "_load_state_snapshot": lambda _root: (state, _sha("state")),
+            "file_sha256": lambda _path: _sha("artifact"),
+            "_persist_state_cas": persist,
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[function], type_ignores=[])
+                ),
+                str(source_path),
+                "exec",
+            ),
+            namespace,
+        )
+        updated, updated_sha = namespace["_mark_raw_ppo_exhausted"](
+            Path("/output/run"), state, _sha("state")
+        )
+        self.assertEqual(updated_sha, _sha("terminal-state"))
+        self.assertEqual(
+            updated["status"], OBJECTIVE_MIGRATION_REQUIRED_STATE_STATUS
+        )
+        recovery = updated["gate_retry_recovery_v1"]
+        self.assertEqual(
+            recovery["status"], RAW_PPO_EXHAUSTED_RECOVERY_STATUS
+        )
+        self.assertIsNone(recovery["active_attempt_id"])
+        self.assertEqual(
+            recovery["objective_migration_requirement"][
+                "trainable_init_sha256"
+            ],
+            _sha("A2-retry-failed"),
+        )
+        self.assertEqual(
+            recovery["next_required_action"],
+            "attacker_binary_joint_goal_and_cot_raw_no_center_no_std",
+        )
+        self.assertEqual(len(recovery["attempts"]), 1)
+        self.assertEqual(
+            updated["stages"]["A2"]["work_status"],
+            "raw_ppo_retry_exhausted_objective_migration_required",
+        )
+
+    def test_preempted_failed_retry_is_sealed_instead_of_claiming_attempt_two(self):
+        source_path = ROOT / "modal_role_lora_selfplay8_gate_retry.py"
+        tree = ast.parse(source_path.read_text())
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_continue_existing_phase"
+        )
+        state = {
+            "gate_retry_recovery_v1": {
+                "status": "active",
+                "attempts": [
+                    {
+                        "status": "gate_not_reached",
+                        "pruning_complete": True,
+                    }
+                ],
+            }
+        }
+        calls = []
+        namespace = {
+            "Any": object,
+            "Path": Path,
+            "RECOVERY_KEY": "gate_retry_recovery_v1",
+            "_verify_existing_recovery": (
+                lambda _root, value: value["gate_retry_recovery_v1"]
+            ),
+            "_reconcile_successful_swap": lambda *_args: "swap",
+            "_prune_promoted_attempt": lambda *_args: "prune",
+            "_release_or_complete": lambda *_args: "release",
+            "_mark_raw_ppo_exhausted": (
+                lambda *_args: calls.append("exhausted") or "sealed"
+            ),
+            "_finish_pending_failed_prune": (
+                lambda *_args: calls.append("prune-failed") or "pending"
+            ),
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[function], type_ignores=[])
+                ),
+                str(source_path),
+                "exec",
+            ),
+            namespace,
+        )
+        result = namespace["_continue_existing_phase"](
+            Path("/output/run"), state, _sha("state")
+        )
+        self.assertEqual(result, "sealed")
+        self.assertEqual(calls, ["exhausted"])
+
+    def test_terminal_reentry_live_audits_migration_initializer(self):
+        source = (
+            ROOT / "modal_role_lora_selfplay8_gate_retry.py"
+        ).read_text()
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_verify_existing_recovery"
+        )
+        strict_calls = [
+            ast.unparse(node)
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_strict_checkpoint"
+        ]
+        self.assertTrue(
+            any(
+                "requirement['trainable_init_checkpoint']" in call
+                and "requirement['trainable_init_sha256']" in call
+                for call in strict_calls
+            )
+        )
 
     def test_already_audited_path_rebuilds_live_and_requires_exact_artifact(self):
         source_path = ROOT / "modal_role_lora_selfplay8_gate_retry.py"
@@ -1361,10 +1795,19 @@ class AdditiveEntrypointTests(unittest.TestCase):
             },
             "stages": stages,
         }
+        retry_plan = _plan()
+        stages["A2"]["gate_retry_plan_id"] = retry_plan["plan_id"]
+        stages["A2"]["gate_retry_early_stop_min_steps"] = 1
         recomputed = []
 
         def recompute(_validation, *, role, expected_budget, **kwargs):
-            recomputed.append((role, expected_budget, kwargs["expected_final_sha256"]))
+            recomputed.append(
+                {
+                    "role": role,
+                    "expected_budget": expected_budget,
+                    **kwargs,
+                }
+            )
             return {"passed": True, "role": role}
 
         captured = {}
@@ -1392,6 +1835,9 @@ class AdditiveEntrypointTests(unittest.TestCase):
             "validate_successful_gate": recompute,
             "file_sha256": lambda path: _sha(str(path)),
             "verify_recovery_history": lambda _history: [],
+            "_released_retry_plan_for_stage": (
+                lambda _state, label: retry_plan if label == "A2" else None
+            ),
             "_audit_released_recovery_artifacts": lambda *_args: None,
             "validate_final_population_state": final_state,
             "checkpoint_weight_digest": lambda _path: "unused",
@@ -1422,6 +1868,18 @@ class AdditiveEntrypointTests(unittest.TestCase):
         self.assertIn("D1", captured["proofs"])
         self.assertNotIn("A1", captured["proofs"])
         self.assertEqual(artifact["observed_checkpoint_count"], 16)
+        a2 = recomputed[1]
+        self.assertEqual(a2["role"], "attacker")
+        self.assertEqual(a2["attacker_min_steps"], 1)
+        self.assertTrue(a2["allow_single_checkpoint_change_proof"])
+        self.assertEqual(
+            a2["expected_initial_sha256"],
+            retry_plan["original_nonqualifying_population"]["sha256"],
+        )
+        self.assertEqual(recomputed[0]["defender_min_steps"], 32)
+        self.assertFalse(
+            recomputed[0]["allow_single_checkpoint_change_proof"]
+        )
 
     def test_canonical_hash_is_format_independent(self):
         first = {"b": [2, 1], "a": {"x": True}}
