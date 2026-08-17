@@ -1,0 +1,115 @@
+{
+  "fixture_provenance": {
+    "kind": "schema-complete regression fixture from the retained live D1 stop tail",
+    "run_suffix": "selfplay8_v3_joint_20260817_013808",
+    "captured_actual_final_step": 57,
+    "note": "Gate metrics/counts are captured values; checkpoint digests are deterministic test stand-ins because the live Volume is not vendored."
+  },
+  "requested_max_step": 200,
+  "actual_final_step": 57,
+  "expected_step": 57,
+  "final_step": 57,
+  "final_checkpoint": "/output/upstream_selfredteam_role_lora/captured_D1/ckpt/global_step57_hf",
+  "checkpoint_sha256": {
+    "10": "1111111111111111111111111111111111111111111111111111111111111111",
+    "20": "2222222222222222222222222222222222222222222222222222222222222222",
+    "30": "3333333333333333333333333333333333333333333333333333333333333333",
+    "40": "4444444444444444444444444444444444444444444444444444444444444444",
+    "50": "5555555555555555555555555555555555555555555555555555555555555555",
+    "57": "6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "expected_checkpoint_steps": [10, 20, 30, 40, 50, 57],
+  "expected_checkpoint_count": 6,
+  "observed_checkpoint_steps": [10, 20, 30, 40, 50, 57],
+  "observed_expected_checkpoint_count": 6,
+  "missing_checkpoint_steps": [],
+  "expected_checkpoint_sha256": {
+    "10": "1111111111111111111111111111111111111111111111111111111111111111",
+    "20": "2222222222222222222222222222222222222222222222222222222222222222",
+    "30": "3333333333333333333333333333333333333333333333333333333333333333",
+    "40": "4444444444444444444444444444444444444444444444444444444444444444",
+    "50": "5555555555555555555555555555555555555555555555555555555555555555",
+    "57": "6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "complete_cadence_required": false,
+  "complete_cadence_verified": true,
+  "changed_across_checkpoints": true,
+  "stopped_early": true,
+  "early_stop": {
+    "metric": "defender/wildguard_actual_harmful_joint_success",
+    "threshold": 0.95,
+    "patience": 5,
+    "min_steps": 32,
+    "last_step": 57,
+    "streak": 5,
+    "triggered": true,
+    "checkpoint_tag": "global_step57",
+    "actual_final_step": 57,
+    "companion_bounds": {
+      "defender/wildguard_actual_harmful_count": {
+        "direction": "min",
+        "bound": 61.0
+      },
+      "defender/wildguard_actual_benign_joint_success": {
+        "direction": "min",
+        "bound": 0.95
+      },
+      "defender/wildguard_actual_benign_count": {
+        "direction": "min",
+        "bound": 61.0
+      }
+    },
+    "history": [
+      {
+        "step": 53,
+        "value": 1.0,
+        "metrics": {
+          "defender/wildguard_actual_harmful_count": 64,
+          "defender/wildguard_actual_benign_joint_success": 0.967741935483871,
+          "defender/wildguard_actual_benign_count": 62
+        },
+        "qualified": true
+      },
+      {
+        "step": 54,
+        "value": 1.0,
+        "metrics": {
+          "defender/wildguard_actual_harmful_count": 64,
+          "defender/wildguard_actual_benign_joint_success": 0.984375,
+          "defender/wildguard_actual_benign_count": 64
+        },
+        "qualified": true
+      },
+      {
+        "step": 55,
+        "value": 1.0,
+        "metrics": {
+          "defender/wildguard_actual_harmful_count": 64,
+          "defender/wildguard_actual_benign_joint_success": 0.9682539682539683,
+          "defender/wildguard_actual_benign_count": 63
+        },
+        "qualified": true
+      },
+      {
+        "step": 56,
+        "value": 1.0,
+        "metrics": {
+          "defender/wildguard_actual_harmful_count": 64,
+          "defender/wildguard_actual_benign_joint_success": 0.9682539682539683,
+          "defender/wildguard_actual_benign_count": 63
+        },
+        "qualified": true
+      },
+      {
+        "step": 57,
+        "value": 1.0,
+        "metrics": {
+          "defender/wildguard_actual_harmful_count": 64,
+          "defender/wildguard_actual_benign_joint_success": 0.9523809523809523,
+          "defender/wildguard_actual_benign_count": 63
+        },
+        "qualified": true
+      }
+    ]
+  }
+}
