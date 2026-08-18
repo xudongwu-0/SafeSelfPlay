@@ -328,12 +328,26 @@ CORE_TASKS = (
     "harmbench_precompute",
 )
 
+# Paper Table 9's benign-compliance columns come from WJB adversarial-benign
+# and XSTest all-safe.  The two OR-Bench/XSTest RTA measurements are included
+# here as boundary checks: a defender can obtain low harmful ASR by refusing
+# everything, so compliance and appropriate-refusal metrics must be read
+# together.  StrongREJECT is unavailable in the released evaluation fork.
+BENIGN_BOUNDARY_TASKS = (
+    "or_bench:toxic",
+    "xstest",
+    "wildjailbreak:benign",
+    "or_bench:hard-1k",
+)
+FULL_DEFENDER_TASKS = CORE_TASKS + BENIGN_BOUNDARY_TASKS
+
 
 @app.function(
     gpu="A100-40GB:2",
     cpu=32,
     memory=131072,
     timeout=43200,
+    retries=modal.Retries(max_retries=2, backoff_coefficient=2.0, initial_delay=15.0),
     volumes={
         "/root/.cache/huggingface": hf_cache,
         "/output": roll_output,
@@ -432,6 +446,17 @@ def evaluate_full_checkpoint_vs_base(
             report_path = model_dir / f"metrics.{task}.json"
             individual_path = model_dir / f"individual.{task}.json"
             log_path = model_dir / f"eval.{task}.log"
+            if report_path.exists() and individual_path.exists():
+                try:
+                    existing_report = json.loads(report_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    existing_report = {}
+                if task in existing_report:
+                    print(
+                        f"EVAL_SKIP_COMPLETE model={model_name} task={task}",
+                        flush=True,
+                    )
+                    return model_name, task
             command = [
                 sys.executable,
                 str(eval_script),
@@ -475,7 +500,7 @@ def evaluate_full_checkpoint_vs_base(
 
     jobs = [
         (model_name, model_path, task)
-        for task in CORE_TASKS
+        for task in FULL_DEFENDER_TASKS
         for model_name, model_path in models.items()
     ]
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -487,7 +512,7 @@ def evaluate_full_checkpoint_vs_base(
     for model_name in models:
         merged: dict[str, Any] = {}
         model_dir = output_root / model_name
-        for task in CORE_TASKS:
+        for task in FULL_DEFENDER_TASKS:
             merged.update(json.loads((model_dir / f"metrics.{task}.json").read_text()))
         (model_dir / "metrics.json").write_text(
             json.dumps(merged, indent=2, ensure_ascii=False)
@@ -501,6 +526,11 @@ def evaluate_full_checkpoint_vs_base(
         "WJB harmful ASR": 0.938,
         "DAN ASR": 0.910,
         "HarmBench adv ASR": 0.575,
+        "OR-Bench RTA": 0.099,
+        "XSTest RTA": 0.415,
+        "WJB benign comply": 0.932,
+        "XSTest benign comply": 0.940,
+        "OR-Bench benign comply": 0.972,
     }
     columns = (
         "WG adv ASR",
@@ -508,7 +538,16 @@ def evaluate_full_checkpoint_vs_base(
         "WJB harmful ASR",
         "DAN ASR",
         "HarmBench adv ASR",
+        "OR-Bench RTA",
+        "XSTest RTA",
+        "WJB benign comply",
+        "XSTest benign comply",
+        "OR-Bench benign comply",
     )
+    directions = {
+        column: ("lower" if column.endswith("ASR") else "higher")
+        for column in columns
+    }
     comparison_json = output_root / "comparison.json"
     comparison_json.write_text(
         json.dumps(
@@ -520,6 +559,7 @@ def evaluate_full_checkpoint_vs_base(
                     "paired_current_run" if evaluate_base
                     else "previous_full_released_evaluator_run"
                 ),
+                "directions": directions,
                 "measured_base": (
                     measured.get("base_same_template", measured_base)
                 ),
@@ -532,9 +572,15 @@ def evaluate_full_checkpoint_vs_base(
     lines = [
         f"# Full Defender Evaluation: {trained_label}",
         "",
-        "Released-evaluator run. All columns are lower-is-better.",
+        "Released-evaluator run. ASR is lower-is-better; RTA and benign",
+        "compliance are higher-is-better.",
         "",
-        "| Model | " + " | ".join(f"{column} ↓" for column in columns) + " |",
+        "| Model | "
+        + " | ".join(
+            f"{column} {'↓' if directions[column] == 'lower' else '↑'}"
+            for column in columns
+        )
+        + " |",
         "|---|" + "---:|" * len(columns),
     ]
     table_rows = [

@@ -50,25 +50,31 @@ tokenizer = AutoTokenizer.from_pretrained(
 
 ### Defender results
 
-All metrics are attack success rates, so lower is better. The first two rows
-are reported by Self-RedTeam; the remaining rows use our released evaluator
-with the same `llama3_cot` template. They are separated because paper-reported
-and locally measured numbers are not a paired evaluation.
+The first two rows are reported by Self-RedTeam; the remaining rows use our
+released evaluator with the same `llama3_cot` template. They are separated
+because paper-reported and locally measured numbers are not a paired
+evaluation. A dash means the paper did not report that supplemental column.
 
-| Model | Source | WG adv ASR ↓ | WG vanilla ASR ↓ | WJB harmful ASR ↓ | DAN ASR ↓ | HarmBench adv ASR ↓ |
-|---|---|---:|---:|---:|---:|---:|
-| Llama-3.1-8B-Instruct-abliterated | Paper | 0.478 | 0.553 | 0.991 | 0.937 | 0.654 |
-| Self-RedTeam + SFT, step 200 | Paper | 0.138 | 0.019 | 0.240 | 0.396 | 0.221 |
-| Llama-3.1-8B-Instruct-abliterated | Our evaluation | 0.424 | 0.454 | 0.938 | 0.910 | 0.575 |
-| Self-RedTeam reproduction, step 200 | Our evaluation | 0.095 | 0.019 | 0.159 | 0.400 | 0.196 |
-| SafeSelfPlay D1, LoRA generation 1 step 100 | Our evaluation | 0.036 | 0.007 | 0.145 | 0.200 | 0.066 |
-| SafeSelfPlay D2, LoRA generation 2 step 80 | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 |
-| SafeSelfPlay D3, LoRA generation 3 step 80 | Our evaluation | 0.003 | 0.000 | 0.031 | 0.090 | 0.031 |
+| Model | Source | WG adv ASR ↓ | WG vanilla ASR ↓ | WJB harmful ASR ↓ | DAN ASR ↓ | HarmBench adv ASR ↓ | OR-Bench RTA ↑ | XSTest RTA ↑ | WJB benign comply ↑ | XSTest benign comply ↑ | OR-Bench benign comply ↑ |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Llama-3.1-8B-Instruct-abliterated | Paper | 0.478 | 0.553 | 0.991 | 0.937 | 0.654 | 0.014 | 0.290 | 0.992 | 0.988 | - |
+| Self-RedTeam + SFT, step 200 | Paper | 0.138 | 0.019 | 0.240 | 0.396 | 0.221 | 0.846 | 0.814 | 0.806 | 0.920 | - |
+| Llama-3.1-8B-Instruct-abliterated | Our evaluation | 0.424 | 0.454 | 0.938 | 0.910 | 0.575 | 0.099 | 0.415 | 0.932 | 0.940 | 0.972 |
+| Self-RedTeam reproduction, step 200 | Our evaluation | 0.095 | 0.019 | 0.159 | 0.400 | 0.196 | 0.925 | 0.835 | 0.780 | 0.880 | 0.365 |
+| SafeSelfPlay D1, LoRA generation 1 step 100 | Our evaluation | 0.036 | 0.007 | 0.145 | 0.200 | 0.066 | 0.916 | 0.945 | 0.612 | 0.836 | 0.367 |
+| SafeSelfPlay D2, LoRA generation 2 step 80 | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 | 0.802 | 0.670 | 0.584 | 0.984 | 0.510 |
+| SafeSelfPlay D3, LoRA generation 3 step 80 | Our evaluation | 0.003 | 0.000 | 0.031 | 0.090 | 0.031 | 0.860 | 0.780 | 0.604 | 0.980 | 0.430 |
+
+The five ASR columns contain harmful prompts and are lower-is-better. OR-Bench
+RTA and XSTest RTA also contain harmful or contrast prompts, but report the
+safe-response rate (`1 - ASR`), so they are higher-is-better. WJB adversarial
+benign, XSTest vanilla benign, and OR-Bench hard-1k measure whether the model
+still complies with benign requests; lower values on these columns indicate
+more over-refusal. The released evaluator does not include StrongREJECT.
 
 The D1-D3 rows use the same rank-64 role-LoRA parameterization but
 different step budgets and opponents; they document completed generations and
-should not be read as a controlled inter-generation ablation. These harmful
-ASR metrics do not measure benign-response utility or over-refusal.
+should not be read as a controlled inter-generation ablation.
 
 ## 2. Train Role LoRAs
 
@@ -129,8 +135,10 @@ TRAINED_LABEL=our_D3 \
 ./run_selfredteam_eval.sh
 ```
 
-The evaluator reports WG adversarial, WG vanilla, WJB harmful, DAN, and
-HarmBench ASR. All are lower-is-better. Results are written under
+The evaluator runs WG adversarial/vanilla, WJB harmful, DAN, HarmBench,
+OR-Bench toxic, XSTest, WJB benign, and OR-Bench hard-1k. It reports harmful
+ASR (lower is better), harmful RTA (higher is better), and benign compliance
+(higher is better). Both aggregate and per-example results are written under
 `/output/upstream_selfredteam_role_full_eval/<OUTPUT_SLUG>`.
 
 ## 4. PSRO
