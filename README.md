@@ -48,6 +48,26 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 ```
 
+### Defender results
+
+All metrics are attack success rates, so lower is better. The first two rows
+are reported by Self-RedTeam; the remaining rows use our released evaluator
+with the same `llama3_cot` template. They are separated because paper-reported
+and locally measured numbers are not a paired evaluation.
+
+| Model | Source | WG adv ASR ↓ | WG vanilla ASR ↓ | WJB harmful ASR ↓ | DAN ASR ↓ | HarmBench adv ASR ↓ |
+|---|---|---:|---:|---:|---:|---:|
+| Llama-3.1-8B-Instruct-abliterated | Paper | 0.478 | 0.553 | 0.991 | 0.937 | 0.654 |
+| Self-RedTeam + SFT, step 200 | Paper | 0.138 | 0.019 | 0.240 | 0.396 | 0.221 |
+| Llama-3.1-8B-Instruct-abliterated | Our evaluation | 0.424 | 0.454 | 0.938 | 0.910 | 0.575 |
+| Self-RedTeam reproduction, step 200 | Our evaluation | 0.095 | 0.019 | 0.159 | 0.400 | 0.196 |
+| SafeSelfPlay D1, full-parameter step 200 | Our evaluation | 0.042 | 0.005 | 0.149 | 0.130 | 0.071 |
+| SafeSelfPlay D2, LoRA generation 2 step 80 | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 |
+
+The D1 and D2 rows use different parameterizations and budgets; they document
+completed checkpoints and should not be read as a controlled D1-vs-D2
+ablation.
+
 ## 2. Train Role LoRAs
 
 Cold-start A1 then D1:
