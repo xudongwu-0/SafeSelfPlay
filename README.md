@@ -6,6 +6,33 @@ self-play. It uses the public
 pipeline, PEFT/LLaMA-Factory LoRA adapters, and PSRO-style checkpoint pools.
 Training and evaluation run remotely on Modal.
 
+## New-machine setup
+
+Clone this repository and prepare the pinned upstream source as a sibling
+directory. The helper creates `../selfplay-redteaming` at the revision expected
+by the launchers and tests:
+
+```bash
+git clone git@github.com:xudongwu-0/SafeSelfPlay.git
+cd SafeSelfPlay
+./setup_selfredteam_upstream.sh
+python -m pip install modal
+modal setup
+modal secret create roll-secrets WANDB_API_KEY=<key> HF_TOKEN=<token>
+```
+
+The Hugging Face account behind `HF_TOKEN` must be able to download the gated
+models used by the selected run. When the new machine logs into the same Modal
+workspace, existing cloud volumes and detached runs remain available; the main
+ones are `roll-abs-benchmark-output`, `selfredteam-official-output`, and
+`roll-hf-cache`. A different Modal workspace starts with empty volumes, so use
+the published `xudongwu/SafeSelfPlay-checkpoints` artifacts or copy the required
+checkpoints explicitly.
+
+Local `checkpoints/`, model caches, W&B caches, PDFs, and untracked experiment
+launchers are not part of Git. Modal builds the CUDA/Python runtime remotely,
+so a local GPU is not required for the documented commands.
+
 ## 1. Reproduce Self-RedTeam
 
 Prepare the exact upstream source revision:

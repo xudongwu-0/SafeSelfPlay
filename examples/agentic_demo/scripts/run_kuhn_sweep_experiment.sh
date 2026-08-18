@@ -8,7 +8,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --gpus-per-node=4
 
-set -ex
+set -e
 
 # Save positional args before sourcing (activate script uses $@)
 HYDRA_OVERRIDES=("$@")
@@ -20,8 +20,9 @@ conda activate /projects/bfoz/wchen11/anaconda3/envs/roll2
 # Restore positional args
 set -- "${HYDRA_OVERRIDES[@]}"
 
-export WANDB_API_KEY="${WANDB_API_KEY:-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}"
-export HF_TOKEN="${HF_TOKEN:-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}"
+: "${WANDB_API_KEY:?Set WANDB_API_KEY before launching the sweep}"
+: "${HF_TOKEN:?Set HF_TOKEN before launching the sweep}"
+export WANDB_API_KEY HF_TOKEN
 export TMPDIR=/tmp/pip_build_$$
 mkdir -p $TMPDIR
 
