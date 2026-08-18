@@ -5110,7 +5110,9 @@ def _patch_upstream_defender_metric_keys() -> None:
         )
         global_raw_upstream_additive_sum = strategy.all_reduce(
             sum(
-                float(item.info.get("raw_upstream_additive_reward", 0.0))
+                float(
+                    item.info.get("raw_upstream_additive_reward") or 0.0
+                )
                 for item in defender_items
             ),
             "sum",

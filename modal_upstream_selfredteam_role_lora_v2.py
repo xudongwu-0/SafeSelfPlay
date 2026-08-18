@@ -2458,6 +2458,180 @@ def train_lora_v2_a2_d2(
     return manifest
 
 
+@lora_v2_app.function(
+    image=llamafactory_lora_image,
+    gpu=os.environ.get("UPSTREAM_ROLE_LORA_V2_GPU", "H200:4"),
+    cpu=8,
+    timeout=43200,
+    memory=65536,
+    volumes={
+        "/root/.cache/huggingface": hf_cache,
+        "/output": output_vol,
+    },
+    secrets=[modal.Secret.from_name("roll-secrets")],
+)
+def train_lora_v2_defender_only(
+    attacker_adapter: str,
+    defender_start_adapter: str,
+    target_generation: int,
+    steps: int = 80,
+    lora_rank: int = 64,
+    lora_alpha: int = 64,
+    learning_rate: float = 4e-5,
+    sft_stop_after_step: int = 10,
+    sft_batches_per_step: int = 1,
+    save_steps: int = 10,
+    actor_lr_scheduler: str = "constant_with_warmup",
+    lr_warmup_ratio: float = 0.05,
+    run_suffix: str = "",
+) -> dict[str, object]:
+    """Recover one defender generation from completed policy adapters."""
+    if target_generation < 1:
+        raise ValueError("target_generation must be positive")
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    if lora_rank < 1 or lora_alpha < 1:
+        raise ValueError("LoRA rank and alpha must be positive")
+    if learning_rate <= 0:
+        raise ValueError("learning_rate must be positive")
+    if not 0 <= sft_stop_after_step <= steps:
+        raise ValueError("SFT cutoff must be in [0, steps]")
+    if sft_batches_per_step < 1 or save_steps < 1:
+        raise ValueError("SFT batches and save interval must be positive")
+    if actor_lr_scheduler not in {
+        "cosine_with_min_lr", "constant", "constant_with_warmup"
+    }:
+        raise ValueError("unsupported actor_lr_scheduler")
+    if not 0 <= lr_warmup_ratio <= 1:
+        raise ValueError("lr_warmup_ratio must be in [0, 1]")
+
+    attacker = Path(attacker_adapter)
+    defender_start = Path(defender_start_adapter)
+    if not _adapter_checkpoint(attacker):
+        raise FileNotFoundError(f"Missing attacker adapter: {attacker}")
+    if not _adapter_checkpoint(defender_start):
+        raise FileNotFoundError(
+            f"Missing defender start adapter: {defender_start}"
+        )
+
+    target_defender = f"D{target_generation}"
+    source_defender = f"D{target_generation - 1}"
+    opponent_attacker = f"A{target_generation}"
+    suffix = run_suffix or datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = Path(OUTPUT_ROOT) / (
+        f"selfplay_{target_defender}_recovery_s{steps}_"
+        f"r{lora_rank}a{lora_alpha}_{suffix}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, object] = {
+        "method": "sequential two-policy Self-RedTeam defender recovery",
+        "base_model": BASE_MODEL,
+        "target_generation": target_generation,
+        "role_order": [target_defender],
+        "lineage": {
+            target_defender: {
+                "initialized_from": str(defender_start),
+                "opponent": str(attacker),
+            }
+        },
+        "steps": steps,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "target_modules": list(LORA_TARGET_MODULES),
+        "learning_rate": learning_rate,
+        "sft_stop_after_step": sft_stop_after_step,
+        "sft_batches_per_step": sft_batches_per_step,
+        "save_steps": save_steps,
+        "actor_lr_scheduler": actor_lr_scheduler,
+        "lr_warmup_ratio": lr_warmup_ratio,
+        "rollout_batch_size": 128,
+        "train_batch_size": 32,
+        "micro_train_batch_size": 8,
+        "kl_penalty": 0.0,
+        "reference_kl_monitored_against": str(defender_start),
+        "status": "defender",
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    output_vol.commit()
+
+    run_dir = root / (
+        f"{target_defender}_from_{source_defender}_s{steps}_"
+        f"vs_{opponent_attacker}"
+    )
+    defender_checkpoint = _run_role(
+        role="defender",
+        role_start_adapter=str(defender_start),
+        fixed_opponent=BASE_MODEL,
+        fixed_opponent_adapter=str(attacker),
+        remote_rm_url=_stable_wildguard_rm_url(),
+        run_dir=run_dir,
+        steps=steps,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        learning_rate=learning_rate,
+        sft_stop_after_step=sft_stop_after_step,
+        sft_batches_per_step=sft_batches_per_step,
+        save_steps=save_steps,
+        actor_lr_scheduler=actor_lr_scheduler,
+        lr_warmup_ratio=lr_warmup_ratio,
+    )
+    manifest.update(
+        status="completed",
+        defender_checkpoint=str(defender_checkpoint),
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    output_vol.commit()
+    return manifest
+
+
+@lora_v2_app.function(cpu=1, timeout=86400)
+def train_lora_v2_defender_only_and_eval(
+    attacker_adapter: str,
+    defender_start_adapter: str,
+    target_generation: int,
+    steps: int = 80,
+    lora_rank: int = 64,
+    lora_alpha: int = 64,
+    learning_rate: float = 4e-5,
+    sft_stop_after_step: int = 10,
+    sft_batches_per_step: int = 1,
+    save_steps: int = 10,
+    actor_lr_scheduler: str = "constant_with_warmup",
+    lr_warmup_ratio: float = 0.05,
+    run_suffix: str = "",
+) -> dict[str, object]:
+    """Recover one defender generation, then run the canonical evaluation."""
+    training = train_lora_v2_defender_only.remote(
+        attacker_adapter=attacker_adapter,
+        defender_start_adapter=defender_start_adapter,
+        target_generation=target_generation,
+        steps=steps,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        learning_rate=learning_rate,
+        sft_stop_after_step=sft_stop_after_step,
+        sft_batches_per_step=sft_batches_per_step,
+        save_steps=save_steps,
+        actor_lr_scheduler=actor_lr_scheduler,
+        lr_warmup_ratio=lr_warmup_ratio,
+        run_suffix=run_suffix,
+    )
+    target_generation = int(training["target_generation"])
+    defender_checkpoint = str(training["defender_checkpoint"])
+    evaluator = modal.Function.from_name(
+        "selfredteam-official-eval",
+        "evaluate_full_checkpoint_vs_base",
+    )
+    evaluation = evaluator.remote(
+        trained_checkpoint=defender_checkpoint,
+        output_slug=f"D{target_generation}_recovery",
+        trained_label=f"our_selfplay_D{target_generation}",
+        evaluate_base=False,
+    )
+    return {"training": training, "evaluation": evaluation}
+
+
 @lora_v2_app.function(cpu=1, timeout=86400)
 def train_lora_v2_a2_d2_and_eval(
     attacker_start_adapter: str,

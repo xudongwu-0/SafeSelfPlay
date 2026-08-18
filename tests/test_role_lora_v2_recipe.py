@@ -810,6 +810,10 @@ class RoleLoRAV2RecipeTest(unittest.TestCase):
             "defender/wildguard_actual_benign_joint_success", source
         )
         self.assertIn(
+            'item.info.get("raw_upstream_additive_reward") or 0.0',
+            source,
+        )
+        self.assertIn(
             "only the disjoint paired-1024 gate authorizes A2", source
         )
         with tempfile.TemporaryDirectory() as directory:
