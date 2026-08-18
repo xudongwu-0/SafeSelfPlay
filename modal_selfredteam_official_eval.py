@@ -346,7 +346,7 @@ def evaluate_full_checkpoint_vs_base(
     trained_label: str = "trained_defender",
     evaluate_base: bool = True,
 ) -> dict[str, str]:
-    """Paired core defender evaluation for a full checkpoint and its base."""
+    """Paired core defender evaluation for a full checkpoint or PEFT adapter."""
     token = os.environ.get("HF_TOKEN") or os.environ.get("HF_HUB_TOKEN")
     if not token:
         raise RuntimeError("roll-secrets does not contain a Hugging Face token")
@@ -359,13 +359,63 @@ def evaluate_full_checkpoint_vs_base(
     )
     os.environ.setdefault("OPENAI_API_KEY", "dummy")
 
-    trained = Path(trained_checkpoint)
-    if not (trained / "model.safetensors.index.json").exists():
-        raise FileNotFoundError(f"Full HF checkpoint not found: {trained}")
     output_root = Path("/output/upstream_selfredteam_role_full_eval") / output_slug
     output_root.mkdir(parents=True, exist_ok=True)
+    trained = Path(trained_checkpoint)
+    full_checkpoint = trained
+    full_model_files = (
+        trained / "model.safetensors.index.json",
+        trained / "model.safetensors",
+        trained / "pytorch_model.bin.index.json",
+        trained / "pytorch_model.bin",
+    )
+    if not any(path.exists() for path in full_model_files):
+        adapter_files = (
+            trained / "adapter_model.safetensors",
+            trained / "adapter_model.bin",
+        )
+        if not (trained / "adapter_config.json").exists() or not any(
+            path.exists() for path in adapter_files
+        ):
+            raise FileNotFoundError(
+                f"Neither a full HF checkpoint nor a PEFT adapter was found: {trained}"
+            )
+
+        import gc
+
+        import torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        full_checkpoint = output_root / "merged_defender"
+        if not any((full_checkpoint / name).exists() for name in (
+            "model.safetensors.index.json",
+            "model.safetensors",
+        )):
+            print(f"MERGE_START adapter={trained} output={full_checkpoint}", flush=True)
+            base = AutoModelForCausalLM.from_pretrained(
+                BASE_MODEL,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                device_map={"": "cpu"},
+            )
+            peft_model = PeftModel.from_pretrained(
+                base, str(trained), is_trainable=False
+            )
+            merged = peft_model.merge_and_unload(safe_merge=True)
+            full_checkpoint.mkdir(parents=True, exist_ok=True)
+            merged.save_pretrained(
+                full_checkpoint, safe_serialization=True, max_shard_size="5GB"
+            )
+            AutoTokenizer.from_pretrained(BASE_MODEL).save_pretrained(full_checkpoint)
+            del merged, peft_model, base
+            gc.collect()
+            torch.cuda.empty_cache()
+            roll_output.commit()
+            print(f"MERGE_DONE output={full_checkpoint}", flush=True)
+
     eval_script = fork_root / "evaluation/eval.py"
-    models = {trained_label: trained_checkpoint}
+    models = {trained_label: str(full_checkpoint)}
     if evaluate_base:
         models["base_same_template"] = BASE_MODEL
 
@@ -464,6 +514,7 @@ def evaluate_full_checkpoint_vs_base(
         json.dumps(
             {
                 "trained_checkpoint": trained_checkpoint,
+                "evaluated_checkpoint": str(full_checkpoint),
                 "chat_template": "llama3_cot",
                 "base_source": (
                     "paired_current_run" if evaluate_base
@@ -503,6 +554,7 @@ def evaluate_full_checkpoint_vs_base(
         "comparison_json": str(comparison_json),
         "comparison_md": str(comparison_md),
         "trained_checkpoint": trained_checkpoint,
+        "evaluated_checkpoint": str(full_checkpoint),
         "base_model": BASE_MODEL,
     }
 

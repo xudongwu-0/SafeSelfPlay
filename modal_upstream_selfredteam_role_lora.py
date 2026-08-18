@@ -3770,7 +3770,9 @@ def _patch_upstream_role_lr_scheduler() -> None:
             actor_scheduler = get_scheduler(
                 "constant_with_warmup",
                 actor_optim,
-                num_warmup_steps=actor_lr_warmup_steps,
+                num_warmup_steps=math.ceil(
+                    max_steps * args.lr_warmup_ratio
+                ),
             )
         elif actor_lr_scheduler == "cosine_with_min_lr":
             actor_scheduler = get_scheduler(
@@ -4338,6 +4340,7 @@ def _patch_upstream_comprehensive_wandb_logging() -> None:
                 # original comprehensive ROLL workspace. Missing quantities
                 # (for example true vocabulary entropy) are left absent.
                 direct_aliases = {
+                    "train/kl": "kl",
                     "actor/pg_loss": "train/policy_loss",
                     "actor/total_loss": "train/policy_loss",
                     "actor/lr": "train/actor_lr",
