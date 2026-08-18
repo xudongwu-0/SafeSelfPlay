@@ -61,12 +61,12 @@ and locally measured numbers are not a paired evaluation.
 | Self-RedTeam + SFT, step 200 | Paper | 0.138 | 0.019 | 0.240 | 0.396 | 0.221 |
 | Llama-3.1-8B-Instruct-abliterated | Our evaluation | 0.424 | 0.454 | 0.938 | 0.910 | 0.575 |
 | Self-RedTeam reproduction, step 200 | Our evaluation | 0.095 | 0.019 | 0.159 | 0.400 | 0.196 |
-| SafeSelfPlay D1, full-parameter step 200 | Our evaluation | 0.042 | 0.005 | 0.149 | 0.130 | 0.071 |
+| SafeSelfPlay D1, LoRA generation 1 step 100 | Our evaluation | 0.036 | 0.007 | 0.145 | 0.200 | 0.066 |
 | SafeSelfPlay D2, LoRA generation 2 step 80 | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 |
 
-The D1 and D2 rows use different parameterizations and budgets; they document
-completed checkpoints and should not be read as a controlled D1-vs-D2
-ablation.
+The D1 and D2 rows use the same rank-64 role-LoRA parameterization but
+different step budgets and opponents; they document completed generations and
+should not be read as a controlled D1-vs-D2 ablation.
 
 ## 2. Train Role LoRAs
 

@@ -530,9 +530,9 @@ def evaluate_full_checkpoint_vs_base(
         )
     )
     lines = [
-        "# Full Defender D1 vs Base",
+        f"# Full Defender Evaluation: {trained_label}",
         "",
-        "Paired released-evaluator run. All columns are lower-is-better.",
+        "Released-evaluator run. All columns are lower-is-better.",
         "",
         "| Model | " + " | ".join(f"{column} ↓" for column in columns) + " |",
         "|---|" + "---:|" * len(columns),
