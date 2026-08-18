@@ -31,20 +31,16 @@ training code.
 
 ## Key Files
 
-- `ABS_PSRO_README.md` — experiment protocol, naming, W&B tables, payoff
-  caching, and the `5 x 100` PSRO schedule.
-- `ABS_PSRO_EXPERIMENT_CONSTRAINTS.md` — collaborator-facing constraints and
-  method boundaries.
-- `examples/agentic_demo/agent_abs_redteam_vanilla_3b.yaml` — ABS-style 3B
-  GRPO/LoRA configuration.
-- `roll/pipeline/agentic/env/red_team_safety/env.py` — safety self-play
-  environment and reward computation.
-- `modal_abs_benchmark.py` — Modal training/evaluation utilities and WildGuard
-  reward service.
-- `modal_sft_base_psro_once.py` — long-running Modal PSRO loop where the SFT
-  attacker starts against a base defender.
-- `scripts/abs_sft/` — prompt-optimization and SFT data-generation scripts for
-  attacker rewrite instruction following.
+- `modal_upstream_selfredteam_role_lora_v2.py` - the canonical LoRA training,
+  continuation, audit, and remote orchestration implementation.
+- `run_selfredteam_lora_a1d1_h200x4.sh` - cold-start `A1 -> D1` training.
+- `run_selfredteam_lora_a2d2_h200x4.sh` - continued `A2 -> D2` self-play and
+  automatic D2 evaluation.
+- `modal_selfredteam_official_eval.py` - paired defender benchmark evaluation.
+- `data/safety_selfplay/` - the cleaned attacker SFT set, generation prompts,
+  and data-quality report used by the canonical run.
+- `roll/pipeline/agentic/env/red_team_safety/env.py` - safety game and reward
+  implementation.
 
 ## Training Quick Start
 
@@ -57,30 +53,9 @@ modal secret create roll-secrets WANDB_API_KEY=<wandb-key> HF_TOKEN=<hf-token>
 modal run modal_abs_benchmark.py --mode check-token
 ```
 
-There are two canonical role-training launchers. Both execute one sequential
-round: `A1 from base vs base defender`, followed by `D1 from base vs frozen
-A1`. The inactive role is never updated. These scripts intentionally do not
-perform a PSRO payoff update; their checkpoints are the inputs to the
-multi-round PSRO driver documented in `ABS_PSRO_README.md`.
-
-### Full-Parameter A1 -> D1
-
-```bash
-./run_selfredteam_full_a1d1_h200x4.sh
-```
-
-The default is A200 followed by D200 on four H200 GPUs. Both roles use a
-separate full-parameter copy of
-`mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated` and LR `1e-6`.
-
-```bash
-STEPS_PER_ROLE=100 \
-LEARNING_RATE=2e-6 \
-ATTACKER_SFT_STOP_AFTER_STEP=30 \
-DEFENDER_SFT_STOP_AFTER_STEP=10 \
-RUN_SUFFIX=full_lr_probe \
-./run_selfredteam_full_a1d1_h200x4.sh
-```
+Only the LoRA v2 launchers below are canonical. Older experiment entrypoints
+remain implementation history and must not be used for a new comparable run.
+Each role has an independent adapter, and the inactive role is frozen.
 
 ### LoRA A1 -> D1
 
@@ -105,38 +80,39 @@ RUN_SUFFIX=lora_formal \
 After A1 and D1 exist, run the next sequential self-play iteration with:
 
 ```bash
+ATTACKER_START_ADAPTER=/output/.../A1/ckpt/global_step100_hf \
+DEFENDER_START_ADAPTER=/output/.../D1/ckpt/global_step100_hf \
 ./run_selfredteam_lora_a2d2_h200x4.sh
 ```
 
 This continues the existing adapters instead of cold-starting them: A2 starts
 from A1 and trains for 80 steps against frozen D1; D2 starts from D1 and trains
 for 80 steps against frozen A2. The remote orchestrator then evaluates D2 on
-WG adversarial, WG vanilla, WJB harmful, DAN, and HarmBench. Override
-`ATTACKER_START_ADAPTER` and `DEFENDER_START_ADAPTER` when using a different
-pool generation.
+WG adversarial, WG vanilla, WJB harmful, DAN, and HarmBench. Both starting
+adapter paths are required so the checkpoint lineage is explicit.
 
-Both scripts use `modal run --detach`, so the remote call survives an SSH
+Both launchers use `modal run --detach`, so the remote call survives an SSH
 disconnect. Training curves and raw trajectory tables are written to the W&B
 `self-play` project; checkpoints and manifests are written to the persistent
 Modal `/output` volume.
 
 ## Canonical Parameters
 
-| Setting | Full default | LoRA default | Meaning |
-| --- | ---: | ---: | --- |
-| Base model | Llama 3.1 8B abliterated | same | Independent initialization for each role |
-| Steps per role | 200 | 100 | Optimizer updates in A1 and again in D1 |
-| Attacker LR | `1e-6` | `1e-5` | Actor optimizer LR during A1 |
-| Defender LR | `1e-6` | `4e-5` | Actor optimizer LR during D1/D2 |
-| LoRA rank / alpha | n/a | `64 / 64` | Adapter capacity and scaling |
-| Rollout / train / micro batch | `128 / 32 / 8` | `128 / 32 / 8` | Prompts sampled, replay batch, per-device micro batch |
-| Attacker SFT cutoff | 30 | 30 | Role-specific format SFT is active through this step |
-| Defender SFT cutoff | 10 | 10 | Defender format SFT is active through this step |
-| KL loss coefficient | `0` | `0` | KL is monitored against role start but is not penalized |
-| LoRA LR schedule | n/a | constant with warmup | Fixed LR after warmup |
-| LoRA warmup ratio | n/a | `0.05` | First 5% of role steps warm up the LR |
-| Checkpoint interval | pipeline default | 10 | Optimizer steps between saved checkpoints |
-| Reward | upstream `general_sum` | same | Self-RedTeam role reward, unchanged |
+| Setting | Canonical value | Meaning |
+| --- | ---: | --- |
+| Base model | Llama 3.1 8B abliterated | Independent initialization for A1 and D1 |
+| A1/D1 steps | `100 / 100` | Optimizer updates per cold-start role |
+| A2/D2 steps | `80 / 80` | Optimizer updates per continued role |
+| Attacker LR | `1e-5` | Actor optimizer LR during A1/A2 |
+| Defender LR | `4e-5` | Actor optimizer LR during D1/D2 |
+| LoRA rank / alpha | `64 / 64` | Adapter capacity and scaling |
+| Rollout / train / micro batch | `128 / 32 / 8` | Prompts, replay batch, per-device micro batch |
+| Attacker SFT cutoff | 30 | Role-specific format SFT is active through this step |
+| Defender SFT cutoff | 10 | Defender format SFT is active through this step |
+| KL loss coefficient | `0` | Role-start KL is monitored but not penalized |
+| LR schedule / warmup | constant / `0.05` | Constant LR after a 5% warmup |
+| Checkpoint interval | 10 | Optimizer steps between checkpoints |
+| Reward | upstream `general_sum` | Self-RedTeam role reward, unchanged |
 
 Every step consumes a rollout batch of 128 prompts. Therefore A100 + D100 is
 200 optimizer updates and 25,600 role-conditioned prompt rollouts in total;

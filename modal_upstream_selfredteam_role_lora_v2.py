@@ -59,11 +59,10 @@ ATTACKER_RL_SFT_DATA = "/tmp/attacker_rewrite_1180_rl_continuation.jsonl"
 DEFENDER_RL_SFT_ROOT = Path("/tmp/defender_rl_sft")
 SELFPLAY_LOCAL = Path(__file__).resolve().parent.parent / "selfplay-redteaming"
 ATTACKER_SFT_LOCAL = (
-    Path(__file__).resolve().parent.parent
-    / "checkpoints"
-    / "abs_attacker_sft_runs"
-    / "abs_attacker_sft_qwen25_3b_lora_r32_1180_20260715_010540_retry1"
-    / "sft_train.cleaned.jsonl"
+    Path(__file__).resolve().parent
+    / "data"
+    / "safety_selfplay"
+    / "attacker_rewrite_1180.jsonl"
 )
 LORA_TARGET_MODULES = (
     "q_proj",

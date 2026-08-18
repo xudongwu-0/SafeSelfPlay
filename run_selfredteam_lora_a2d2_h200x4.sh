@@ -8,8 +8,8 @@ cd "$(dirname "$0")"
 #   D2 = continue D1 for 80 steps against frozen A2.
 # The CPU orchestration task keeps running remotely after SSH disconnects and
 # starts the released five-benchmark defender evaluation when D2 is complete.
-ATTACKER_START_ADAPTER="${ATTACKER_START_ADAPTER:-/output/upstream_selfredteam_role_lora_v2/attacker_r64a64_s100_lr1e-05_A1_r64_lr1e5_s100_warm5_const_sft30_20260808_080708/ckpt/global_step100_hf}"
-DEFENDER_START_ADAPTER="${DEFENDER_START_ADAPTER:-/output/upstream_selfredteam_role_lora_v2/dual_lora_A100D100_r64a64_lora_lr2x_A2e5_D4e5_20260809_150103/D1_lora_s100_vs_A1_s100/ckpt/global_step100_hf}"
+: "${ATTACKER_START_ADAPTER:?Set ATTACKER_START_ADAPTER to the A1 adapter path}"
+: "${DEFENDER_START_ADAPTER:?Set DEFENDER_START_ADAPTER to the D1 adapter path}"
 STEPS_PER_ROLE="${STEPS_PER_ROLE:-80}"
 LORA_RANK="${LORA_RANK:-64}"
 LORA_ALPHA="${LORA_ALPHA:-64}"
