@@ -34,8 +34,8 @@ training code.
 - `modal_upstream_selfredteam_role_lora_v2.py` - the canonical LoRA training,
   continuation, audit, and remote orchestration implementation.
 - `run_selfredteam_lora_a1d1_h200x4.sh` - cold-start `A1 -> D1` training.
-- `run_selfredteam_lora_a2d2_h200x4.sh` - continued `A2 -> D2` self-play and
-  automatic D2 evaluation.
+- `run_selfredteam_lora_next_round_h200x4.sh` - continued role self-play and
+  automatic evaluation of the new defender.
 - `modal_selfredteam_official_eval.py` - paired defender benchmark evaluation.
 - `data/safety_selfplay/` - the cleaned attacker SFT set, generation prompts,
   and data-quality report used by the canonical run.
@@ -82,7 +82,8 @@ After A1 and D1 exist, run the next sequential self-play iteration with:
 ```bash
 ATTACKER_START_ADAPTER=/output/.../A1/ckpt/global_step100_hf \
 DEFENDER_START_ADAPTER=/output/.../D1/ckpt/global_step100_hf \
-./run_selfredteam_lora_a2d2_h200x4.sh
+SOURCE_GENERATION=1 \
+./run_selfredteam_lora_next_round_h200x4.sh
 ```
 
 This continues the existing adapters instead of cold-starting them: A2 starts
@@ -90,6 +91,9 @@ from A1 and trains for 80 steps against frozen D1; D2 starts from D1 and trains
 for 80 steps against frozen A2. The remote orchestrator then evaluates D2 on
 WG adversarial, WG vanilla, WJB harmful, DAN, and HarmBench. Both starting
 adapter paths are required so the checkpoint lineage is explicit.
+For the next round, pass the A2/D2 paths and set `SOURCE_GENERATION=2`; the
+same launcher then produces A3/D3 labels throughout W&B, manifests, checkpoint
+directories, and the automatic defender evaluation.
 
 Both launchers use `modal run --detach`, so the remote call survives an SSH
 disconnect. Training curves and raw trajectory tables are written to the W&B

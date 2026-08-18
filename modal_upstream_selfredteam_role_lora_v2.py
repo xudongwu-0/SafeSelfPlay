@@ -2292,6 +2292,7 @@ def train_lora_v2_a1_d1(
 def train_lora_v2_a2_d2(
     attacker_start_adapter: str,
     defender_start_adapter: str,
+    source_generation: int = 1,
     steps_per_role: int = 80,
     lora_rank: int = 64,
     lora_alpha: int = 64,
@@ -2305,7 +2306,14 @@ def train_lora_v2_a2_d2(
     lr_warmup_ratio: float = 0.05,
     run_suffix: str = "",
 ) -> dict[str, object]:
-    """Continue A1 into A2, then continue D1 into D2 against frozen A2."""
+    """Train the next attacker and defender generation sequentially."""
+    if source_generation < 1:
+        raise ValueError("source_generation must be positive")
+    target_generation = source_generation + 1
+    source_attacker = f"A{source_generation}"
+    source_defender = f"D{source_generation}"
+    target_attacker = f"A{target_generation}"
+    target_defender = f"D{target_generation}"
     if steps_per_role < 1:
         raise ValueError("steps_per_role must be positive")
     if lora_rank < 1 or lora_alpha < 1:
@@ -2330,23 +2338,36 @@ def train_lora_v2_a2_d2(
     attacker_start = Path(attacker_start_adapter)
     defender_start = Path(defender_start_adapter)
     if not _adapter_checkpoint(attacker_start):
-        raise FileNotFoundError(f"Missing A1 adapter: {attacker_start}")
+        raise FileNotFoundError(
+            f"Missing {source_attacker} adapter: {attacker_start}"
+        )
     if not _adapter_checkpoint(defender_start):
-        raise FileNotFoundError(f"Missing D1 adapter: {defender_start}")
+        raise FileNotFoundError(
+            f"Missing {source_defender} adapter: {defender_start}"
+        )
 
     suffix = run_suffix or datetime.now().strftime("%Y%m%d_%H%M%S")
     root = Path(OUTPUT_ROOT) / (
-        f"selfplay_A2D2_A{steps_per_role}D{steps_per_role}_"
+        f"selfplay_{target_attacker}{target_defender}_"
+        f"A{steps_per_role}D{steps_per_role}_"
         f"r{lora_rank}a{lora_alpha}_{suffix}"
     )
     root.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, object] = {
         "method": "sequential two-policy Self-RedTeam continuation",
         "base_model": BASE_MODEL,
-        "role_order": ["A2", "D2"],
+        "source_generation": source_generation,
+        "target_generation": target_generation,
+        "role_order": [target_attacker, target_defender],
         "lineage": {
-            "A2": {"initialized_from": str(attacker_start), "opponent": str(defender_start)},
-            "D2": {"initialized_from": str(defender_start), "opponent": "A2"},
+            target_attacker: {
+                "initialized_from": str(attacker_start),
+                "opponent": str(defender_start),
+            },
+            target_defender: {
+                "initialized_from": str(defender_start),
+                "opponent": target_attacker,
+            },
         },
         "steps_per_role": steps_per_role,
         "lora_rank": lora_rank,
@@ -2366,8 +2387,8 @@ def train_lora_v2_a2_d2(
         "prompt_budget_per_role": 128 * steps_per_role,
         "kl_penalty": 0.0,
         "reference_kl_monitored_against": {
-            "A2": str(attacker_start),
-            "D2": str(defender_start),
+            target_attacker: str(attacker_start),
+            target_defender: str(defender_start),
         },
         "status": "attacker",
     }
@@ -2376,7 +2397,10 @@ def train_lora_v2_a2_d2(
     output_vol.commit()
 
     rm_url = _stable_wildguard_rm_url()
-    attacker_dir = root / f"A2_from_A1_s{steps_per_role}_vs_D1"
+    attacker_dir = root / (
+        f"{target_attacker}_from_{source_attacker}_"
+        f"s{steps_per_role}_vs_{source_defender}"
+    )
     attacker_checkpoint = _run_role(
         role="attacker",
         role_start_adapter=str(attacker_start),
@@ -2398,11 +2422,16 @@ def train_lora_v2_a2_d2(
         status="defender",
         attacker_checkpoint=str(attacker_checkpoint),
     )
-    manifest["lineage"]["D2"]["opponent"] = str(attacker_checkpoint)
+    manifest["lineage"][target_defender]["opponent"] = str(
+        attacker_checkpoint
+    )
     manifest_path.write_text(json.dumps(manifest, indent=2))
     output_vol.commit()
 
-    defender_dir = root / f"D2_from_D1_s{steps_per_role}_vs_A2"
+    defender_dir = root / (
+        f"{target_defender}_from_{source_defender}_"
+        f"s{steps_per_role}_vs_{target_attacker}"
+    )
     defender_checkpoint = _run_role(
         role="defender",
         role_start_adapter=str(defender_start),
@@ -2433,6 +2462,7 @@ def train_lora_v2_a2_d2(
 def train_lora_v2_a2_d2_and_eval(
     attacker_start_adapter: str,
     defender_start_adapter: str,
+    source_generation: int = 1,
     steps_per_role: int = 80,
     lora_rank: int = 64,
     lora_alpha: int = 64,
@@ -2446,10 +2476,12 @@ def train_lora_v2_a2_d2_and_eval(
     lr_warmup_ratio: float = 0.05,
     run_suffix: str = "",
 ) -> dict[str, object]:
-    """Keep orchestration remote: train A2/D2, then evaluate only D2."""
+    """Train one continued generation remotely, then evaluate its defender."""
+    target_generation = source_generation + 1
     training = train_lora_v2_a2_d2.remote(
         attacker_start_adapter=attacker_start_adapter,
         defender_start_adapter=defender_start_adapter,
+        source_generation=source_generation,
         steps_per_role=steps_per_role,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
@@ -2464,15 +2496,15 @@ def train_lora_v2_a2_d2_and_eval(
         run_suffix=run_suffix,
     )
     defender_checkpoint = str(training["defender_checkpoint"])
-    output_suffix = run_suffix or "a2d2"
+    output_suffix = run_suffix or f"a{target_generation}d{target_generation}"
     evaluator = modal.Function.from_name(
         "selfredteam-official-eval",
         "evaluate_full_checkpoint_vs_base",
     )
     evaluation = evaluator.remote(
         trained_checkpoint=defender_checkpoint,
-        output_slug=f"D2_{output_suffix}",
-        trained_label="our_selfplay_D2",
+        output_slug=f"D{target_generation}_{output_suffix}",
+        trained_label=f"our_selfplay_D{target_generation}",
         evaluate_base=False,
     )
     return {"training": training, "evaluation": evaluation}
