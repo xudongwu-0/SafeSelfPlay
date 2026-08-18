@@ -46,51 +46,146 @@ training code.
 - `scripts/abs_sft/` — prompt-optimization and SFT data-generation scripts for
   attacker rewrite instruction following.
 
-## Quick Start
+## Training Quick Start
 
-Modal is the intended execution path for these experiments.
+Training is remote-only through Modal; the launchers never use the local GPU.
+Create the required secret once, then verify access to WildGuard:
 
 ```bash
 cd /home/xudong/work/self_play/ROLL
 modal secret create roll-secrets WANDB_API_KEY=<wandb-key> HF_TOKEN=<hf-token>
-```
-
-Check access to the gated WildGuard assets:
-
-```bash
 modal run modal_abs_benchmark.py --mode check-token
 ```
 
-Run the canonical A10Gx4 entrypoint. It calls the same direct Modal training
-function used by the completed A10Gx4 probes, uses the Self-RedTeam
-optimization pipeline, and trains the attacker and defender as separate
-ABS-style LoRA policies:
+There are two canonical role-training launchers. Both execute one sequential
+round: `A1 from base vs base defender`, followed by `D1 from base vs frozen
+A1`. The inactive role is never updated. These scripts intentionally do not
+perform a PSRO payoff update; their checkpoints are the inputs to the
+multi-round PSRO driver documented in `ABS_PSRO_README.md`.
+
+### Full-Parameter A1 -> D1
 
 ```bash
-ITERATIONS=1 ./run_selfredteam_abs_a10g4.sh
+./run_selfredteam_full_a1d1_h200x4.sh
 ```
 
-Each iteration is `A50 -> D50 -> cached payoff update`. Set `ITERATIONS=5` for
-the full five-round PSRO run. The script fixes the known-good A10Gx4 resource
-and batch topology so experiments do not accidentally use a different Modal
-function or training profile. For the full protocol and comparable vanilla
-baseline, see `ABS_PSRO_README.md`.
-
-For a compute-efficient check that both independent policies receive a useful
-learning signal, run the validated short sequential probe:
+The default is A200 followed by D200 on four H200 GPUs. Both roles use a
+separate full-parameter copy of
+`mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated` and LR `1e-6`.
 
 ```bash
-./run_upstream_normalmix_one_round_a10g4.sh
+STEPS_PER_ROLE=100 \
+LEARNING_RATE=2e-6 \
+ATTACKER_SFT_STOP_AFTER_STEP=30 \
+DEFENDER_SFT_STOP_AFTER_STEP=10 \
+RUN_SUFFIX=full_lr_probe \
+./run_selfredteam_full_a1d1_h200x4.sh
 ```
 
-This probe trains `A1` for five updates from the attacker SFT initialization,
-then trains `D1` for two updates from the base model against the frozen `A1`.
-It uses the upstream Self-RedTeam `general_sum` reward unchanged. Harmful-only
-seed allocation is used for the short attacker phase; the defender phase uses
-balanced harmful/benign seeds and label-balanced replay. Checkpoints are saved
-only at role boundaries. Override `ATTACKER_STEPS`, `DEFENDER_STEPS`, or
-`ROLLOUT_BATCH_SIZE` for diagnostics. This is a learning-signal probe, not a
-replacement for the full `A50 -> D50` PSRO comparison.
+### LoRA A1 -> D1
+
+```bash
+./run_selfredteam_lora_a1d1_h200x4.sh
+```
+
+The default is A100 followed by D100 on four H200 GPUs. Each role starts from
+the same base model with its own rank-64, alpha-64 adapter. The formal setting
+uses attacker LR `1e-5` and defender LR `4e-5`.
+
+```bash
+STEPS_PER_ROLE=100 \
+ATTACKER_LR=1e-5 \
+DEFENDER_LR=4e-5 \
+RUN_SUFFIX=lora_formal \
+./run_selfredteam_lora_a1d1_h200x4.sh
+```
+
+### LoRA A2 -> D2 Self-Play
+
+After A1 and D1 exist, run the next sequential self-play iteration with:
+
+```bash
+./run_selfredteam_lora_a2d2_h200x4.sh
+```
+
+This continues the existing adapters instead of cold-starting them: A2 starts
+from A1 and trains for 80 steps against frozen D1; D2 starts from D1 and trains
+for 80 steps against frozen A2. The remote orchestrator then evaluates D2 on
+WG adversarial, WG vanilla, WJB harmful, DAN, and HarmBench. Override
+`ATTACKER_START_ADAPTER` and `DEFENDER_START_ADAPTER` when using a different
+pool generation.
+
+Both scripts use `modal run --detach`, so the remote call survives an SSH
+disconnect. Training curves and raw trajectory tables are written to the W&B
+`self-play` project; checkpoints and manifests are written to the persistent
+Modal `/output` volume.
+
+## Canonical Parameters
+
+| Setting | Full default | LoRA default | Meaning |
+| --- | ---: | ---: | --- |
+| Base model | Llama 3.1 8B abliterated | same | Independent initialization for each role |
+| Steps per role | 200 | 100 | Optimizer updates in A1 and again in D1 |
+| Attacker LR | `1e-6` | `1e-5` | Actor optimizer LR during A1 |
+| Defender LR | `1e-6` | `4e-5` | Actor optimizer LR during D1/D2 |
+| LoRA rank / alpha | n/a | `64 / 64` | Adapter capacity and scaling |
+| Rollout / train / micro batch | `128 / 32 / 8` | `128 / 32 / 8` | Prompts sampled, replay batch, per-device micro batch |
+| Attacker SFT cutoff | 30 | 30 | Role-specific format SFT is active through this step |
+| Defender SFT cutoff | 10 | 10 | Defender format SFT is active through this step |
+| KL loss coefficient | `0` | `0` | KL is monitored against role start but is not penalized |
+| LoRA LR schedule | n/a | constant with warmup | Fixed LR after warmup |
+| LoRA warmup ratio | n/a | `0.05` | First 5% of role steps warm up the LR |
+| Checkpoint interval | pipeline default | 10 | Optimizer steps between saved checkpoints |
+| Reward | upstream `general_sum` | same | Self-RedTeam role reward, unchanged |
+
+Every step consumes a rollout batch of 128 prompts. Therefore A100 + D100 is
+200 optimizer updates and 25,600 role-conditioned prompt rollouts in total;
+it should not be described as a shared-policy 100-step run.
+
+## LoRA Implementation And Audits
+
+Use only `modal_upstream_selfredteam_role_lora_v2.py` for new LoRA runs. It
+uses LLaMA-Factory 0.9.3/PEFT to construct adapters and fixes two failures in
+the historical path: native LoRA A/B tensors are synchronized into every vLLM
+rollout engine, and replay is redistributed globally after zero-variance groups
+are removed instead of silently truncating a 128-sample rollout. It also
+restores adapters after vLLM sleep/wake and validates target module names.
+
+Audit a checkpoint before adding it to a PSRO pool:
+
+```bash
+modal run modal_upstream_selfredteam_role_lora_v2.py::lora_v2_app.audit_lora_weights \
+  --checkpoint /output/.../ckpt/global_step100_hf
+modal run modal_upstream_selfredteam_role_lora_v2.py::lora_v2_app.audit_lora_rollout \
+  --checkpoint /output/.../ckpt/global_step100_hf
+```
+
+The rollout audit compares Hugging Face PEFT inference, vLLM file-based LoRA,
+and in-memory synchronization. The latter two must be token-identical.
+
+## Learning-Rate Sweep Record
+
+The LR search was a sequence of controlled runs, not an automated exhaustive
+grid. LoRA attacker trials covered approximately `1e-6`, `2.5e-6`, `4e-6`,
+`5e-6`, and `1e-5`; defender trials covered `1e-5` and `2e-5`. Lower attacker
+rates learned slowly or reached an early format plateau. The post-fix A1
+baseline selected `1e-5`, and the matched D1 selected `2e-5`. Runs made before
+the native adapter-sync and replay fixes are diagnostic history and are not
+valid LR comparisons.
+
+The controlled acceleration probe doubled the LoRA rates to A1 `2e-5` and D1
+`4e-5`. Doubling the attacker LR did not improve its final result enough to
+replace `1e-5`; doubling the defender LR produced materially faster D1
+convergence and is the formal defender setting. All other parameters remained
+fixed. The probe runs are
+[`3e24be98`](https://wandb.ai/2373025856w-the-university-of-hong-kong/self-play/runs/3e24be98)
+and its paired D1 run.
+The established baseline runs are
+[`A1 6087d6fb`](https://wandb.ai/2373025856w-the-university-of-hong-kong/self-play/runs/6087d6fb)
+and
+[`D1 7da2ba71`](https://wandb.ai/2373025856w-the-university-of-hong-kong/self-play/runs/7da2ba71).
+The D1 checkpoint obtained WG adv `0.036`, WG vanilla `0.007`, WJB `0.145`,
+DAN `0.200`, and HarmBench adv `0.066` in the saved evaluation.
 
 ---
 
