@@ -63,10 +63,12 @@ and locally measured numbers are not a paired evaluation.
 | Self-RedTeam reproduction, step 200 | Our evaluation | 0.095 | 0.019 | 0.159 | 0.400 | 0.196 |
 | SafeSelfPlay D1, LoRA generation 1 step 100 | Our evaluation | 0.036 | 0.007 | 0.145 | 0.200 | 0.066 |
 | SafeSelfPlay D2, LoRA generation 2 step 80 | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 |
+| SafeSelfPlay D3, LoRA generation 3 step 80 | Our evaluation | 0.003 | 0.000 | 0.031 | 0.090 | 0.031 |
 
-The D1 and D2 rows use the same rank-64 role-LoRA parameterization but
+The D1-D3 rows use the same rank-64 role-LoRA parameterization but
 different step budgets and opponents; they document completed generations and
-should not be read as a controlled D1-vs-D2 ablation.
+should not be read as a controlled inter-generation ablation. These harmful
+ASR metrics do not measure benign-response utility or over-refusal.
 
 ## 2. Train Role LoRAs
 
@@ -133,9 +135,22 @@ HarmBench ASR. All are lower-is-better. Results are written under
 
 ## 4. PSRO
 
-The payoff evaluator and cache are implemented in
-`modal_upstream_v2_payoff.py` and `roll/utils/upstream_v2_payoff.py`. The ROLL
-PSRO orchestration entrypoint is `modal_abs_benchmark.py`:
+The current Llama role-LoRA launcher trains each new policy against the latest
+opponent. Evaluate one frozen adapter pair with the adapter-aware payoff code:
+
+```bash
+modal run --detach \
+  modal_upstream_v2_payoff.py::upstream_v2_payoff_convergence \
+  --attacker-adapter /output/.../A3/ckpt/global_step80_hf \
+  --defender-adapter /output/.../D3/ckpt/global_step80_hf \
+  --episodes 4096
+```
+
+The evaluator and convergence cache are implemented in
+`modal_upstream_v2_payoff.py` and `roll/utils/upstream_v2_payoff.py`.
+
+The older ROLL/Qwen path contains the complete payoff-matrix, Nash-mixture,
+and PSRO orchestration entrypoint in `modal_abs_benchmark.py`:
 
 ```bash
 modal run modal_abs_benchmark.py \
@@ -150,8 +165,9 @@ modal run --detach modal_abs_benchmark.py \
 ```
 
 Pairwise results are cached, so unchanged checkpoint pairs are not evaluated
-again. The resulting payoff matrix determines the opponent mixture for the
-next fixed-role best response.
+again. This complete orchestrator is not yet wired to the current Llama
+rank-64 role-LoRA launcher; current A1-A3/D1-D3 checkpoints therefore represent
+sequential latest-opponent self-play, not Nash-mixture PSRO.
 
 ## Attribution
 
