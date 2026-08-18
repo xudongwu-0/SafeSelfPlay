@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import modal
@@ -147,6 +148,43 @@ def publish_checkpoint_bundle(
         commit_message="Add checkpoint manifest",
     )
     return {"repo": f"https://huggingface.co/{REPO_ID}", **manifest}
+
+
+@app.function(
+    cpu=1,
+    memory=1024,
+    timeout=43200,
+    volumes={"/lora_output": LORA_VOLUME},
+)
+def publish_d3_when_ready(
+    d3_checkpoint: str,
+    poll_seconds: int = 60,
+) -> dict[str, object]:
+    """Wait for a committed D3 adapter, then publish only that adapter."""
+    if poll_seconds < 10:
+        raise ValueError("poll_seconds must be at least 10")
+    local_checkpoint = Path(
+        d3_checkpoint.replace("/output/", "/lora_output/", 1)
+    )
+    deadline = time.monotonic() + 42000
+    while time.monotonic() < deadline:
+        LORA_VOLUME.reload()
+        if (
+            (local_checkpoint / "adapter_config.json").is_file()
+            and any(
+                (local_checkpoint / filename).is_file()
+                for filename in (
+                    "adapter_model.safetensors",
+                    "adapter_model.bin",
+                )
+            )
+        ):
+            return publish_checkpoint_bundle.remote(
+                d3_checkpoint=d3_checkpoint,
+                include_static=False,
+            )
+        time.sleep(poll_seconds)
+    raise TimeoutError(f"D3 checkpoint did not appear: {d3_checkpoint}")
 
 
 @app.local_entrypoint()
