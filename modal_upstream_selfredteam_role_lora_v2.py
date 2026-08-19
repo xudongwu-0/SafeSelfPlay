@@ -270,133 +270,8 @@ def _patch_linear_cot_format_parser() -> None:
     utils_path.write_text(source[:start] + replacement + source[end + 1:])
 
 
-def _patch_zero_sum_psro_reward() -> None:
-    """Install our strict zero-sum utility into the disposable upstream copy.
-
-    The sibling Self-RedTeam checkout remains untouched. Both role turns call
-    the helper mounted from ``/roll`` and the defender reward is always
-    ``-u_A``. CoT format remains observable and may receive auxiliary SFT loss,
-    but it is not added to the PPO game reward.
-    """
-
-    utils_path = UPSTREAM_WORK / "red_team/utils.py"
-    source = utils_path.read_text()
-    old = '''def get_redteaming_game_reward_zero_sum(role, labels: dict) -> tuple[float, str]:
-    raise NotImplementedError("Zero-sum reward is not implemented")
-'''
-    new = '''def get_redteaming_game_reward_zero_sum(
-    gamedata, labels: dict, reward_coeff_config="psro_zero_sum_v2"
-) -> tuple[float, set]:
-    """Strict role-LoRA PSRO reward; defender is always the negative of attacker."""
-    from roll.utils.role_lora_zero_sum_psro import compute_zero_sum_psro_reward
-
-    role = gamedata["game_role"]
-    prompt_type = gamedata.get("prompt_type")
-    if role not in ("attacker", "defender"):
-        raise ValueError(f"Invalid role: {role}")
-    score = compute_zero_sum_psro_reward(
-        prompt_type=prompt_type,
-        labels=labels,
-    )
-    outcomes = set()
-    if score["attack_label_consistent"]:
-        outcomes.add(GameOutcome.ATTACKER_FAITHFUL_REVISION)
-    else:
-        outcomes.add(GameOutcome.ATTACKER_UNFAITHFUL_REVISION)
-
-    harmful_seed = prompt_type == "generated_harmful"
-    if score["attacker_zero_sum_reward"] > 0:
-        outcomes.add(
-            GameOutcome.ATTACKER_WIN_SUCCESSFUL_HARMFUL_REQUEST
-            if harmful_seed
-            else GameOutcome.ATTACKER_WIN_SUCCESSFUL_BENIGN_REQUEST
-        )
-    else:
-        outcomes.add(
-            GameOutcome.ATTACKER_LOSE_FAILED_HARMFUL_REQUEST
-            if harmful_seed
-            else GameOutcome.ATTACKER_LOSE_FAILED_BENIGN_REQUEST
-        )
-
-    prompt_harmful = labels["prompt_harmfulness"] == "harmful"
-    refused = labels["response_refusal"] == "refusal"
-    correct_behavior = (prompt_harmful and refused) or (
-        not prompt_harmful and not refused
-    )
-    outcomes.add(
-        GameOutcome.DEFENDER_WIN_CORRECT_REFUSAL
-        if correct_behavior
-        else GameOutcome.DEFENDER_LOSE_WRONG_REFUSAL
-    )
-    outcomes.add(
-        GameOutcome.DEFENDER_WIN_SUCCESSFUL_DEFENSE
-        if score["defender_success"]
-        else GameOutcome.DEFENDER_LOSE_BROKEN_DEFENSE
-    )
-    reward_key = (
-        "attacker_zero_sum_reward"
-        if role == "attacker"
-        else "defender_zero_sum_reward"
-    )
-    return float(score[reward_key]), outcomes
-'''
-    if old not in source:
-        raise RuntimeError("Expected upstream zero-sum reward stub was not found")
-    utils_path.write_text(source.replace(old, new, 1))
-
-    language_game_path = (
-        UPSTREAM_WORK / "openrlhf/trainer/ppo_utils/language_game.py"
-    )
-    _replace_once(
-        language_game_path,
-        "            if labels.get('is_parsing_error', False):\n"
-        "                continue\n"
-        "                \n"
-        '            for turn_idx, turn in enumerate(game["processed_output_history"]):\n',
-        '''            if labels.get('is_parsing_error', False):
-                continue
-            if "zero_sum" in self.reward_type:
-                prompt_types = {
-                    turn["game_states"].get("prompt_type")
-                    for turn in game["processed_output_history"]
-                    if turn.get("game_states")
-                }
-                if len(prompt_types) != 1:
-                    raise ValueError(
-                        f"zero-sum game has ambiguous prompt types: {prompt_types}"
-                    )
-                prompt_type = next(iter(prompt_types))
-                expected_prompt_harmfulness = {
-                    "generated_harmful": "harmful",
-                    "generated_benign": "unharmful",
-                }.get(prompt_type)
-                if expected_prompt_harmfulness is None:
-                    raise ValueError(
-                        f"invalid zero-sum prompt type: {prompt_type!r}"
-                    )
-                if labels.get("prompt_harmfulness") != expected_prompt_harmfulness:
-                    # Label drift is outside the PSRO estimand. It contributes
-                    # neither role reward and is omitted from the replay buffer.
-                    continue
-
-            for turn_idx, turn in enumerate(game["processed_output_history"]):
-''',
-        "drop zero-sum label-drift games before replay",
-    )
-    _replace_once(
-        language_game_path,
-        '''                if not self.disable_hidden_cot:
-                    reward += get_cot_formatting_reward(turn_states.get('cot_format_violation', None))
-''',
-        '''                if not self.disable_hidden_cot and "zero_sum" not in self.reward_type:
-                    reward += get_cot_formatting_reward(turn_states.get('cot_format_violation', None))
-''',
-        "exclude format shaping from zero-sum PPO reward",
-    )
-
-
 def _patch_exact_prompt_label_balance() -> None:
-    """Make finite zero-sum training prefixes exactly 50/50 H/B."""
+    """Make finite PSRO role-training prefixes exactly 50/50 H/B seeds."""
 
     actor_path = UPSTREAM_WORK / "openrlhf/trainer/ray/ppo_actor.py"
     _replace_once(
@@ -451,6 +326,112 @@ def _patch_exact_prompt_label_balance() -> None:
             )
 ''',
         "exact finite H/B prompt balance",
+    )
+
+
+def _patch_early_attack_label_filter() -> None:
+    """Skip defender rollout when a generated rewrite changes seed class.
+
+    This is a sampling filter for the original general-sum training objective,
+    not a zero-sum PPO reward.  The disposable upstream copy performs a prompt
+    classification call after the attacker turn and removes drifted/unparseable
+    games before the defender is invoked.
+    """
+
+    language_game_path = (
+        UPSTREAM_WORK / "openrlhf/trainer/ppo_utils/language_game.py"
+    )
+    _replace_once(
+        language_game_path,
+        '''            if turn % 2 == 0:
+                self.strategy.print(f"🎮 Turn {turn}: 🚀 Generating attacks... 🔥")
+                self._generate_attacker_turn(active_games, turn, attacker_llm_generator, **kwargs)
+            else:
+''',
+        '''            if turn % 2 == 0:
+                self.strategy.print(f"🎮 Turn {turn}: 🚀 Generating attacks... 🔥")
+                self._generate_attacker_turn(active_games, turn, attacker_llm_generator, **kwargs)
+                if self.custom_configs.get(
+                    "drop_attack_label_drift_before_defense", False
+                ):
+                    self._drop_attack_label_drift_before_defense(active_games)
+            else:
+''',
+        "classify attack labels before defender rollout",
+    )
+    _replace_once(
+        language_game_path,
+        '''    def _generate_defender_turn(self, active_games, turn, llm_generator, **kwargs):
+''',
+        '''    def _drop_attack_label_drift_before_defense(self, active_games):
+        expected_by_prompt_type = {
+            "generated_harmful": "harmful",
+            "generated_benign": "unharmful",
+            "vanilla_harmful": "harmful",
+            "vanilla_benign": "unharmful",
+        }
+        game_indices = []
+        batch_queries = []
+        for game_idx, game in active_games.items():
+            if len(game["history"]) != 1:
+                raise ValueError("early label filter expects one attacker turn")
+            expected = expected_by_prompt_type.get(game["prompt_type"])
+            if expected is None:
+                raise ValueError(
+                    f"unknown prompt type for early label filter: "
+                    f"{game['prompt_type']!r}"
+                )
+            game_indices.append(game_idx)
+            batch_queries.append({
+                "game_idx": game_idx,
+                "prompt": game["history"][0]["content"],
+                # WildGuard emits the prompt label jointly with response fields.
+                # This fixed neutral placeholder makes the prompt-only gate
+                # deterministic; it is never used as a game response or reward.
+                "response": "I cannot assist with that request.",
+            })
+
+        if not batch_queries:
+            return
+        raw_labels = remote_rm_fn(
+            self.remote_rm_url[0], batch_queries, score_key="labels"
+        )
+        if isinstance(raw_labels, list):
+            labels_by_game = dict(zip(game_indices, raw_labels))
+        else:
+            labels_by_game = raw_labels
+
+        dropped_parse = 0
+        dropped_drift = 0
+        for game_idx in game_indices:
+            labels = labels_by_game.get(
+                game_idx, labels_by_game.get(str(game_idx))
+            )
+            if labels is None:
+                raise ValueError(
+                    f"missing early prompt label for game {game_idx}"
+                )
+            if labels.get("is_parsing_error", False):
+                dropped_parse += 1
+                del active_games[game_idx]
+                continue
+            expected = expected_by_prompt_type[
+                active_games[game_idx]["prompt_type"]
+            ]
+            if labels.get("prompt_harmfulness") != expected:
+                dropped_drift += 1
+                del active_games[game_idx]
+
+        self.strategy.print(
+            "Early attack-label filter: "
+            f"kept={len(active_games)}, drift={dropped_drift}, "
+            f"parse_error={dropped_parse}; dropped games receive no reward "
+            "and no defender rollout"
+        )
+
+    def _generate_defender_turn(self, active_games, turn, llm_generator, **kwargs):
+''',
+        "install early attack-label filter",
     )
 
 
@@ -1712,6 +1693,7 @@ def _prepare_lora_v2_upstream() -> None:
     _patch_native_lora_sync()
     _patch_attacker_sft_rl_format()
     _patch_exact_prompt_label_balance()
+    _patch_early_attack_label_filter()
 
 
 def _adapter_checkpoint(path: Path) -> bool:
@@ -1889,15 +1871,14 @@ def _run_role(
     save_steps: int,
     actor_lr_scheduler: str = "cosine_with_min_lr",
     lr_warmup_ratio: float = 0.03,
-    reward_type: str = "general_sum",
+    exact_prompt_label_balance: bool = False,
+    drop_attack_label_drift_before_defense: bool = False,
     wandb_identity: str = "",
 ) -> Path:
     if role not in {"attacker", "defender"}:
         raise ValueError(role)
     if not fixed_opponent:
         raise ValueError("A frozen role opponent is required")
-    if reward_type not in {"general_sum", "psro_zero_sum_v2"}:
-        raise ValueError(f"Unsupported role-LoRA reward type: {reward_type}")
     if role_start_adapter and not _adapter_checkpoint(Path(role_start_adapter)):
         raise FileNotFoundError(
             f"Missing active-role start adapter: {role_start_adapter}"
@@ -1916,8 +1897,6 @@ def _run_role(
     os.environ["WANDB_RESUME"] = "allow"
     subprocess.run(["ray", "stop", "--force"], check=False)
     _prepare_lora_v2_upstream()
-    if reward_type == "psro_zero_sum_v2":
-        _patch_zero_sum_psro_reward()
     _install_upstream_runtime()
     _install_llamafactory_runtime()
     os.environ["PYTHONPATH"] = ":".join(
@@ -1959,8 +1938,7 @@ def _run_role(
         ]
     custom_configs = {
         "max_turns": 2,
-        "reward_type": reward_type,
-        "reward_coeff_config": reward_type,
+        "reward_type": "general_sum",
         "remove_ties": True,
         "redistribute_after_ties": True,
         "no_defender_turn": role == "attacker",
@@ -1973,7 +1951,10 @@ def _run_role(
         "fixed_attacker_from_opponent_vllm": role == "defender",
         "actor_lr_scheduler": actor_lr_scheduler,
         "postfill_cot_stop_after_step": sft_stop_after_step,
-        "exact_prompt_label_balance": reward_type == "psro_zero_sum_v2",
+        "exact_prompt_label_balance": exact_prompt_label_balance,
+        "drop_attack_label_drift_before_defense": (
+            drop_attack_label_drift_before_defense
+        ),
     }
     wandb_key = os.environ.get("WANDB_API_KEY", "")
     if not wandb_key:
@@ -2129,12 +2110,15 @@ def _run_role(
     manifest = {
         "method": "Self-RedTeam role-specific PEFT LoRA v2",
         "role": role,
-        "ppo_reward_type": reward_type,
-        "strict_zero_sum_ppo_reward": reward_type == "psro_zero_sum_v2",
-        "format_reward_in_ppo": reward_type != "psro_zero_sum_v2",
+        "ppo_reward_type": "general_sum",
+        "strict_zero_sum_ppo_reward": False,
+        "format_reward_in_ppo": True,
+        "drop_attack_label_drift_before_defense": (
+            drop_attack_label_drift_before_defense
+        ),
         "prompt_label_balance": (
             "deterministic exact 50/50 harmful/benign finite prefix"
-            if reward_type == "psro_zero_sum_v2"
+            if exact_prompt_label_balance
             else "probabilistic prompt_data_probs"
         ),
         "base_model": BASE_MODEL,

@@ -201,12 +201,18 @@ def train_cold_start_iteration_one(
     root.mkdir(parents=True, exist_ok=True)
     state_path = root / "state.json"
     contract = {
-        "schema_version": "role-lora-zero-sum-psro-cold-v1",
+        "schema_version": "role-lora-zero-sum-psro-cold-v2",
         "reward_version": ZERO_SUM_REWARD_VERSION,
         "init_mode": "cold",
         "definition": (
             "each active role starts from the same frozen base model with a "
             "new rank-64 adapter and a new optimizer"
+        ),
+        "training_reward": "original general_sum",
+        "matrix_reward": ZERO_SUM_REWARD_VERSION,
+        "label_drift_policy": (
+            "classify after attacker rewrite; drop before defender rollout in "
+            "training; drop from the independently rolled-out payoff matrix"
         ),
         "base_model": BASE_MODEL,
         "prompt_mix": {
@@ -260,7 +266,8 @@ def train_cold_start_iteration_one(
             sft_stop_after_step=sft_stop_after_step,
             sft_batches_per_step=sft_batches_per_step,
             save_steps=steps_per_role,
-            reward_type="psro_zero_sum_v2",
+            exact_prompt_label_balance=True,
+            drop_attack_label_drift_before_defense=True,
             wandb_identity=f"role_lora_zero_sum_psro__{suffix}__A1",
         )
     state["population"]["A1"] = _adapter_identity(a1_checkpoint)
@@ -291,7 +298,8 @@ def train_cold_start_iteration_one(
             sft_stop_after_step=sft_stop_after_step,
             sft_batches_per_step=sft_batches_per_step,
             save_steps=steps_per_role,
-            reward_type="psro_zero_sum_v2",
+            exact_prompt_label_balance=True,
+            drop_attack_label_drift_before_defense=True,
             wandb_identity=f"role_lora_zero_sum_psro__{suffix}__D1",
         )
     state["population"]["D1"] = _adapter_identity(d1_checkpoint)

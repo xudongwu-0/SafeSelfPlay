@@ -162,31 +162,24 @@ class ZeroSumProtocolTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             solve_zero_sum_meta_game([[0.0], [float("nan")]])
 
-    def test_lora_trainer_uses_shared_reward_without_format_shaping(self):
+    def test_training_keeps_general_sum_and_filters_drift_early(self):
         repository = Path(__file__).resolve().parents[1]
         source = (
             repository / "modal_upstream_selfredteam_role_lora_v2.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("def _patch_zero_sum_psro_reward()", source)
-        self.assertIn(
-            "from roll.utils.role_lora_zero_sum_psro import "
-            "compute_zero_sum_psro_reward",
-            source,
-        )
-        self.assertIn(
-            'if not self.disable_hidden_cot and "zero_sum" not in '
-            "self.reward_type:",
-            source,
-        )
-        self.assertIn(
-            "Label drift is outside the PSRO estimand", source
-        )
+        self.assertNotIn("def _patch_zero_sum_psro_reward()", source)
+        self.assertIn('"reward_type": "general_sum"', source)
+        self.assertIn('"strict_zero_sum_ppo_reward": False', source)
         self.assertIn("def _patch_exact_prompt_label_balance()", source)
-        self.assertIn('"exact_prompt_label_balance": reward_type ==', source)
-        self.assertIn('reward_type: str = "general_sum"', source)
-        self.assertIn('reward_type="psro_zero_sum_v2"', (
+        self.assertIn("def _patch_early_attack_label_filter()", source)
+        self.assertIn("dropped games receive no reward", source)
+        cold_source = (
             repository / "modal_role_lora_zero_sum_psro.py"
-        ).read_text(encoding="utf-8"))
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('reward_type="psro_zero_sum_v2"', cold_source)
+        self.assertIn('"training_reward": "original general_sum"', cold_source)
+        self.assertIn("exact_prompt_label_balance=True", cold_source)
+        self.assertIn("drop_attack_label_drift_before_defense=True", cold_source)
         self.assertIn(
             'wandb_identity=f"role_lora_zero_sum_psro__{suffix}__A1"',
             (repository / "modal_role_lora_zero_sum_psro.py").read_text(
