@@ -270,6 +270,190 @@ def _patch_linear_cot_format_parser() -> None:
     utils_path.write_text(source[:start] + replacement + source[end + 1:])
 
 
+def _patch_zero_sum_psro_reward() -> None:
+    """Install our strict zero-sum utility into the disposable upstream copy.
+
+    The sibling Self-RedTeam checkout remains untouched. Both role turns call
+    the helper mounted from ``/roll`` and the defender reward is always
+    ``-u_A``. CoT format remains observable and may receive auxiliary SFT loss,
+    but it is not added to the PPO game reward.
+    """
+
+    utils_path = UPSTREAM_WORK / "red_team/utils.py"
+    source = utils_path.read_text()
+    old = '''def get_redteaming_game_reward_zero_sum(role, labels: dict) -> tuple[float, str]:
+    raise NotImplementedError("Zero-sum reward is not implemented")
+'''
+    new = '''def get_redteaming_game_reward_zero_sum(
+    gamedata, labels: dict, reward_coeff_config="psro_zero_sum_v2"
+) -> tuple[float, set]:
+    """Strict role-LoRA PSRO reward; defender is always the negative of attacker."""
+    from roll.utils.role_lora_zero_sum_psro import compute_zero_sum_psro_reward
+
+    role = gamedata["game_role"]
+    prompt_type = gamedata.get("prompt_type")
+    if role not in ("attacker", "defender"):
+        raise ValueError(f"Invalid role: {role}")
+    score = compute_zero_sum_psro_reward(
+        prompt_type=prompt_type,
+        labels=labels,
+    )
+    outcomes = set()
+    if score["attack_label_consistent"]:
+        outcomes.add(GameOutcome.ATTACKER_FAITHFUL_REVISION)
+    else:
+        outcomes.add(GameOutcome.ATTACKER_UNFAITHFUL_REVISION)
+
+    harmful_seed = prompt_type == "generated_harmful"
+    if score["attacker_zero_sum_reward"] > 0:
+        outcomes.add(
+            GameOutcome.ATTACKER_WIN_SUCCESSFUL_HARMFUL_REQUEST
+            if harmful_seed
+            else GameOutcome.ATTACKER_WIN_SUCCESSFUL_BENIGN_REQUEST
+        )
+    else:
+        outcomes.add(
+            GameOutcome.ATTACKER_LOSE_FAILED_HARMFUL_REQUEST
+            if harmful_seed
+            else GameOutcome.ATTACKER_LOSE_FAILED_BENIGN_REQUEST
+        )
+
+    prompt_harmful = labels["prompt_harmfulness"] == "harmful"
+    refused = labels["response_refusal"] == "refusal"
+    correct_behavior = (prompt_harmful and refused) or (
+        not prompt_harmful and not refused
+    )
+    outcomes.add(
+        GameOutcome.DEFENDER_WIN_CORRECT_REFUSAL
+        if correct_behavior
+        else GameOutcome.DEFENDER_LOSE_WRONG_REFUSAL
+    )
+    outcomes.add(
+        GameOutcome.DEFENDER_WIN_SUCCESSFUL_DEFENSE
+        if score["defender_success"]
+        else GameOutcome.DEFENDER_LOSE_BROKEN_DEFENSE
+    )
+    reward_key = (
+        "attacker_zero_sum_reward"
+        if role == "attacker"
+        else "defender_zero_sum_reward"
+    )
+    return float(score[reward_key]), outcomes
+'''
+    if old not in source:
+        raise RuntimeError("Expected upstream zero-sum reward stub was not found")
+    utils_path.write_text(source.replace(old, new, 1))
+
+    language_game_path = (
+        UPSTREAM_WORK / "openrlhf/trainer/ppo_utils/language_game.py"
+    )
+    _replace_once(
+        language_game_path,
+        "            if labels.get('is_parsing_error', False):\n"
+        "                continue\n"
+        "                \n"
+        '            for turn_idx, turn in enumerate(game["processed_output_history"]):\n',
+        '''            if labels.get('is_parsing_error', False):
+                continue
+            if "zero_sum" in self.reward_type:
+                prompt_types = {
+                    turn["game_states"].get("prompt_type")
+                    for turn in game["processed_output_history"]
+                    if turn.get("game_states")
+                }
+                if len(prompt_types) != 1:
+                    raise ValueError(
+                        f"zero-sum game has ambiguous prompt types: {prompt_types}"
+                    )
+                prompt_type = next(iter(prompt_types))
+                expected_prompt_harmfulness = {
+                    "generated_harmful": "harmful",
+                    "generated_benign": "unharmful",
+                }.get(prompt_type)
+                if expected_prompt_harmfulness is None:
+                    raise ValueError(
+                        f"invalid zero-sum prompt type: {prompt_type!r}"
+                    )
+                if labels.get("prompt_harmfulness") != expected_prompt_harmfulness:
+                    # Label drift is outside the PSRO estimand. It contributes
+                    # neither role reward and is omitted from the replay buffer.
+                    continue
+
+            for turn_idx, turn in enumerate(game["processed_output_history"]):
+''',
+        "drop zero-sum label-drift games before replay",
+    )
+    _replace_once(
+        language_game_path,
+        '''                if not self.disable_hidden_cot:
+                    reward += get_cot_formatting_reward(turn_states.get('cot_format_violation', None))
+''',
+        '''                if not self.disable_hidden_cot and "zero_sum" not in self.reward_type:
+                    reward += get_cot_formatting_reward(turn_states.get('cot_format_violation', None))
+''',
+        "exclude format shaping from zero-sum PPO reward",
+    )
+
+
+def _patch_exact_prompt_label_balance() -> None:
+    """Make finite zero-sum training prefixes exactly 50/50 H/B."""
+
+    actor_path = UPSTREAM_WORK / "openrlhf/trainer/ray/ppo_actor.py"
+    _replace_once(
+        actor_path,
+        '''        prompts_data = blending_datasets(
+            args.prompt_data,
+            args.prompt_data_probs,
+            strategy,
+            args.seed,
+            max_count=args.max_samples,
+            return_eval=False,
+            train_split=args.prompt_split,
+        )
+        prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
+''',
+        '''        prompts_data = blending_datasets(
+            args.prompt_data,
+            args.prompt_data_probs,
+            strategy,
+            args.seed,
+            max_count=args.max_samples,
+            return_eval=False,
+            train_split=args.prompt_split,
+        )
+        if args.custom_configs.get("exact_prompt_label_balance", False):
+            if args.max_samples % 2:
+                raise ValueError("exact H/B balance requires an even max_samples")
+            harmful_indices = [
+                index
+                for index, data_type in enumerate(prompts_data["data_type"])
+                if "harmful" in data_type
+            ]
+            benign_indices = [
+                index
+                for index, data_type in enumerate(prompts_data["data_type"])
+                if "benign" in data_type
+            ]
+            quota = args.max_samples // 2
+            if len(harmful_indices) < quota or len(benign_indices) < quota:
+                raise ValueError(
+                    "blended prompt sources cannot fill exact H/B quotas: "
+                    f"harmful={len(harmful_indices)}, benign={len(benign_indices)}, "
+                    f"quota={quota}"
+                )
+            selected_indices = harmful_indices[:quota] + benign_indices[:quota]
+            prompts_data = prompts_data.select(selected_indices).shuffle(
+                seed=args.seed
+            )
+        else:
+            prompts_data = prompts_data.select(
+                range(min(args.max_samples, len(prompts_data)))
+            )
+''',
+        "exact finite H/B prompt balance",
+    )
+
+
 def _patch_role_aware_malformed_output_fallback() -> None:
     """Recover malformed defender answers without exposing attacker CoT.
 
@@ -1527,6 +1711,7 @@ def _prepare_lora_v2_upstream() -> None:
     _patch_colocated_fixed_opponent()
     _patch_native_lora_sync()
     _patch_attacker_sft_rl_format()
+    _patch_exact_prompt_label_balance()
 
 
 def _adapter_checkpoint(path: Path) -> bool:
@@ -1704,11 +1889,14 @@ def _run_role(
     save_steps: int,
     actor_lr_scheduler: str = "cosine_with_min_lr",
     lr_warmup_ratio: float = 0.03,
+    reward_type: str = "general_sum",
 ) -> Path:
     if role not in {"attacker", "defender"}:
         raise ValueError(role)
     if not fixed_opponent:
         raise ValueError("A frozen role opponent is required")
+    if reward_type not in {"general_sum", "psro_zero_sum_v2"}:
+        raise ValueError(f"Unsupported role-LoRA reward type: {reward_type}")
     if role_start_adapter and not _adapter_checkpoint(Path(role_start_adapter)):
         raise FileNotFoundError(
             f"Missing active-role start adapter: {role_start_adapter}"
@@ -1727,6 +1915,8 @@ def _run_role(
     os.environ["WANDB_RESUME"] = "allow"
     subprocess.run(["ray", "stop", "--force"], check=False)
     _prepare_lora_v2_upstream()
+    if reward_type == "psro_zero_sum_v2":
+        _patch_zero_sum_psro_reward()
     _install_upstream_runtime()
     _install_llamafactory_runtime()
     os.environ["PYTHONPATH"] = ":".join(
@@ -1768,7 +1958,8 @@ def _run_role(
         ]
     custom_configs = {
         "max_turns": 2,
-        "reward_type": "general_sum",
+        "reward_type": reward_type,
+        "reward_coeff_config": reward_type,
         "remove_ties": True,
         "redistribute_after_ties": True,
         "no_defender_turn": role == "attacker",
@@ -1781,6 +1972,7 @@ def _run_role(
         "fixed_attacker_from_opponent_vllm": role == "defender",
         "actor_lr_scheduler": actor_lr_scheduler,
         "postfill_cot_stop_after_step": sft_stop_after_step,
+        "exact_prompt_label_balance": reward_type == "psro_zero_sum_v2",
     }
     wandb_key = os.environ.get("WANDB_API_KEY", "")
     if not wandb_key:
@@ -1936,6 +2128,14 @@ def _run_role(
     manifest = {
         "method": "Self-RedTeam role-specific PEFT LoRA v2",
         "role": role,
+        "ppo_reward_type": reward_type,
+        "strict_zero_sum_ppo_reward": reward_type == "psro_zero_sum_v2",
+        "format_reward_in_ppo": reward_type != "psro_zero_sum_v2",
+        "prompt_label_balance": (
+            "deterministic exact 50/50 harmful/benign finite prefix"
+            if reward_type == "psro_zero_sum_v2"
+            else "probabilistic prompt_data_probs"
+        ),
         "base_model": BASE_MODEL,
         "role_start": role_start_adapter or BASE_MODEL,
         "role_start_base": BASE_MODEL,

@@ -740,6 +740,20 @@ def evaluate_upstream_v2_raw_payoff_cell(
     defender_meta = _adapter_metadata(raw_defender_path)
     for role, metadata in (("attacker", attacker_meta), ("defender", defender_meta)):
         _require_v2_adapter_shape(role, metadata)
+    prompt_dataset_files = {
+        filename: _sha256_file(UPSTREAM_SOURCE / "red_team" / "data" / filename)
+        for filename in (
+            "vanilla_harmful_dataset.jsonl",
+            "vanilla_benign_dataset.jsonl",
+        )
+    }
+    prompt_dataset_sha256 = hashlib.sha256(
+        json.dumps(
+            prompt_dataset_files,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
     suffix = run_suffix or datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", suffix).strip("._-")
@@ -901,6 +915,8 @@ def evaluate_upstream_v2_raw_payoff_cell(
             ),
         },
         "prompt_distribution": "deterministic exact 50/50 harmful/benign interleave",
+        "prompt_dataset_files_sha256": prompt_dataset_files,
+        "prompt_dataset_sha256": prompt_dataset_sha256,
         "nested_seed_prefix": True,
         "candidate_reuse": reuse_provenance,
         "wildguard_parse_errors": (
