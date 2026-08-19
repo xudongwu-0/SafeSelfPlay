@@ -117,14 +117,21 @@ label flips relative to the seed, attacker reward is capped at zero and the
 corresponding defender-training game is omitted from replay. This policy does
 not alter the separately computed zero-sum PSRO matrix reward.
 
-Continue one complete generation, for example A2/D2 to A3/D3:
+Continue through warm-start, latest-opponent naive self-play. The canonical
+launcher reads the verified A1/D1 population from the cold-run state and, by
+default, trains A2, D2, ..., A5, D5 for 100 steps each:
 
 ```bash
-ATTACKER_START_ADAPTER=/output/.../A2/ckpt/global_step80_hf \
-DEFENDER_START_ADAPTER=/output/.../D2/ckpt/global_step80_hf \
-SOURCE_GENERATION=2 \
+SOURCE_RUN_SUFFIX=cold_psro_capdrop_A100D100_r64_20260819 \
 ./run_selfredteam_lora_next_round_h200x4.sh
 ```
+
+Each attacker inherits the previous attacker and trains against the previous
+defender; each defender inherits the previous defender and trains against the
+attacker just produced in the same generation. Every phase uses a new
+optimizer, exact 50/50 harmful/benign input seeds, and the same asymmetric
+label-drift policy as A1/D1. State and adapter hashes are persisted between
+phases so a failed chain can be relaunched without repeating completed roles.
 
 Recover only a failed defender phase without retraining its attacker:
 

@@ -42,6 +42,9 @@ from roll.utils.role_lora_zero_sum_psro import (
 from roll.utils.role_lora_training_reward import (
     TRAINING_LABEL_DRIFT_POLICY,
 )
+from roll.utils.role_lora_naive_selfplay import (
+    build_latest_opponent_schedule,
+)
 from roll.utils.upstream_v2_payoff import mean_ci95
 
 
@@ -346,6 +349,371 @@ def train_cold_start_iteration_one(
     return state
 
 
+def _verify_population_identity(
+    label: str,
+    record: dict[str, Any],
+    *,
+    lora_rank: int,
+    lora_alpha: int,
+) -> dict[str, Any]:
+    path = Path(str(record.get("path", "")))
+    current = _adapter_identity(path)
+    for field in ("path", "adapter_sha256", "config_sha256"):
+        if current[field] != record.get(field):
+            raise RuntimeError(
+                f"{label} population identity changed at {field}: "
+                f"state={record.get(field)!r}, current={current[field]!r}"
+            )
+    if current["rank"] != lora_rank or current["alpha"] != lora_alpha:
+        raise RuntimeError(
+            f"{label} LoRA contract mismatch: "
+            f"r={current['rank']}, alpha={current['alpha']}"
+        )
+    return current
+
+
+@psro_app.function(
+    image=psro_lora_image,
+    gpu=os.environ.get("ROLE_LORA_PSRO_GPU", "H200:4"),
+    cpu=8,
+    timeout=43200,
+    memory=65536,
+    volumes={
+        "/root/.cache/huggingface": hf_cache,
+        "/output": output_vol,
+    },
+    secrets=[modal.Secret.from_name("roll-secrets")],
+)
+def train_naive_latest_opponent_role(
+    *,
+    run_root: str,
+    target: str,
+    role: str,
+    role_start_adapter: str,
+    role_start_sha256: str,
+    opponent_adapter: str,
+    opponent_sha256: str,
+    steps: int,
+    lora_rank: int,
+    lora_alpha: int,
+    learning_rate: float,
+    sft_stop_after_step: int,
+    sft_batches_per_step: int,
+    save_steps: int,
+    actor_lr_scheduler: str,
+    lr_warmup_ratio: float,
+    wandb_identity: str,
+) -> dict[str, Any]:
+    """Train exactly one warm-start role against its latest frozen opponent."""
+
+    if role not in {"attacker", "defender"}:
+        raise ValueError(f"invalid role: {role!r}")
+    expected_prefix = "A" if role == "attacker" else "D"
+    if not re.fullmatch(rf"{expected_prefix}[2-9][0-9]*", target):
+        raise ValueError(f"invalid target label for {role}: {target!r}")
+    root = Path(run_root)
+    if root == PSRO_OUTPUT_ROOT or PSRO_OUTPUT_ROOT not in root.parents:
+        raise ValueError("run_root must be below the PSRO output root")
+
+    output_vol.reload()
+    start_identity = _adapter_identity(Path(role_start_adapter))
+    opponent_identity = _adapter_identity(Path(opponent_adapter))
+    if start_identity["adapter_sha256"] != role_start_sha256:
+        raise RuntimeError("active-role start adapter changed before training")
+    if opponent_identity["adapter_sha256"] != opponent_sha256:
+        raise RuntimeError("latest-opponent adapter changed before training")
+    for label, identity in (
+        ("role start", start_identity),
+        ("opponent", opponent_identity),
+    ):
+        if identity["rank"] != lora_rank or identity["alpha"] != lora_alpha:
+            raise RuntimeError(
+                f"{label} LoRA contract mismatch: "
+                f"r={identity['rank']}, alpha={identity['alpha']}"
+            )
+
+    run_dir = root / "training" / target
+    checkpoint = run_dir / "ckpt" / f"global_step{steps}_hf"
+    if _adapter_checkpoint(checkpoint):
+        manifest = _read_json(run_dir / "manifest.json")
+        expected_manifest = {
+            "role": role,
+            "steps": steps,
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "role_start": role_start_adapter,
+            "fixed_opponent_adapter": opponent_adapter,
+            "label_drift_training_policy": TRAINING_LABEL_DRIFT_POLICY,
+            "prompt_label_balance": (
+                "deterministic exact 50/50 harmful/benign finite prefix"
+            ),
+        }
+        for field, expected in expected_manifest.items():
+            if manifest.get(field) != expected:
+                raise RuntimeError(
+                    f"completed {target} manifest mismatch at {field}: "
+                    f"expected={expected!r}, actual={manifest.get(field)!r}"
+                )
+        return _adapter_identity(checkpoint)
+
+    checkpoint = _run_role(
+        role=role,
+        role_start_adapter=role_start_adapter,
+        fixed_opponent=BASE_MODEL,
+        fixed_opponent_adapter=opponent_adapter,
+        remote_rm_url=_stable_wildguard_rm_url(),
+        run_dir=run_dir,
+        steps=steps,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        learning_rate=learning_rate,
+        sft_stop_after_step=sft_stop_after_step,
+        sft_batches_per_step=sft_batches_per_step,
+        save_steps=save_steps,
+        actor_lr_scheduler=actor_lr_scheduler,
+        lr_warmup_ratio=lr_warmup_ratio,
+        exact_prompt_label_balance=True,
+        label_drift_training_policy=TRAINING_LABEL_DRIFT_POLICY,
+        wandb_identity=wandb_identity,
+    )
+    return _adapter_identity(checkpoint)
+
+
+@psro_app.function(
+    image=psro_lora_image,
+    cpu=1,
+    timeout=86400,
+    volumes={"/output": output_vol},
+)
+def advance_naive_latest_opponent(
+    *,
+    source_run_suffix: str,
+    continuation_suffix: str,
+    last_generation: int = 5,
+    steps_per_role: int = 100,
+    lora_rank: int = 64,
+    lora_alpha: int = 64,
+    attacker_learning_rate: float = 1e-5,
+    defender_learning_rate: float = 4e-5,
+    attacker_sft_stop_after_step: int = 30,
+    defender_sft_stop_after_step: int = 10,
+    sft_batches_per_step: int = 1,
+    save_steps: int = 10,
+    actor_lr_scheduler: str = "constant_with_warmup",
+    lr_warmup_ratio: float = 0.05,
+) -> dict[str, Any]:
+    """Advance one phase, persist it, then detach the next controller."""
+
+    if last_generation < 2:
+        raise ValueError("last_generation must be at least 2")
+    if steps_per_role < 1:
+        raise ValueError("steps_per_role must be positive")
+    if lora_rank != 64 or lora_alpha != 64:
+        raise ValueError("the canonical continuation is fixed at rank/alpha 64")
+    if not 0 <= attacker_sft_stop_after_step <= steps_per_role:
+        raise ValueError("attacker SFT cutoff must be within the role budget")
+    if not 0 <= defender_sft_stop_after_step <= steps_per_role:
+        raise ValueError("defender SFT cutoff must be within the role budget")
+    if save_steps < 1 or sft_batches_per_step < 1:
+        raise ValueError("save_steps and sft_batches_per_step must be positive")
+    if actor_lr_scheduler not in {
+        "cosine_with_min_lr",
+        "constant",
+        "constant_with_warmup",
+    }:
+        raise ValueError("unsupported actor_lr_scheduler")
+    if not 0 <= lr_warmup_ratio <= 1:
+        raise ValueError("lr_warmup_ratio must be in [0, 1]")
+
+    output_vol.reload()
+    source_suffix = _safe_component(
+        source_run_suffix,
+        label="source_run_suffix",
+    )
+    continuation = _safe_component(
+        continuation_suffix,
+        label="continuation_suffix",
+    )
+    source_root = PSRO_OUTPUT_ROOT / source_suffix
+    source_state_path = source_root / "state.json"
+    source_state = _read_json(source_state_path)
+    if not source_state.get("completed"):
+        raise RuntimeError("cold A1/D1 source run is not complete")
+    source_population = source_state.get("population")
+    if not isinstance(source_population, dict):
+        raise RuntimeError("cold source state has no population")
+    verified_source = {
+        label: _verify_population_identity(
+            label,
+            dict(source_population.get(label, {})),
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+        )
+        for label in ("A1", "D1")
+    }
+
+    schedule = build_latest_opponent_schedule(
+        first_generation=2,
+        last_generation=last_generation,
+    )
+    root = source_root / "naive_latest_opponent" / continuation
+    root.mkdir(parents=True, exist_ok=True)
+    state_path = root / "state.json"
+    contract = {
+        "schema_version": "role-lora-naive-latest-opponent-v1",
+        "algorithm": "naive_self_play_latest_opponent",
+        "initialization": (
+            "warm-start previous same-role adapter with a new optimizer"
+        ),
+        "source_run_suffix": source_suffix,
+        "source_state_sha256": _sha256_file(source_state_path),
+        "schedule": schedule,
+        "training_reward": "original general_sum including existing shaping",
+        "training_label_drift_policy": TRAINING_LABEL_DRIFT_POLICY,
+        "prompt_mix": {
+            "generated_harmful": 0.5,
+            "generated_benign": 0.5,
+        },
+        "exact_prompt_label_balance": True,
+        "psro_matrix_or_meta_solver_during_training": False,
+        "steps_per_role": steps_per_role,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "attacker_learning_rate": attacker_learning_rate,
+        "defender_learning_rate": defender_learning_rate,
+        "attacker_sft_stop_after_step": attacker_sft_stop_after_step,
+        "defender_sft_stop_after_step": defender_sft_stop_after_step,
+        "sft_batches_per_step": sft_batches_per_step,
+        "save_steps": save_steps,
+        "actor_lr_scheduler": actor_lr_scheduler,
+        "lr_warmup_ratio": lr_warmup_ratio,
+        "seed": 8888,
+    }
+    prior = _read_json(state_path) if state_path.is_file() else None
+    if prior is not None and prior.get("contract") != contract:
+        raise RuntimeError(
+            f"continuation suffix already has a different contract: {root}"
+        )
+    state: dict[str, Any] = prior or {
+        "completed": False,
+        "stage": "initialized",
+        "contract": contract,
+        "population": verified_source,
+        "completed_targets": [],
+    }
+    population = state.get("population")
+    if not isinstance(population, dict):
+        raise RuntimeError("continuation state has no population")
+
+    phase = next(
+        (item for item in schedule if item["target"] not in population),
+        None,
+    )
+    if phase is None:
+        state.update(
+            completed=True,
+            stage=f"A2_through_D{last_generation}_completed",
+        )
+        _write_json_atomic(state_path, state)
+        output_vol.commit()
+        return state
+
+    start_label = phase["initialized_from"]
+    opponent_label = phase["opponent"]
+    if start_label not in population or opponent_label not in population:
+        raise RuntimeError(
+            f"{phase['target']} prerequisites are incomplete: "
+            f"start={start_label}, opponent={opponent_label}"
+        )
+    start_identity = _verify_population_identity(
+        start_label,
+        dict(population[start_label]),
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+    )
+    opponent_identity = _verify_population_identity(
+        opponent_label,
+        dict(population[opponent_label]),
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+    )
+    target = phase["target"]
+    state["stage"] = f"training_{target}"
+    _write_json_atomic(state_path, state)
+    output_vol.commit()
+
+    role = phase["role"]
+    result = train_naive_latest_opponent_role.remote(
+        run_root=str(root),
+        target=target,
+        role=role,
+        role_start_adapter=start_identity["path"],
+        role_start_sha256=start_identity["adapter_sha256"],
+        opponent_adapter=opponent_identity["path"],
+        opponent_sha256=opponent_identity["adapter_sha256"],
+        steps=steps_per_role,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        learning_rate=(
+            attacker_learning_rate
+            if role == "attacker"
+            else defender_learning_rate
+        ),
+        sft_stop_after_step=(
+            attacker_sft_stop_after_step
+            if role == "attacker"
+            else defender_sft_stop_after_step
+        ),
+        sft_batches_per_step=sft_batches_per_step,
+        save_steps=save_steps,
+        actor_lr_scheduler=actor_lr_scheduler,
+        lr_warmup_ratio=lr_warmup_ratio,
+        wandb_identity=(
+            f"role_lora_naive__{continuation}__{target}"
+        ),
+    )
+    population[target] = result
+    completed_targets = list(state.get("completed_targets", []))
+    if target not in completed_targets:
+        completed_targets.append(target)
+    state["completed_targets"] = completed_targets
+    state["stage"] = f"{target}_completed"
+    _write_json_atomic(state_path, state)
+    output_vol.commit()
+
+    remaining = any(item["target"] not in population for item in schedule)
+    if remaining:
+        next_call = advance_naive_latest_opponent.spawn(
+            source_run_suffix=source_suffix,
+            continuation_suffix=continuation,
+            last_generation=last_generation,
+            steps_per_role=steps_per_role,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            attacker_learning_rate=attacker_learning_rate,
+            defender_learning_rate=defender_learning_rate,
+            attacker_sft_stop_after_step=attacker_sft_stop_after_step,
+            defender_sft_stop_after_step=defender_sft_stop_after_step,
+            sft_batches_per_step=sft_batches_per_step,
+            save_steps=save_steps,
+            actor_lr_scheduler=actor_lr_scheduler,
+            lr_warmup_ratio=lr_warmup_ratio,
+        )
+        return {
+            "completed_phase": target,
+            "next_controller_call_id": next_call.object_id,
+            "state_path": str(state_path),
+        }
+
+    state.update(
+        completed=True,
+        stage=f"A2_through_D{last_generation}_completed",
+    )
+    _write_json_atomic(state_path, state)
+    output_vol.commit()
+    return state
+
+
 rescore_image = (
     modal.Image.debian_slim()
     .pip_install("numpy")
@@ -620,6 +988,47 @@ def cold_start_train(
     else:
         print(f"PSRO_RUN_SUFFIX={suffix}", flush=True)
         print(f"TRAIN_CALL_ID={result.object_id}", flush=True)
+
+
+@psro_app.local_entrypoint(name="naive_selfplay_train")
+def naive_selfplay_train(
+    source_run_suffix: str,
+    continuation_suffix: str = "",
+    last_generation: int = 5,
+    steps_per_role: int = 100,
+    lora_rank: int = 64,
+    lora_alpha: int = 64,
+    attacker_learning_rate: float = 1e-5,
+    defender_learning_rate: float = 4e-5,
+    attacker_sft_stop_after_step: int = 30,
+    defender_sft_stop_after_step: int = 10,
+    sft_batches_per_step: int = 1,
+    save_steps: int = 10,
+    actor_lr_scheduler: str = "constant_with_warmup",
+    lr_warmup_ratio: float = 0.05,
+) -> None:
+    continuation = continuation_suffix or datetime.now().strftime(
+        "naive_A2_to_D5_s100_%Y%m%d_%H%M%S"
+    )
+    call = advance_naive_latest_opponent.spawn(
+        source_run_suffix=source_run_suffix,
+        continuation_suffix=continuation,
+        last_generation=last_generation,
+        steps_per_role=steps_per_role,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        attacker_learning_rate=attacker_learning_rate,
+        defender_learning_rate=defender_learning_rate,
+        attacker_sft_stop_after_step=attacker_sft_stop_after_step,
+        defender_sft_stop_after_step=defender_sft_stop_after_step,
+        sft_batches_per_step=sft_batches_per_step,
+        save_steps=save_steps,
+        actor_lr_scheduler=actor_lr_scheduler,
+        lr_warmup_ratio=lr_warmup_ratio,
+    )
+    print(f"SOURCE_RUN_SUFFIX={source_run_suffix}", flush=True)
+    print(f"CONTINUATION_SUFFIX={continuation}", flush=True)
+    print(f"CONTROLLER_CALL_ID={call.object_id}", flush=True)
 
 
 @psro_app.local_entrypoint(name="rescore_cell")
