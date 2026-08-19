@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cold-start role-LoRA PSRO using one strict zero-sum safety payoff.
+"""Cold-start role-LoRA PSRO with a projected terminal zero-sum payoff.
 
 This module owns a new run root and does not edit the sibling Self-RedTeam
 checkout.  Iteration one intentionally uses one fixed opponent per oracle; the
@@ -179,7 +179,7 @@ def train_cold_start_iteration_one(
     sft_batches_per_step: int = 1,
     run_suffix: str = "",
 ) -> dict[str, Any]:
-    """Train cold A1 and cold D1 with strict zero-sum PPO rewards."""
+    """Train cold A1 and D1 with the existing general-sum training reward."""
 
     if steps_per_role < 1:
         raise ValueError("steps_per_role must be positive")
@@ -201,19 +201,16 @@ def train_cold_start_iteration_one(
     root.mkdir(parents=True, exist_ok=True)
     state_path = root / "state.json"
     contract = {
-        "schema_version": "role-lora-zero-sum-psro-cold-v2",
+        "schema_version": "role-lora-zero-sum-psro-cold-v3",
         "reward_version": ZERO_SUM_REWARD_VERSION,
         "init_mode": "cold",
         "definition": (
             "each active role starts from the same frozen base model with a "
             "new rank-64 adapter and a new optimizer"
         ),
-        "training_reward": "original general_sum",
+        "training_reward": "original general_sum including existing shaping",
         "matrix_reward": ZERO_SUM_REWARD_VERSION,
-        "label_drift_policy": (
-            "classify after attacker rewrite; drop before defender rollout in "
-            "training; drop from the independently rolled-out payoff matrix"
-        ),
+        "label_drift_policy": "no consistency gate; score every valid rollout",
         "base_model": BASE_MODEL,
         "prompt_mix": {
             "generated_harmful": 0.5,
@@ -267,7 +264,6 @@ def train_cold_start_iteration_one(
             sft_batches_per_step=sft_batches_per_step,
             save_steps=steps_per_role,
             exact_prompt_label_balance=True,
-            drop_attack_label_drift_before_defense=True,
             wandb_identity=f"role_lora_zero_sum_psro__{suffix}__A1",
         )
     state["population"]["A1"] = _adapter_identity(a1_checkpoint)
@@ -299,7 +295,6 @@ def train_cold_start_iteration_one(
             sft_batches_per_step=sft_batches_per_step,
             save_steps=steps_per_role,
             exact_prompt_label_balance=True,
-            drop_attack_label_drift_before_defense=True,
             wandb_identity=f"role_lora_zero_sum_psro__{suffix}__D1",
         )
     state["population"]["D1"] = _adapter_identity(d1_checkpoint)
@@ -531,8 +526,8 @@ def rescore_raw_cell_zero_sum(
             "dropped_counts": progress["dropped_counts"],
             "accepted_count": progress["accepted_count"],
             "policy": (
-                "drop WildGuard parse errors and attack-label drift, then "
-                "take the first exact 50/50 valid nested prefix; never zero-fill"
+                "drop only WildGuard parse errors, score label drift normally, "
+                "then take the first exact 50/50 nested prefix; never zero-fill"
             ),
         },
         "attacker_payoff": mean_ci95(attacker_values),

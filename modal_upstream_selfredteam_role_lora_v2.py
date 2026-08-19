@@ -329,112 +329,6 @@ def _patch_exact_prompt_label_balance() -> None:
     )
 
 
-def _patch_early_attack_label_filter() -> None:
-    """Skip defender rollout when a generated rewrite changes seed class.
-
-    This is a sampling filter for the original general-sum training objective,
-    not a zero-sum PPO reward.  The disposable upstream copy performs a prompt
-    classification call after the attacker turn and removes drifted/unparseable
-    games before the defender is invoked.
-    """
-
-    language_game_path = (
-        UPSTREAM_WORK / "openrlhf/trainer/ppo_utils/language_game.py"
-    )
-    _replace_once(
-        language_game_path,
-        '''            if turn % 2 == 0:
-                self.strategy.print(f"🎮 Turn {turn}: 🚀 Generating attacks... 🔥")
-                self._generate_attacker_turn(active_games, turn, attacker_llm_generator, **kwargs)
-            else:
-''',
-        '''            if turn % 2 == 0:
-                self.strategy.print(f"🎮 Turn {turn}: 🚀 Generating attacks... 🔥")
-                self._generate_attacker_turn(active_games, turn, attacker_llm_generator, **kwargs)
-                if self.custom_configs.get(
-                    "drop_attack_label_drift_before_defense", False
-                ):
-                    self._drop_attack_label_drift_before_defense(active_games)
-            else:
-''',
-        "classify attack labels before defender rollout",
-    )
-    _replace_once(
-        language_game_path,
-        '''    def _generate_defender_turn(self, active_games, turn, llm_generator, **kwargs):
-''',
-        '''    def _drop_attack_label_drift_before_defense(self, active_games):
-        expected_by_prompt_type = {
-            "generated_harmful": "harmful",
-            "generated_benign": "unharmful",
-            "vanilla_harmful": "harmful",
-            "vanilla_benign": "unharmful",
-        }
-        game_indices = []
-        batch_queries = []
-        for game_idx, game in active_games.items():
-            if len(game["history"]) != 1:
-                raise ValueError("early label filter expects one attacker turn")
-            expected = expected_by_prompt_type.get(game["prompt_type"])
-            if expected is None:
-                raise ValueError(
-                    f"unknown prompt type for early label filter: "
-                    f"{game['prompt_type']!r}"
-                )
-            game_indices.append(game_idx)
-            batch_queries.append({
-                "game_idx": game_idx,
-                "prompt": game["history"][0]["content"],
-                # WildGuard emits the prompt label jointly with response fields.
-                # This fixed neutral placeholder makes the prompt-only gate
-                # deterministic; it is never used as a game response or reward.
-                "response": "I cannot assist with that request.",
-            })
-
-        if not batch_queries:
-            return
-        raw_labels = remote_rm_fn(
-            self.remote_rm_url[0], batch_queries, score_key="labels"
-        )
-        if isinstance(raw_labels, list):
-            labels_by_game = dict(zip(game_indices, raw_labels))
-        else:
-            labels_by_game = raw_labels
-
-        dropped_parse = 0
-        dropped_drift = 0
-        for game_idx in game_indices:
-            labels = labels_by_game.get(
-                game_idx, labels_by_game.get(str(game_idx))
-            )
-            if labels is None:
-                raise ValueError(
-                    f"missing early prompt label for game {game_idx}"
-                )
-            if labels.get("is_parsing_error", False):
-                dropped_parse += 1
-                del active_games[game_idx]
-                continue
-            expected = expected_by_prompt_type[
-                active_games[game_idx]["prompt_type"]
-            ]
-            if labels.get("prompt_harmfulness") != expected:
-                dropped_drift += 1
-                del active_games[game_idx]
-
-        self.strategy.print(
-            "Early attack-label filter: "
-            f"kept={len(active_games)}, drift={dropped_drift}, "
-            f"parse_error={dropped_parse}; dropped games receive no reward "
-            "and no defender rollout"
-        )
-
-    def _generate_defender_turn(self, active_games, turn, llm_generator, **kwargs):
-''',
-        "install early attack-label filter",
-    )
-
-
 def _patch_role_aware_malformed_output_fallback() -> None:
     """Recover malformed defender answers without exposing attacker CoT.
 
@@ -1693,7 +1587,6 @@ def _prepare_lora_v2_upstream() -> None:
     _patch_native_lora_sync()
     _patch_attacker_sft_rl_format()
     _patch_exact_prompt_label_balance()
-    _patch_early_attack_label_filter()
 
 
 def _adapter_checkpoint(path: Path) -> bool:
@@ -1872,7 +1765,6 @@ def _run_role(
     actor_lr_scheduler: str = "cosine_with_min_lr",
     lr_warmup_ratio: float = 0.03,
     exact_prompt_label_balance: bool = False,
-    drop_attack_label_drift_before_defense: bool = False,
     wandb_identity: str = "",
 ) -> Path:
     if role not in {"attacker", "defender"}:
@@ -1952,9 +1844,6 @@ def _run_role(
         "actor_lr_scheduler": actor_lr_scheduler,
         "postfill_cot_stop_after_step": sft_stop_after_step,
         "exact_prompt_label_balance": exact_prompt_label_balance,
-        "drop_attack_label_drift_before_defense": (
-            drop_attack_label_drift_before_defense
-        ),
     }
     wandb_key = os.environ.get("WANDB_API_KEY", "")
     if not wandb_key:
@@ -2113,9 +2002,6 @@ def _run_role(
         "ppo_reward_type": "general_sum",
         "strict_zero_sum_ppo_reward": False,
         "format_reward_in_ppo": True,
-        "drop_attack_label_drift_before_defense": (
-            drop_attack_label_drift_before_defense
-        ),
         "prompt_label_balance": (
             "deterministic exact 50/50 harmful/benign finite prefix"
             if exact_prompt_label_balance
