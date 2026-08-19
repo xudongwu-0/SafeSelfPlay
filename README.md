@@ -105,11 +105,17 @@ should not be read as a controlled inter-generation ablation.
 
 ## 2. Train Role LoRAs
 
-Cold-start A1 then D1:
+Cold-start PSRO A1 then D1:
 
 ```bash
 ./run_selfredteam_lora_a1d1_h200x4.sh
 ```
+
+The training reward remains the original Self-RedTeam general-sum reward with
+its existing CoT/SFT shaping. For generated attacks whose WildGuard prompt
+label flips relative to the seed, attacker reward is capped at zero and the
+corresponding defender-training game is omitted from replay. This policy does
+not alter the separately computed zero-sum PSRO matrix reward.
 
 Continue one complete generation, for example A2/D2 to A3/D3:
 

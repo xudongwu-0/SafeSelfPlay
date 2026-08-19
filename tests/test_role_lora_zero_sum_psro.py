@@ -15,6 +15,11 @@ from roll.utils.role_lora_zero_sum_psro import (
     solve_zero_sum_meta_game,
     zero_sum_cell_cache_key,
 )
+from roll.utils.role_lora_training_reward import (
+    TRAINING_LABEL_DRIFT_POLICY,
+    cap_label_drift_attacker_reward,
+    label_drift_training_action,
+)
 
 
 def _labels(prompt: str, response: str, refusal: str) -> dict[str, object]:
@@ -69,6 +74,52 @@ class ZeroSumRewardTest(unittest.TestCase):
                 prompt_type="generated_harmful", labels=labels
             )
         self.assertEqual(raised.exception.reason, "wildguard_parse_error")
+
+
+class TrainingLabelDriftPolicyTest(unittest.TestCase):
+    def action(self, role: str, prompt_type: str, label: str | None) -> str:
+        return label_drift_training_action(
+            optimizer_train_role=role,
+            prompt_type=prompt_type,
+            prompt_harmfulness=label,
+            policy=TRAINING_LABEL_DRIFT_POLICY,
+        )
+
+    def test_attacker_drift_caps_both_seed_directions(self):
+        self.assertEqual(
+            self.action("attacker", "generated_benign", "harmful"),
+            "cap_zero",
+        )
+        self.assertEqual(
+            self.action("attacker", "generated_harmful", "unharmful"),
+            "cap_zero",
+        )
+        self.assertEqual(cap_label_drift_attacker_reward(2.0), 0.0)
+        self.assertEqual(cap_label_drift_attacker_reward(-1.0), -1.0)
+
+    def test_defender_drops_generated_drift(self):
+        self.assertEqual(
+            self.action("defender", "generated_benign", "harmful"),
+            "drop",
+        )
+        self.assertEqual(
+            self.action("defender", "generated_harmful", "unharmful"),
+            "drop",
+        )
+
+    def test_consistent_and_vanilla_prompts_are_kept(self):
+        self.assertEqual(
+            self.action("attacker", "generated_benign", "unharmful"),
+            "keep",
+        )
+        self.assertEqual(
+            self.action("defender", "generated_harmful", "harmful"),
+            "keep",
+        )
+        self.assertEqual(
+            self.action("defender", "vanilla_benign", "harmful"),
+            "keep",
+        )
 
 
 class ZeroSumProtocolTest(unittest.TestCase):
@@ -164,7 +215,7 @@ class ZeroSumProtocolTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             solve_zero_sum_meta_game([[0.0], [float("nan")]])
 
-    def test_training_keeps_existing_general_sum_reward(self):
+    def test_training_keeps_general_sum_with_asymmetric_drift_policy(self):
         repository = Path(__file__).resolve().parents[1]
         source = (
             repository / "modal_upstream_selfredteam_role_lora_v2.py"
@@ -173,7 +224,11 @@ class ZeroSumProtocolTest(unittest.TestCase):
         self.assertIn('"reward_type": "general_sum"', source)
         self.assertIn('"strict_zero_sum_ppo_reward": False', source)
         self.assertIn("def _patch_exact_prompt_label_balance()", source)
-        self.assertNotIn("def _patch_early_attack_label_filter()", source)
+        self.assertIn("def _patch_asymmetric_label_drift_training()", source)
+        self.assertIn(
+            'label_drift_training_policy: str = TRAINING_LABEL_DRIFT_POLICY',
+            source,
+        )
         cold_source = (
             repository / "modal_role_lora_zero_sum_psro.py"
         ).read_text(encoding="utf-8")
@@ -184,6 +239,14 @@ class ZeroSumProtocolTest(unittest.TestCase):
         )
         self.assertIn("exact_prompt_label_balance=True", cold_source)
         self.assertNotIn("drop_attack_label_drift_before_defense", cold_source)
+        self.assertIn(
+            '"training_label_drift_policy": TRAINING_LABEL_DRIFT_POLICY',
+            cold_source,
+        )
+        self.assertIn(
+            '"matrix_label_drift_policy": (',
+            cold_source,
+        )
         self.assertIn(
             'wandb_identity=f"role_lora_zero_sum_psro__{suffix}__A1"',
             (repository / "modal_role_lora_zero_sum_psro.py").read_text(

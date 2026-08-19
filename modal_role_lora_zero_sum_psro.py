@@ -39,6 +39,9 @@ from roll.utils.role_lora_zero_sum_psro import (
     solve_zero_sum_meta_game,
     zero_sum_cell_cache_key,
 )
+from roll.utils.role_lora_training_reward import (
+    TRAINING_LABEL_DRIFT_POLICY,
+)
 from roll.utils.upstream_v2_payoff import mean_ci95
 
 
@@ -170,16 +173,20 @@ def _adapter_identity(path: Path) -> dict[str, Any]:
     secrets=[modal.Secret.from_name("roll-secrets")],
 )
 def train_cold_start_iteration_one(
-    steps_per_role: int = 1,
+    steps_per_role: int = 100,
     lora_rank: int = 64,
     lora_alpha: int = 64,
     attacker_learning_rate: float = 1e-5,
     defender_learning_rate: float = 4e-5,
-    sft_stop_after_step: int = 1,
+    attacker_sft_stop_after_step: int = 30,
+    defender_sft_stop_after_step: int = 10,
     sft_batches_per_step: int = 1,
+    save_steps: int = 10,
+    actor_lr_scheduler: str = "constant_with_warmup",
+    lr_warmup_ratio: float = 0.05,
     run_suffix: str = "",
 ) -> dict[str, Any]:
-    """Train cold A1 and D1 with the existing general-sum training reward."""
+    """Train cold A1 and D1 with role-specific label-drift handling."""
 
     if steps_per_role < 1:
         raise ValueError("steps_per_role must be positive")
@@ -187,21 +194,33 @@ def train_cold_start_iteration_one(
         raise ValueError("the canonical cold-start path is fixed at rank/alpha 64")
     if attacker_learning_rate <= 0 or defender_learning_rate <= 0:
         raise ValueError("learning rates must be positive")
-    if not 0 <= sft_stop_after_step <= steps_per_role:
-        raise ValueError("sft_stop_after_step must be within the role budget")
+    if not 0 <= attacker_sft_stop_after_step <= steps_per_role:
+        raise ValueError("attacker SFT cutoff must be within the role budget")
+    if not 0 <= defender_sft_stop_after_step <= steps_per_role:
+        raise ValueError("defender SFT cutoff must be within the role budget")
     if sft_batches_per_step < 1:
         raise ValueError("sft_batches_per_step must be positive")
+    if save_steps < 1:
+        raise ValueError("save_steps must be positive")
+    if actor_lr_scheduler not in {
+        "cosine_with_min_lr",
+        "constant",
+        "constant_with_warmup",
+    }:
+        raise ValueError("unsupported actor_lr_scheduler")
+    if not 0 <= lr_warmup_ratio <= 1:
+        raise ValueError("lr_warmup_ratio must be in [0, 1]")
 
     output_vol.reload()
     suffix = _safe_component(
-        run_suffix or datetime.now().strftime("cold_smoke_%Y%m%d_%H%M%S"),
+        run_suffix or datetime.now().strftime("cold_A1D1_%Y%m%d_%H%M%S"),
         label="run_suffix",
     )
     root = PSRO_OUTPUT_ROOT / suffix
     root.mkdir(parents=True, exist_ok=True)
     state_path = root / "state.json"
     contract = {
-        "schema_version": "role-lora-zero-sum-psro-cold-v3",
+        "schema_version": "role-lora-zero-sum-psro-cold-v4",
         "reward_version": ZERO_SUM_REWARD_VERSION,
         "init_mode": "cold",
         "definition": (
@@ -209,8 +228,15 @@ def train_cold_start_iteration_one(
             "new rank-64 adapter and a new optimizer"
         ),
         "training_reward": "original general_sum including existing shaping",
+        "training_label_drift_policy": TRAINING_LABEL_DRIFT_POLICY,
+        "training_label_drift_effect": {
+            "attacker": "final shaped reward capped at zero",
+            "defender": "entire generated-drift game omitted from replay",
+        },
         "matrix_reward": ZERO_SUM_REWARD_VERSION,
-        "label_drift_policy": "no consistency gate; score every valid rollout",
+        "matrix_label_drift_policy": (
+            "no consistency gate; score every valid rollout"
+        ),
         "base_model": BASE_MODEL,
         "prompt_mix": {
             "generated_harmful": 0.5,
@@ -221,8 +247,12 @@ def train_cold_start_iteration_one(
         "lora_alpha": lora_alpha,
         "attacker_learning_rate": attacker_learning_rate,
         "defender_learning_rate": defender_learning_rate,
-        "sft_stop_after_step": sft_stop_after_step,
+        "attacker_sft_stop_after_step": attacker_sft_stop_after_step,
+        "defender_sft_stop_after_step": defender_sft_stop_after_step,
         "sft_batches_per_step": sft_batches_per_step,
+        "save_steps": save_steps,
+        "actor_lr_scheduler": actor_lr_scheduler,
+        "lr_warmup_ratio": lr_warmup_ratio,
         "seed": 8888,
     }
     prior = _read_json(state_path) if state_path.is_file() else None
@@ -260,10 +290,13 @@ def train_cold_start_iteration_one(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             learning_rate=attacker_learning_rate,
-            sft_stop_after_step=sft_stop_after_step,
+            sft_stop_after_step=attacker_sft_stop_after_step,
             sft_batches_per_step=sft_batches_per_step,
-            save_steps=steps_per_role,
+            save_steps=save_steps,
+            actor_lr_scheduler=actor_lr_scheduler,
+            lr_warmup_ratio=lr_warmup_ratio,
             exact_prompt_label_balance=True,
+            label_drift_training_policy=TRAINING_LABEL_DRIFT_POLICY,
             wandb_identity=f"role_lora_zero_sum_psro__{suffix}__A1",
         )
     state["population"]["A1"] = _adapter_identity(a1_checkpoint)
@@ -291,10 +324,13 @@ def train_cold_start_iteration_one(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             learning_rate=defender_learning_rate,
-            sft_stop_after_step=sft_stop_after_step,
+            sft_stop_after_step=defender_sft_stop_after_step,
             sft_batches_per_step=sft_batches_per_step,
-            save_steps=steps_per_role,
+            save_steps=save_steps,
+            actor_lr_scheduler=actor_lr_scheduler,
+            lr_warmup_ratio=lr_warmup_ratio,
             exact_prompt_label_balance=True,
+            label_drift_training_policy=TRAINING_LABEL_DRIFT_POLICY,
             wandb_identity=f"role_lora_zero_sum_psro__{suffix}__D1",
         )
     state["population"]["D1"] = _adapter_identity(d1_checkpoint)
@@ -545,17 +581,40 @@ def rescore_raw_cell_zero_sum(
 
 @psro_app.local_entrypoint(name="cold_start_train")
 def cold_start_train(
-    steps_per_role: int = 1,
+    steps_per_role: int = 100,
+    lora_rank: int = 64,
+    lora_alpha: int = 64,
+    attacker_learning_rate: float = 1e-5,
+    defender_learning_rate: float = 4e-5,
+    attacker_sft_stop_after_step: int = 30,
+    defender_sft_stop_after_step: int = 10,
+    sft_batches_per_step: int = 1,
+    save_steps: int = 10,
+    actor_lr_scheduler: str = "constant_with_warmup",
+    lr_warmup_ratio: float = 0.05,
     run_suffix: str = "",
     wait_for_completion: bool = False,
 ) -> None:
-    suffix = run_suffix or datetime.now().strftime("cold_smoke_%Y%m%d_%H%M%S")
+    suffix = run_suffix or datetime.now().strftime("cold_A1D1_%Y%m%d_%H%M%S")
     invoke = (
         train_cold_start_iteration_one.remote
         if wait_for_completion
         else train_cold_start_iteration_one.spawn
     )
-    result = invoke(steps_per_role=steps_per_role, run_suffix=suffix)
+    result = invoke(
+        steps_per_role=steps_per_role,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        attacker_learning_rate=attacker_learning_rate,
+        defender_learning_rate=defender_learning_rate,
+        attacker_sft_stop_after_step=attacker_sft_stop_after_step,
+        defender_sft_stop_after_step=defender_sft_stop_after_step,
+        sft_batches_per_step=sft_batches_per_step,
+        save_steps=save_steps,
+        actor_lr_scheduler=actor_lr_scheduler,
+        lr_warmup_ratio=lr_warmup_ratio,
+        run_suffix=suffix,
+    )
     if wait_for_completion:
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     else:

@@ -3,8 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Canonical sequential LoRA run. Both adapters start independently from the
-# same base model; only the active role's rank-64 adapter is optimized.
+# Canonical cold-start PSRO LoRA run. Both adapters start independently from
+# the same base model; training keeps the general-sum reward and applies the
+# asymmetric generated-label-drift policy before PPO replay.
 STEPS_PER_ROLE="${STEPS_PER_ROLE:-100}"
 LORA_RANK="${LORA_RANK:-64}"
 LORA_ALPHA="${LORA_ALPHA:-64}"
@@ -19,10 +20,10 @@ LR_WARMUP_RATIO="${LR_WARMUP_RATIO:-0.05}"
 RUN_SUFFIX="${RUN_SUFFIX:-lora_A${STEPS_PER_ROLE}D${STEPS_PER_ROLE}_r${LORA_RANK}a${LORA_ALPHA}_A_lr${ATTACKER_LR}_D_lr${DEFENDER_LR}_$(date +%Y%m%d_%H%M%S)}"
 
 # Modal --detach keeps the remote A1 -> D1 call alive after SSH disconnects.
-export UPSTREAM_ROLE_LORA_V2_GPU="${UPSTREAM_ROLE_LORA_V2_GPU:-H200:4}"
+export ROLE_LORA_PSRO_GPU="${ROLE_LORA_PSRO_GPU:-H200:4}"
 
 exec modal run --detach \
-  modal_upstream_selfredteam_role_lora_v2.py::lora_v2_app.train_lora_v2_a1_d1 \
+  modal_role_lora_zero_sum_psro.py::cold_start_train \
   --steps-per-role "$STEPS_PER_ROLE" \
   --lora-rank "$LORA_RANK" \
   --lora-alpha "$LORA_ALPHA" \

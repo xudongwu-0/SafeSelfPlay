@@ -50,6 +50,9 @@ from modal_upstream_selfredteam_role_full import (
     _install_upstream_runtime,
     _patch_role_specific_online_sft,
 )
+from roll.utils.role_lora_training_reward import (
+    TRAINING_LABEL_DRIFT_POLICY,
+)
 
 
 BASE_MODEL = "mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated"
@@ -326,6 +329,89 @@ def _patch_exact_prompt_label_balance() -> None:
             )
 ''',
         "exact finite H/B prompt balance",
+    )
+
+
+def _patch_asymmetric_label_drift_training() -> None:
+    """Cap attacker drift rewards and omit drifted defender games."""
+
+    game_path = (
+        UPSTREAM_WORK / "openrlhf/trainer/ppo_utils/language_game.py"
+    )
+    _replace_once(
+        game_path,
+        "from openrlhf.utils.remote_rm_utils import remote_rm_fn\n",
+        "from openrlhf.utils.remote_rm_utils import remote_rm_fn\n"
+        "from roll.utils.role_lora_training_reward import (\n"
+        "    cap_label_drift_attacker_reward,\n"
+        "    label_drift_training_action,\n"
+        ")\n",
+        "role label-drift policy import",
+    )
+    _replace_once(
+        game_path,
+        (
+            "            # Skip if wildguard cannot parse the response\n"
+            "            if labels.get('is_parsing_error', False):\n"
+            "                continue\n"
+            "                \n"
+            "            for turn_idx, turn in enumerate("
+            "game[\"processed_output_history\"]):\n"
+        ),
+        """            # Skip if wildguard cannot parse the response
+            if labels.get('is_parsing_error', False):
+                continue
+
+            label_drift_action = label_drift_training_action(
+                optimizer_train_role=self.custom_configs.get(
+                    "optimizer_train_role"
+                ),
+                prompt_type=game["prompt_type"],
+                prompt_harmfulness=labels.get("prompt_harmfulness"),
+                policy=self.custom_configs.get(
+                    "label_drift_training_policy"
+                ),
+            )
+            if label_drift_action == "drop":
+                # The frozen attacker changed the seed label. Do not let that
+                # interaction update the defender or enter its replay buffer.
+                continue
+
+            for turn_idx, turn in enumerate(game["processed_output_history"]):
+""",
+        "drop defender games whose generated attack changes label",
+    )
+    _replace_once(
+        game_path,
+        """                turn_states['reward'] = reward
+                turn_states['game_outcomes'] = outcome
+""",
+        """                if (
+                    label_drift_action == "cap_zero"
+                    and turn_states["game_role"] == "attacker"
+                ):
+                    turn_states['reward_before_label_drift_cap'] = reward
+                    reward = cap_label_drift_attacker_reward(reward)
+                turn_states['reward'] = reward
+                turn_states['game_outcomes'] = outcome
+                turn_states['label_drift_action'] = label_drift_action
+""",
+        "cap generated label-drift attacker reward at zero",
+    )
+
+    experience_path = (
+        UPSTREAM_WORK / "openrlhf/trainer/ppo_utils/experience_maker.py"
+    )
+    _replace_once(
+        experience_path,
+        """            'actual_prompt_harmfulness', 'actual_prompt_stratum',
+            'prompt_origin',
+""",
+        """            'actual_prompt_harmfulness', 'actual_prompt_stratum',
+            'prompt_origin', 'label_drift_action',
+            'reward_before_label_drift_cap',
+""",
+        "label-drift diagnostics in replay metadata",
     )
 
 
@@ -1587,6 +1673,7 @@ def _prepare_lora_v2_upstream() -> None:
     _patch_native_lora_sync()
     _patch_attacker_sft_rl_format()
     _patch_exact_prompt_label_balance()
+    _patch_asymmetric_label_drift_training()
 
 
 def _adapter_checkpoint(path: Path) -> bool:
@@ -1765,12 +1852,21 @@ def _run_role(
     actor_lr_scheduler: str = "cosine_with_min_lr",
     lr_warmup_ratio: float = 0.03,
     exact_prompt_label_balance: bool = False,
+    label_drift_training_policy: str = TRAINING_LABEL_DRIFT_POLICY,
     wandb_identity: str = "",
 ) -> Path:
     if role not in {"attacker", "defender"}:
         raise ValueError(role)
     if not fixed_opponent:
         raise ValueError("A frozen role opponent is required")
+    if label_drift_training_policy not in {
+        "",
+        TRAINING_LABEL_DRIFT_POLICY,
+    }:
+        raise ValueError(
+            "unsupported label-drift training policy: "
+            f"{label_drift_training_policy!r}"
+        )
     if role_start_adapter and not _adapter_checkpoint(Path(role_start_adapter)):
         raise FileNotFoundError(
             f"Missing active-role start adapter: {role_start_adapter}"
@@ -1844,6 +1940,7 @@ def _run_role(
         "actor_lr_scheduler": actor_lr_scheduler,
         "postfill_cot_stop_after_step": sft_stop_after_step,
         "exact_prompt_label_balance": exact_prompt_label_balance,
+        "label_drift_training_policy": label_drift_training_policy,
     }
     wandb_key = os.environ.get("WANDB_API_KEY", "")
     if not wandb_key:
@@ -2002,6 +2099,15 @@ def _run_role(
         "ppo_reward_type": "general_sum",
         "strict_zero_sum_ppo_reward": False,
         "format_reward_in_ppo": True,
+        "label_drift_training_policy": (
+            label_drift_training_policy or "disabled"
+        ),
+        "label_drift_training_effect": (
+            "attacker final shaped reward capped at zero on generated label "
+            "drift; defender games with generated label drift omitted"
+            if label_drift_training_policy
+            else "disabled"
+        ),
         "prompt_label_balance": (
             "deterministic exact 50/50 harmful/benign finite prefix"
             if exact_prompt_label_balance
