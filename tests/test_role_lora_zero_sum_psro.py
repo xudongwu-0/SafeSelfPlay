@@ -187,6 +187,12 @@ class ZeroSumProtocolTest(unittest.TestCase):
         self.assertIn('reward_type="psro_zero_sum_v2"', (
             repository / "modal_role_lora_zero_sum_psro.py"
         ).read_text(encoding="utf-8"))
+        self.assertIn(
+            'wandb_identity=f"role_lora_zero_sum_psro__{suffix}__A1"',
+            (repository / "modal_role_lora_zero_sum_psro.py").read_text(
+                encoding="utf-8"
+            ),
+        )
 
     def test_iteration_one_is_cold_for_both_roles_and_balanced(self):
         repository = Path(__file__).resolve().parents[1]

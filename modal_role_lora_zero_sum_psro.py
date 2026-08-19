@@ -261,6 +261,7 @@ def train_cold_start_iteration_one(
             sft_batches_per_step=sft_batches_per_step,
             save_steps=steps_per_role,
             reward_type="psro_zero_sum_v2",
+            wandb_identity=f"role_lora_zero_sum_psro__{suffix}__A1",
         )
     state["population"]["A1"] = _adapter_identity(a1_checkpoint)
     state["stage"] = "A1_completed"
@@ -291,6 +292,7 @@ def train_cold_start_iteration_one(
             sft_batches_per_step=sft_batches_per_step,
             save_steps=steps_per_role,
             reward_type="psro_zero_sum_v2",
+            wandb_identity=f"role_lora_zero_sum_psro__{suffix}__D1",
         )
     state["population"]["D1"] = _adapter_identity(d1_checkpoint)
     state.update(

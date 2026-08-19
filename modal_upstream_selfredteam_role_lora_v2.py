@@ -1890,6 +1890,7 @@ def _run_role(
     actor_lr_scheduler: str = "cosine_with_min_lr",
     lr_warmup_ratio: float = 0.03,
     reward_type: str = "general_sum",
+    wandb_identity: str = "",
 ) -> Path:
     if role not in {"attacker", "defender"}:
         raise ValueError(role)
@@ -1909,7 +1910,7 @@ def _run_role(
         )
     # Ray worker processes inherit the environment of the raylet.  Set W&B
     # identity before starting Ray so the actor uses this deterministic ID.
-    run_name = f"{run_dir.parent.name}__{run_dir.name}"
+    run_name = wandb_identity or f"{run_dir.parent.name}__{run_dir.name}"
     run_id = hashlib.sha1(run_name.encode()).hexdigest()[:8]
     os.environ["WANDB_RUN_ID"] = run_id
     os.environ["WANDB_RESUME"] = "allow"
@@ -2175,6 +2176,7 @@ def _run_role(
             else None
         ),
         "wandb_run_id": run_id,
+        "wandb_identity": run_name,
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     redacted = list(command)
