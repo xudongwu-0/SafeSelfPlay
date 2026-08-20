@@ -88,10 +88,10 @@ evaluation. A dash means the paper did not report that supplemental column.
 | Self-RedTeam + SFT, step 200 | Paper | 0.138 | 0.019 | 0.240 | 0.396 | 0.221 | 0.846 | 0.814 | 0.806 | 0.920 | - |
 | Llama-3.1-8B-Instruct-abliterated | Our evaluation | 0.424 | 0.454 | 0.938 | 0.910 | 0.575 | 0.099 | 0.415 | 0.932 | 0.940 | 0.972 |
 | Self-RedTeam reproduction, step 200 | Our evaluation | 0.095 | 0.019 | 0.159 | 0.400 | 0.196 | 0.925 | 0.835 | 0.780 | 0.880 | 0.365 |
-| SafeSelfPlay D1, cold restart step 100 (current pipeline) | Our evaluation, 2026-08-20 | 0.065 | 0.019 | 0.378 | 0.280 | 0.121 | 0.896 | 0.870 | 0.908 | 0.932 | 0.469 |
-| SafeSelfPlay legacy D1, LoRA generation 1 step 100 | Our evaluation | 0.036 | 0.007 | 0.145 | 0.200 | 0.066 | 0.916 | 0.945 | 0.612 | 0.836 | 0.367 |
-| SafeSelfPlay legacy D2, LoRA generation 2 step 80 | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 | 0.802 | 0.670 | 0.584 | 0.984 | 0.510 |
-| SafeSelfPlay legacy D3, LoRA generation 3 step 80 | Our evaluation | 0.003 | 0.000 | 0.031 | 0.090 | 0.031 | 0.860 | 0.780 | 0.604 | 0.980 | 0.430 |
+| SafeSelfPlay D1, step 100 (no-reward-hacking) | Our evaluation, 2026-08-20 | 0.065 | 0.019 | 0.378 | 0.280 | 0.121 | 0.896 | 0.870 | 0.908 | 0.932 | 0.469 |
+| SafeSelfPlay D1, step 100(reward-hacking) | Our evaluation | 0.036 | 0.007 | 0.145 | 0.200 | 0.066 | 0.916 | 0.945 | 0.612 | 0.836 | 0.367 |
+| SafeSelfPlay D2, step 80 (reward-hacking) | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 | 0.802 | 0.670 | 0.584 | 0.984 | 0.510 |
+| SafeSelfPlay D3, step 80 (reward-hacking) | Our evaluation | 0.003 | 0.000 | 0.031 | 0.090 | 0.031 | 0.860 | 0.780 | 0.604 | 0.980 | 0.430 |
 
 The five ASR columns contain harmful prompts and are lower-is-better. OR-Bench
 RTA and XSTest RTA also contain harmful or contrast prompts, but report the
