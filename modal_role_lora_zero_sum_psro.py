@@ -1358,6 +1358,30 @@ def _advance_kwargs(contract: dict[str, Any], run_suffix: str) -> dict[str, Any]
     }
 
 
+_EXTENSIBLE_CONTRACT_FIELDS = {
+    "generations",
+    "final_matrix_shape",
+    "post_training_evaluation",
+}
+
+
+def _contracts_match_for_generation_extension(
+    prior: dict[str, Any],
+    requested: dict[str, Any],
+) -> bool:
+    prior_invariant = {
+        key: value
+        for key, value in prior.items()
+        if key not in _EXTENSIBLE_CONTRACT_FIELDS
+    }
+    requested_invariant = {
+        key: value
+        for key, value in requested.items()
+        if key not in _EXTENSIBLE_CONTRACT_FIELDS
+    }
+    return prior_invariant == requested_invariant
+
+
 @psro_app.function(
     image=rescore_image,
     cpu=2,
@@ -1475,8 +1499,6 @@ def advance_cold_psro(
     }
     output_vol.reload()
     prior = _read_json(state_path) if state_path.is_file() else None
-    if prior is not None and prior.get("contract") != contract:
-        raise RuntimeError(f"run suffix already has a different contract: {root}")
     state: dict[str, Any] = prior or {
         "completed": False,
         "stage": "initialized",
@@ -1488,10 +1510,49 @@ def advance_cold_psro(
         "cells": {},
         "oracle_specs": {},
         "matrix_snapshots": {},
+        "final_matrices": {},
+        "extension_history": [],
         "evaluations": {},
     }
-    if state.get("completed") is True:
-        return state
+    if prior is not None:
+        prior_contract = prior.get("contract")
+        if not isinstance(prior_contract, dict):
+            raise RuntimeError("existing PSRO state has no valid contract")
+        if prior_contract != contract:
+            prior_generations = int(prior_contract.get("generations", 0))
+            if (
+                prior.get("completed") is True
+                and generations > prior_generations
+                and _contracts_match_for_generation_extension(
+                    prior_contract, contract
+                )
+            ):
+                extension = {
+                    "from_generations": prior_generations,
+                    "to_generations": generations,
+                    "source_state_sha256": _sha256_file(state_path),
+                    "reused_population": sorted(prior.get("population", {})),
+                    "reused_cells": sorted(prior.get("cells", {})),
+                    "rule": (
+                        "append-only generation extension; all non-generation "
+                        "contract fields must match"
+                    ),
+                }
+                state.setdefault("extension_history", []).append(extension)
+                state["contract"] = contract
+                state["completed"] = False
+                state["stage"] = (
+                    f"extended_from_generation_{prior_generations}_to_"
+                    f"{generations}"
+                )
+                state.setdefault("final_matrices", {})
+                state.setdefault("matrix_snapshots", {})
+            else:
+                raise RuntimeError(
+                    f"run suffix already has a non-extensible contract: {root}"
+                )
+        elif state.get("completed") is True:
+            return state
     population = state["population"]
     for label, record in population.items():
         if label in {"A0", "D0"}:
@@ -1626,25 +1687,45 @@ def advance_cold_psro(
             population, state["cells"]
         )
         final_solution = solve_zero_sum_meta_game(matrix)
-        _persist_matrix_snapshot(
+        final_snapshot_name = f"final_g{generations}"
+        final_snapshot_record = _persist_matrix_snapshot(
             root,
             state,
-            snapshot_name="final",
+            snapshot_name=final_snapshot_name,
             attackers=attackers,
             defenders=defenders,
             matrix=matrix,
             solution=final_solution,
         )
+        latest_final_path = root / "matrices" / "final.json"
+        _write_json_atomic(
+            latest_final_path,
+            _read_json(Path(final_snapshot_record["path"])),
+        )
+        state["matrix_snapshots"]["latest_final"] = {
+            "path": str(latest_final_path),
+            "sha256": _sha256_file(latest_final_path),
+            "generation": generations,
+            "immutable_snapshot": final_snapshot_record,
+        }
+        final_matrix_record = {
+            "attackers": attackers,
+            "defenders": defenders,
+            "payoff": matrix,
+            "meta_solution": final_solution,
+            "snapshot": final_snapshot_record,
+        }
+        state.setdefault("final_matrices", {})[str(generations)] = (
+            final_matrix_record
+        )
         state.update(
             {
                 "completed": True,
-                "stage": "A1_A5_D1_D5_and_official_evaluations_completed",
-                "final_matrix": {
-                    "attackers": attackers,
-                    "defenders": defenders,
-                    "payoff": matrix,
-                    "meta_solution": final_solution,
-                },
+                "stage": (
+                    f"A1_A{generations}_D1_D{generations}_and_official_"
+                    "evaluations_completed"
+                ),
+                "final_matrix": final_matrix_record,
             }
         )
         _persist_psro_inventory(root, state)

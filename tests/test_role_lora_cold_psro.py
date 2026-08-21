@@ -59,6 +59,11 @@ def test_sequential_double_oracle_schedule_includes_base() -> None:
     assert next_action(population, cells, evaluations, generations=1) == {
         "kind": "complete"
     }
+    assert next_action(population, cells, evaluations, generations=2) == {
+        "kind": "oracle",
+        "role": "attacker",
+        "target": "A2",
+    }
 
 
 def test_matrix_and_positive_support_pool_are_ordered() -> None:
@@ -110,4 +115,6 @@ def test_modal_sources_bind_pool_and_exact_retained_contracts() -> None:
     assert "deterministic per-episode PSRO opponent selection" in trainer
     assert 'retention_policy="zero_sum_psro_v4"' in coordinator
     assert '"matrix_snapshots": {}' in coordinator
+    assert "append-only generation extension" in coordinator
+    assert 'final_snapshot_name = f"final_g{generations}"' in coordinator
     assert '"zero_sum_psro_v4"' in payoff

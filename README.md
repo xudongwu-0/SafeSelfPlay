@@ -265,6 +265,7 @@ The durable state and checkpoint index are written to:
 /output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/before_A1.json
 /output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/before_D1.json
 /output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/...
+/output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/final_g5.json
 /output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/final.json
 ```
 
@@ -276,6 +277,22 @@ value, regret certificate, and its own SHA-256 in state. After the 36 cells
 and A1-A5/D1-D5 finish, the coordinator
 runs the current `selfredteam-official-eval` defender workflow for D1 through
 D5 and records the returned reports in the same state file.
+
+The cell store and generation-final matrices are append-only extension
+artifacts, like the population checkpoints. To extend a completed five-round
+run, reuse its exact suffix and increase only the generation limit:
+
+```bash
+RUN_SUFFIX=<completed-five-round-suffix> GENERATIONS=6 \
+./run_role_lora_cold_psro5_h200x4.sh
+```
+
+The coordinator verifies that every non-generation hyperparameter and
+implementation SHA is unchanged, revalidates all existing checkpoint hashes,
+and retains the original `final_g5.json`. It then trains A6/D6 and evaluates
+only the 13 new cells in the A6 row and D6 column; the original 36 cells and
+their 144,000 retained episodes are not regenerated. `final.json` always
+contains the latest full matrix, while `final_gN.json` files are immutable.
 
 To evaluate one frozen adapter pair independently with the adapter-aware raw
 payoff code:
