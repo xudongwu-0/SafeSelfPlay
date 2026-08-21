@@ -226,8 +226,59 @@ ASR (lower is better), harmful RTA (higher is better), and benign compliance
 
 ## 4. PSRO
 
-The current Llama role-LoRA launcher trains each new policy against the latest
-opponent. Evaluate one frozen adapter pair with the adapter-aware payoff code:
+Launch the canonical Llama role-LoRA cold PSRO run with:
+
+```bash
+./run_role_lora_cold_psro5_h200x4.sh
+```
+
+The shell launcher, rather than the Python implementation, fixes this formal
+run's defaults. In particular it passes `GENERATIONS=5`,
+`MATRIX_EPISODES=4000`, `STEPS_PER_ROLE=100`, rank/alpha, both learning rates,
+SFT cutoffs, checkpoint interval, training/matrix seeds, candidate-resampling
+limit, generation/judge batch sizes, and generation length. Override them as
+environment variables for a separate run suffix; every resolved value is
+stored in that run's immutable state contract.
+
+This is sequential double-oracle PSRO, not latest-opponent self-play. `A0` and
+`D0` are the same frozen base model represented as role-specific strategies.
+Every learned `A1`–`A5` and `D1`–`D5` is cold-started from that base with a
+fresh rank-64 adapter and optimizer. Before training each oracle, the complete
+available zero-sum matrix is solved; one opponent is sampled from the frozen
+Nash mixture per two-turn episode and kept for that episode. Zero-probability
+strategies are not forced back into the mixture, but base remains in the pool
+and can receive Nash mass.
+
+Each of the final 6x6 matrix's 36 cells retains exactly 4000 games: 2000
+generated-harmful and 2000 generated-benign. Parse failures and
+benign-to-harmful rewrites are discarded and deterministically replaced, so
+4000 is a retained-game count rather than a generation-attempt cap. Training
+still uses the current general-sum D1-D5 pipeline and asymmetric label-drift
+handling; only matrix construction uses the separately projected zero-sum
+terminal payoff.
+
+The durable state and checkpoint index are written to:
+
+```text
+/output/role_lora_zero_sum_psro/<RUN_SUFFIX>/state.json
+/output/role_lora_zero_sum_psro/<RUN_SUFFIX>/checkpoint_inventory.json
+/output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/before_A1.json
+/output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/before_D1.json
+/output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/...
+/output/role_lora_zero_sum_psro/<RUN_SUFFIX>/matrices/final.json
+```
+
+Every population entry records its adapter and config SHA-256. Completed
+cells, oracles, and official evaluations are reused only when their frozen
+contracts match. Every matrix snapshot stores row/column labels, all payoff
+values, the cell artifacts and retained counts, Nash probabilities, game
+value, regret certificate, and its own SHA-256 in state. After the 36 cells
+and A1-A5/D1-D5 finish, the coordinator
+runs the current `selfredteam-official-eval` defender workflow for D1 through
+D5 and records the returned reports in the same state file.
+
+To evaluate one frozen adapter pair independently with the adapter-aware raw
+payoff code:
 
 ```bash
 modal run --detach \
@@ -250,8 +301,8 @@ its quota. All retained games use the terminal zero-sum projection; this
 matrix-only rule does not change the D1-D5 training pipeline or its general-sum
 training reward.
 
-The older ROLL/Qwen path contains the complete payoff-matrix, Nash-mixture,
-and PSRO orchestration entrypoint in `modal_abs_benchmark.py`:
+The older ROLL/Qwen path has a separate payoff-matrix and PSRO entrypoint in
+`modal_abs_benchmark.py` and is retained only for that legacy model family:
 
 ```bash
 modal run modal_abs_benchmark.py \
@@ -265,10 +316,10 @@ modal run --detach modal_abs_benchmark.py \
   --asym-role-steps 50
 ```
 
-Pairwise results are cached, so unchanged checkpoint pairs are not evaluated
-again. This complete orchestrator is not yet wired to the current Llama
-rank-64 role-LoRA launcher; current A1-A3/D1-D3 checkpoints therefore represent
-sequential latest-opponent self-play, not Nash-mixture PSRO.
+The previously reported A1-A5/D1-D5 checkpoints remain sequential
+latest-opponent self-play baselines; they are not relabeled as Nash-mixture
+PSRO. The new launcher writes to a separate run root and never mutates those
+checkpoints.
 
 ## Attribution
 

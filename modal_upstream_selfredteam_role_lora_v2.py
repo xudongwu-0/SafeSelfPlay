@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -505,7 +507,7 @@ def _patch_reference_kl_monitoring() -> None:
 
 
 def _patch_colocated_fixed_opponent() -> None:
-    """Place one immutable role opponent beside actor/ref/current vLLM."""
+    """Place an immutable opponent mixture beside actor/ref/current vLLM."""
     cli_path = UPSTREAM_WORK / "openrlhf/cli/train_ppo_ray.py"
     _replace_once(
         cli_path,
@@ -547,6 +549,7 @@ def _patch_colocated_fixed_opponent() -> None:
             vllm_enable_sleep=False,
             lora_rank=args.fixed_opponent_lora_rank,
             initial_lora_path=args.fixed_opponent_lora_path,
+            opponent_pool_json=args.fixed_opponent_pool_json,
             tensor_lora_sync=False,
         )
 """,
@@ -598,6 +601,15 @@ def _patch_colocated_fixed_opponent() -> None:
     parser.add_argument("--fixed_opponent_pretrain", type=str, default=None)
     parser.add_argument("--fixed_opponent_lora_path", type=str, default=None)
     parser.add_argument("--fixed_opponent_lora_rank", type=int, default=0)
+    parser.add_argument(
+        "--fixed_opponent_pool_json",
+        type=str,
+        default=None,
+        help=(
+            "Frozen PSRO opponent entries [{id,adapter,sha256,probability}]; "
+            "a null adapter selects the base model"
+        ),
+    )
     parser.add_argument(
         "--fixed_opponent_vllm_gpu_memory_utilization",
         type=float,
@@ -1108,7 +1120,7 @@ class WorkerWrap(WorkerV1):
     _replace_once(
         engine_path,
         "import os\n",
-        "import hashlib\nimport os\n",
+        "import hashlib\nimport json\nimport os\n",
         "stable training LoRA identifier import",
     )
     _replace_once(
@@ -1136,9 +1148,20 @@ class WorkerWrap(WorkerV1):
         self.current_lora_request = None
         self.tensor_lora_sync = kwargs.pop("tensor_lora_sync", False)
         self.initial_lora_path = kwargs.pop("initial_lora_path", None)
-        if self.tensor_lora_sync and self.initial_lora_path:
+        raw_opponent_pool = kwargs.pop("opponent_pool_json", None)
+        self.opponent_pool = (
+            json.loads(raw_opponent_pool) if raw_opponent_pool else []
+        )
+        self.opponent_draw_counts = defaultdict(int)
+        if self.tensor_lora_sync and (
+            self.initial_lora_path or self.opponent_pool
+        ):
             raise ValueError(
-                "A vLLM engine cannot use tensor sync and a file LoRA together"
+                "A vLLM engine cannot use tensor sync and frozen LoRAs together"
+            )
+        if self.initial_lora_path and self.opponent_pool:
+            raise ValueError(
+                "Use either initial_lora_path or opponent_pool_json, not both"
             )
 """,
         "vLLM current LoRA request",
@@ -1158,6 +1181,34 @@ class WorkerWrap(WorkerV1):
                 lora_name="fixed_opponent_lora",
                 lora_int_id=_FIXED_OPPONENT_LORA_INT_ID,
                 lora_path=self.initial_lora_path,
+            )
+        self.opponent_lora_requests = []
+        cumulative = 0.0
+        for pool_index, entry in enumerate(self.opponent_pool):
+            probability = float(entry["probability"])
+            if probability <= 0:
+                raise ValueError("Opponent pool probabilities must be positive")
+            cumulative += probability
+            adapter_path = entry.get("adapter")
+            request = (
+                LoRARequest(
+                    lora_name=f"psro_opponent_{pool_index}_{entry['id']}",
+                    lora_int_id=1000 + pool_index,
+                    lora_path=adapter_path,
+                )
+                if adapter_path
+                else None
+            )
+            self.opponent_lora_requests.append((cumulative, request, entry["id"]))
+        if self.opponent_lora_requests:
+            if abs(cumulative - 1.0) > 1e-8:
+                raise ValueError(
+                    f"Opponent pool probabilities sum to {cumulative}, not one"
+                )
+            self.opponent_lora_requests[-1] = (
+                1.0,
+                self.opponent_lora_requests[-1][1],
+                self.opponent_lora_requests[-1][2],
             )
 """,
         "initialize vLLM tensor LoRA worker",
@@ -1199,6 +1250,23 @@ class WorkerWrap(WorkerV1):
 
     def reset_prefix_cache(self):
         self.llm.llm_engine.reset_prefix_cache()
+
+    def _opponent_selector(self, actor_rank, prompt_token_ids, ordinal):
+        if not self.opponent_lora_requests:
+            return None
+        digest = hashlib.sha256()
+        digest.update(b"role_lora_psro_opponent_draw_v1")
+        digest.update(str(actor_rank).encode())
+        digest.update(str(ordinal).encode())
+        for token_id in prompt_token_ids:
+            digest.update(int(token_id).to_bytes(4, "little", signed=False))
+        draw = int.from_bytes(digest.digest()[:8], "big") / 2**64
+        for pool_index, (cumulative, _request, _label) in enumerate(
+            self.opponent_lora_requests
+        ):
+            if draw < cumulative:
+                return pool_index
+        raise RuntimeError("Opponent mixture CDF did not select a strategy")
 """,
         "vLLM tensor LoRA update methods",
     )
@@ -1221,15 +1289,78 @@ class WorkerWrap(WorkerV1):
     )
     _replace_once(
         engine_path,
+        """        self.requests[actor_rank] = prompt_token_ids
+        self.actor_counter += 1
+""",
+        """        draw_start = self.opponent_draw_counts[actor_rank]
+        selectors = [
+            self._opponent_selector(
+                actor_rank,
+                prompt,
+                draw_start + local_index,
+            )
+            for local_index, prompt in enumerate(prompt_token_ids)
+        ]
+        self.opponent_draw_counts[actor_rank] += len(prompt_token_ids)
+        self.requests[actor_rank] = (prompt_token_ids, selectors)
+        self.actor_counter += 1
+""",
+        "deterministic per-episode PSRO opponent selection",
+    )
+    _replace_once(
+        engine_path,
+        """            num_requests = []
+            requests: list[TokensPrompt] = []
+            for actor_rank, request in self.requests.items():
+                num_requests.append((actor_rank, len(request)))
+                for r in request:
+                    requests.append(TokensPrompt(prompt_token_ids=r))
+""",
+        """            num_requests = []
+            requests: list[TokensPrompt] = []
+            selectors = []
+            for actor_rank, (request, request_selectors) in self.requests.items():
+                num_requests.append((actor_rank, len(request)))
+                for prompt_token_ids, selector in zip(
+                    request, request_selectors, strict=True
+                ):
+                    requests.append(
+                        TokensPrompt(prompt_token_ids=prompt_token_ids)
+                    )
+                    selectors.append(selector)
+""",
+        "preserve opponent selectors while gathering actor requests",
+    )
+    _replace_once(
+        engine_path,
         """                responses = self.llm.generate(prompts=requests, sampling_params=sampling_params)
 """,
-        """                responses = self.llm.generate(
-                    prompts=requests,
-                    sampling_params=sampling_params,
-                    lora_request=self.current_lora_request,
-                )
+        """                if self.opponent_lora_requests:
+                    responses = [None] * len(requests)
+                    grouped = defaultdict(list)
+                    for request_index, selector in enumerate(selectors):
+                        grouped[selector].append(request_index)
+                    for selector, indices in sorted(grouped.items()):
+                        lora_request = self.opponent_lora_requests[selector][1]
+                        group_responses = self.llm.generate(
+                            prompts=[requests[index] for index in indices],
+                            sampling_params=sampling_params,
+                            lora_request=lora_request,
+                        )
+                        for index, response in zip(
+                            indices, group_responses, strict=True
+                        ):
+                            responses[index] = response
+                    if any(response is None for response in responses):
+                        raise RuntimeError("Opponent response scatter is incomplete")
+                else:
+                    responses = self.llm.generate(
+                        prompts=requests,
+                        sampling_params=sampling_params,
+                        lora_request=self.current_lora_request,
+                    )
 """,
-        "adapter-aware vLLM generation",
+        "adapter-aware grouped PSRO opponent generation",
     )
     _replace_once(
         engine_path,
@@ -1239,6 +1370,7 @@ class WorkerWrap(WorkerV1):
         """    vllm_enable_sleep=False,
     lora_rank=0,
     initial_lora_path=None,
+    opponent_pool_json=None,
     tensor_lora_sync=False,
 ):
 """,
@@ -1250,10 +1382,28 @@ class WorkerWrap(WorkerV1):
                 noset_visible_devices=noset_visible_devices,
 """,
         """                enable_sleep_mode=vllm_enable_sleep,
-                enable_lora=lora_rank > 0 or initial_lora_path is not None,
-                max_loras=1,
+                enable_lora=(
+                    lora_rank > 0
+                    or initial_lora_path is not None
+                    or opponent_pool_json is not None
+                ),
+                max_loras=max(
+                    1,
+                    sum(
+                        bool(entry.get("adapter"))
+                        for entry in json.loads(opponent_pool_json or "[]")
+                    ),
+                ),
+                max_cpu_loras=max(
+                    1,
+                    sum(
+                        bool(entry.get("adapter"))
+                        for entry in json.loads(opponent_pool_json or "[]")
+                    ),
+                ),
                 max_lora_rank=max(1, lora_rank),
                 initial_lora_path=initial_lora_path,
+                opponent_pool_json=opponent_pool_json,
                 tensor_lora_sync=tensor_lora_sync,
                 noset_visible_devices=noset_visible_devices,
 """,
@@ -1268,6 +1418,7 @@ class WorkerWrap(WorkerV1):
 """,
         """            args.vllm_enable_sleep,
             args.lora_rank,
+            None,
             None,
             True,
         )
@@ -1687,6 +1838,77 @@ def _adapter_checkpoint(path: Path) -> bool:
     )
 
 
+def _adapter_weight_sha256(path: Path) -> str:
+    if not _adapter_checkpoint(path):
+        raise FileNotFoundError(f"Missing PEFT adapter checkpoint: {path}")
+    weights = next(
+        candidate
+        for candidate in (
+            path / "adapter_model.safetensors",
+            path / "adapter_model.bin",
+        )
+        if candidate.is_file()
+    )
+    digest = hashlib.sha256()
+    with weights.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalize_fixed_opponent_pool(
+    entries: list[dict[str, object]] | None,
+) -> list[dict[str, object]]:
+    """Validate an immutable PSRO mixture and remove zero-mass strategies."""
+
+    if not entries:
+        return []
+    normalized: list[dict[str, object]] = []
+    seen: set[str] = set()
+    total = 0.0
+    for raw in entries:
+        label = str(raw.get("id", ""))
+        if not re.fullmatch(r"[AD][0-9]+", label) or label in seen:
+            raise ValueError(f"Invalid or duplicate opponent id: {label!r}")
+        seen.add(label)
+        probability = float(raw.get("probability", -1.0))
+        if not math.isfinite(probability) or probability < 0:
+            raise ValueError(f"Invalid probability for {label}: {probability}")
+        if probability == 0:
+            continue
+        adapter_value = raw.get("adapter")
+        adapter = str(adapter_value) if adapter_value else None
+        expected_sha = str(raw.get("sha256", ""))
+        if adapter is None:
+            if label not in {"A0", "D0"}:
+                raise ValueError(f"Only A0/D0 may select the base model: {label}")
+            if expected_sha != f"base:{BASE_MODEL}":
+                raise ValueError(f"Invalid base identity for {label}")
+        else:
+            actual_sha = _adapter_weight_sha256(Path(adapter))
+            if actual_sha != expected_sha:
+                raise RuntimeError(
+                    f"Frozen opponent {label} SHA changed: "
+                    f"expected={expected_sha}, actual={actual_sha}"
+                )
+        total += probability
+        normalized.append(
+            {
+                "id": label,
+                "adapter": adapter,
+                "sha256": expected_sha,
+                "probability": probability,
+            }
+        )
+    if not normalized or not math.isclose(total, 1.0, abs_tol=1e-8):
+        raise ValueError(f"Positive opponent probabilities sum to {total}, not one")
+    # Eliminate floating-point CDF residue while preserving the recorded mix.
+    normalized[-1]["probability"] = float(normalized[-1]["probability"]) + (
+        1.0 - total
+    )
+    return normalized
+
+
 def _install_llamafactory_runtime() -> None:
     subprocess.run(
         [
@@ -1840,6 +2062,7 @@ def _run_role(
     role_start_adapter: str | None = None,
     fixed_opponent: str,
     fixed_opponent_adapter: str | None = None,
+    fixed_opponent_pool: list[dict[str, object]] | None = None,
     remote_rm_url: str,
     run_dir: Path,
     steps: int,
@@ -1851,6 +2074,7 @@ def _run_role(
     save_steps: int,
     actor_lr_scheduler: str = "cosine_with_min_lr",
     lr_warmup_ratio: float = 0.03,
+    seed: int = 8888,
     exact_prompt_label_balance: bool = False,
     label_drift_training_policy: str = TRAINING_LABEL_DRIFT_POLICY,
     wandb_identity: str = "",
@@ -1877,6 +2101,13 @@ def _run_role(
         raise FileNotFoundError(
             f"Missing frozen opponent adapter: {fixed_opponent_adapter}"
         )
+    if fixed_opponent_adapter and fixed_opponent_pool:
+        raise ValueError(
+            "fixed_opponent_adapter and fixed_opponent_pool are mutually exclusive"
+        )
+    normalized_opponent_pool = _normalize_fixed_opponent_pool(
+        fixed_opponent_pool
+    )
     # Ray worker processes inherit the environment of the raylet.  Set W&B
     # identity before starting Ray so the actor uses this deterministic ID.
     run_name = wandb_identity or f"{run_dir.parent.name}__{run_dir.name}"
@@ -1952,6 +2183,13 @@ def _run_role(
         fixed_opponent_lora_args = [
             "--fixed_opponent_lora_path",
             fixed_opponent_adapter,
+            "--fixed_opponent_lora_rank",
+            str(lora_rank),
+        ]
+    elif normalized_opponent_pool:
+        fixed_opponent_lora_args = [
+            "--fixed_opponent_pool_json",
+            json.dumps(normalized_opponent_pool, sort_keys=True),
             "--fixed_opponent_lora_rank",
             str(lora_rank),
         ]
@@ -2038,7 +2276,7 @@ def _run_role(
         "1",
         "--bf16",
         "--seed",
-        "8888",
+        str(seed),
         "--top_p",
         "1.0",
         "--temperature",
@@ -2118,6 +2356,13 @@ def _run_role(
         "role_start_base": BASE_MODEL,
         "fixed_opponent_base": fixed_opponent,
         "fixed_opponent_adapter": fixed_opponent_adapter,
+        "fixed_opponent_pool": normalized_opponent_pool or None,
+        "fixed_opponent_sampling": (
+            "deterministic request-level categorical draw; one frozen "
+            "opponent action per two-turn episode"
+            if normalized_opponent_pool
+            else "single fixed opponent"
+        ),
         "legacy_lora_interface": False,
         "rollout_sync": "native LoRA A/B tensors via vLLM LoRA manager",
         "steps": steps,
@@ -2130,6 +2375,7 @@ def _run_role(
         "learning_rate": learning_rate,
         "actor_lr_scheduler": actor_lr_scheduler,
         "lr_warmup_ratio": lr_warmup_ratio,
+        "seed": seed,
         "kl_penalty": 0.0,
         "reference_kl_monitored": True,
         "sft_stop_after_step": sft_stop_after_step,

@@ -648,6 +648,7 @@ def evaluate_upstream_v2_raw_payoff_cell(
     generation_batch_size: int = 64,
     judge_batch_size: int = 64,
     max_new_tokens: int = 2048,
+    retention_policy: str = "raw_parseable_v2",
     run_suffix: str = "",
     reuse_source_suffix: str = "",
 ) -> dict[str, Any]:
@@ -657,6 +658,13 @@ def evaluate_upstream_v2_raw_payoff_cell(
     from vllm import LLM
     from vllm.lora.request import LoRARequest
 
+    if retention_policy not in {
+        "raw_parseable_v2",
+        "zero_sum_psro_v4",
+    }:
+        raise ValueError(f"unsupported retention_policy: {retention_policy!r}")
+    if retention_policy == "zero_sum_psro_v4" and reuse_source_suffix:
+        raise ValueError("PSRO-v4 retained cells cannot use legacy candidate reuse")
     if min_convergence_episodes < 256 or min_convergence_episodes % 2:
         raise ValueError(
             "min_convergence_episodes must be even and at least 256"
@@ -724,7 +732,10 @@ def evaluate_upstream_v2_raw_payoff_cell(
         familywise_alpha=familywise_alpha,
         simultaneous_series=6,
     )
-    if not convergence_preflight["feasible"]:
+    if (
+        not convergence_preflight["feasible"]
+        and retention_policy != "zero_sum_psro_v4"
+    ):
         raise ValueError(
             "The pre-registered convergence configuration is impossible even "
             "for a zero-variance, zero-drift reward stream. Add sufficiently "
@@ -889,9 +900,13 @@ def evaluate_upstream_v2_raw_payoff_cell(
             ),
         },
         "estimand": (
-            "pre-remove_ties training game metric: every WildGuard-parseable "
-            "game is retained; None labels contribute upstream zero/tie "
-            "components and tie_rate is reported"
+            "PSRO retained candidate stream: WildGuard parse errors and "
+            "generated-benign attacks classified harmful are dropped and "
+            "replaced before the exact 50/50 prefix is formed"
+            if retention_policy == "zero_sum_psro_v4"
+            else "pre-remove_ties training game metric: every WildGuard-"
+            "parseable game is retained; None labels contribute upstream "
+            "zero/tie components and tie_rate is reported"
         ),
         "reward_normalization": {"attacker": "none", "defender": "none"},
         "zero_sum_assumption": False,
@@ -919,6 +934,14 @@ def evaluate_upstream_v2_raw_payoff_cell(
         "prompt_dataset_sha256": prompt_dataset_sha256,
         "nested_seed_prefix": True,
         "candidate_reuse": reuse_provenance,
+        "retention_policy": retention_policy,
+        "retained_episode_contract": (
+            "drop WildGuard parse errors and generated-benign attacks "
+            "classified harmful; deterministically resample to an exact "
+            "50/50 retained prefix"
+            if retention_policy == "zero_sum_psro_v4"
+            else "drop WildGuard parse errors and retain every other game"
+        ),
         "wildguard_parse_errors": (
             "drop without zero-fill; deterministically resample each stratum "
             "until the requested valid prefix is complete"
@@ -940,6 +963,9 @@ def evaluate_upstream_v2_raw_payoff_cell(
         "familywise_alpha": familywise_alpha,
         "simultaneous_confidence_series": 6,
         "zero_variance_convergence_preflight": convergence_preflight,
+        "convergence_preflight_is_generation_gate": (
+            retention_policy != "zero_sum_psro_v4"
+        ),
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": -1,
@@ -1137,7 +1163,18 @@ def evaluate_upstream_v2_raw_payoff_cell(
                 flush=True,
             )
 
-        progress = assemble_valid_interleaved_prefix(candidate_rows, episodes)
+        if retention_policy == "zero_sum_psro_v4":
+            from roll.utils.role_lora_zero_sum_psro import (
+                assemble_valid_zero_sum_prefix,
+            )
+
+            def assemble_retained_prefix(rows):
+                return assemble_valid_zero_sum_prefix(rows, episodes=episodes)
+        else:
+            def assemble_retained_prefix(rows):
+                return assemble_valid_interleaved_prefix(rows, episodes)
+
+        progress = assemble_retained_prefix(candidate_rows)
         max_candidates = episodes * max_candidate_multiplier
         if len(candidate_rows) > max_candidates:
             raise RuntimeError(
@@ -1461,9 +1498,7 @@ def evaluate_upstream_v2_raw_payoff_cell(
 
             candidate_rows.extend(wave_rows)
             _write_jsonl_atomic(candidate_path, candidate_rows)
-            progress = assemble_valid_interleaved_prefix(
-                candidate_rows, episodes
-            )
+            progress = assemble_retained_prefix(candidate_rows)
             status_path.write_text(
                 json.dumps(
                     {
@@ -1573,7 +1608,12 @@ def evaluate_upstream_v2_raw_payoff_cell(
                 "valid_counts": progress["valid_counts"],
                 "dropped_counts": progress["dropped_counts"],
                 "accepted_count": len(episode_rows),
-                "policy": "drop parse errors and stratify-resample; never fill zero",
+                "policy": (
+                    "drop parse errors and benign-to-harmful drift, then "
+                    "stratify-resample; never fill zero"
+                    if retention_policy == "zero_sum_psro_v4"
+                    else "drop parse errors and stratify-resample; never fill zero"
+                ),
             },
             "candidate_reuse": reuse_provenance,
             "generation_protocol": {
@@ -3014,6 +3054,7 @@ def upstream_v2_payoff_convergence(
     generation_batch_size: int = 64,
     judge_batch_size: int = 64,
     max_new_tokens: int = 2048,
+    retention_policy: str = "raw_parseable_v2",
     run_suffix: str = "",
     reuse_source_suffix: str = "",
     wait_for_completion: bool = False,
@@ -3050,6 +3091,7 @@ def upstream_v2_payoff_convergence(
         generation_batch_size=generation_batch_size,
         judge_batch_size=judge_batch_size,
         max_new_tokens=max_new_tokens,
+        retention_policy=retention_policy,
         run_suffix=suffix,
         reuse_source_suffix=reuse_source_suffix,
     )

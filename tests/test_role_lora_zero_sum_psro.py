@@ -305,7 +305,8 @@ class ZeroSumProtocolTest(unittest.TestCase):
         source = (
             repository / "modal_role_lora_zero_sum_psro.py"
         ).read_text(encoding="utf-8")
-        self.assertEqual(source.count("role_start_adapter=None"), 2)
+        # A1/D1 cold bootstrap plus the generic A_i/D_i cold PSRO oracle.
+        self.assertEqual(source.count("role_start_adapter=None"), 3)
         self.assertIn('"generated_harmful": 0.5', source)
         self.assertIn('"generated_benign": 0.5', source)
         self.assertIn('PSRO_OUTPUT_ROOT = Path(', source)
