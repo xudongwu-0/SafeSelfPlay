@@ -238,7 +238,7 @@ def train_cold_start_iteration_one(
         },
         "matrix_reward": ZERO_SUM_REWARD_VERSION,
         "matrix_label_drift_policy": (
-            "no consistency gate; score every valid rollout"
+            "drop generated_benign to harmful drift; score other valid rollouts"
         ),
         "base_model": BASE_MODEL,
         "prompt_mix": {
@@ -830,9 +830,10 @@ def rescore_raw_cell_zero_sum(
     if not isinstance(prompt_dataset_sha256, str) or len(prompt_dataset_sha256) != 64:
         raise RuntimeError("invalid prompt dataset SHA-256")
 
-    source_episode_budget = int(source_manifest.get("episodes", 0))
-    requested_episodes = zero_sum_episodes or source_episode_budget
-    if requested_episodes < 256 or requested_episodes % 2:
+    requested_episodes = zero_sum_episodes
+    if requested_episodes and (
+        requested_episodes < 256 or requested_episodes % 2
+    ):
         raise ValueError("zero_sum_episodes must be even and at least 256")
     progress = assemble_valid_zero_sum_prefix(
         source_rows,
@@ -842,6 +843,11 @@ def rescore_raw_cell_zero_sum(
         raise RuntimeError(
             "raw candidate artifact cannot fill the requested balanced "
             f"zero-sum prefix: {progress}"
+        )
+    if progress["requested_episodes"] < 256:
+        raise RuntimeError(
+            "raw candidate artifact has fewer than 256 retained games in "
+            f"its largest balanced zero-sum prefix: {progress}"
         )
     rows = rescore_zero_sum_episodes(progress["episodes"])
     counts = [value for value in DEFAULT_SAMPLE_COUNTS if value <= len(rows)]
@@ -930,8 +936,10 @@ def rescore_raw_cell_zero_sum(
             "dropped_counts": progress["dropped_counts"],
             "accepted_count": progress["accepted_count"],
             "policy": (
-                "drop only WildGuard parse errors, score label drift normally, "
-                "then take the first exact 50/50 nested prefix; never zero-fill"
+                "drop WildGuard parse errors and generated-benign attacks "
+                "classified as harmful, then take the first exact 50/50 "
+                "nested prefix; retained games use the unchanged zero-sum "
+                "terminal projection and are never zero-filled"
             ),
         },
         "attacker_payoff": mean_ci95(attacker_values),

@@ -240,6 +240,16 @@ modal run --detach \
 The evaluator and convergence cache are implemented in
 `modal_upstream_v2_payoff.py` and `roll/utils/upstream_v2_payoff.py`.
 
+For the separate zero-sum PSRO matrix, the retained prompt mix is exactly
+50/50 generated-harmful/generated-benign. If an attacker rewrites a benign
+seed into a prompt classified as harmful, that game is dropped and replaced by
+the next deterministic benign candidate before averaging. With the default
+`zero_sum_episodes=0`, rescoring uses the largest balanced prefix available;
+an explicit retained-sample target fails closed if either stratum cannot fill
+its quota. All retained games use the terminal zero-sum projection; this
+matrix-only rule does not change the D1-D5 training pipeline or its general-sum
+training reward.
+
 The older ROLL/Qwen path contains the complete payoff-matrix, Nash-mixture,
 and PSRO orchestration entrypoint in `modal_abs_benchmark.py`:
 

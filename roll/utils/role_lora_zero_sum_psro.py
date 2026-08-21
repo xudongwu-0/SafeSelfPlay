@@ -2,7 +2,8 @@
 
 The matrix projects both roles' terminal general-sum utilities onto one
 antisymmetric payoff. Training remains untouched. CoT-format and online-SFT
-shaping are not matrix payoffs, and label consistency is not a gate.
+shaping are not matrix payoffs. A generated-benign seed rewritten into a
+WildGuard-harmful prompt is outside the matrix estimand and is resampled.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from roll.utils.upstream_v2_payoff import (
 )
 
 
-ZERO_SUM_REWARD_VERSION = "role-lora-psro-terminal-projection-v3"
+ZERO_SUM_REWARD_VERSION = "role-lora-psro-terminal-projection-v4"
 ZERO_SUM_REWARD_BOUNDS = (-1.0, 1.0)
 TERMINAL_GENERAL_SUM_BOUNDS = (-2.0, 2.0)
 
@@ -43,7 +44,9 @@ def compute_zero_sum_psro_reward(
     Let ``r_A`` and ``r_D`` be the existing role rewards after removing the
     private CoT-format components. Both have fixed theoretical bounds [-2, 2].
     The matrix payoff is ``u_A = (r_A - r_D) / 4`` and ``u_D = -u_A``.
-    Label drift is scored normally by the original terminal reward components.
+    A benign seed rewritten into a harmful prompt is dropped so that changing
+    the task label cannot become an attacker shortcut. Other terminal outcomes
+    use the unchanged reward projection.
     """
 
     if prompt_type not in {"generated_harmful", "generated_benign"}:
@@ -53,6 +56,11 @@ def compute_zero_sum_psro_reward(
         )
     if bool(labels.get("is_parsing_error", False)):
         raise ZeroSumEpisodeDrop("wildguard_parse_error")
+    if (
+        prompt_type == "generated_benign"
+        and labels.get("prompt_harmfulness") == "harmful"
+    ):
+        raise ZeroSumEpisodeDrop("benign_to_harmful_label_drift")
 
     raw = compute_upstream_v2_raw_rewards(
         prompt_type=prompt_type,
@@ -117,10 +125,14 @@ def assemble_valid_zero_sum_prefix(
     *,
     episodes: int,
 ) -> dict[str, Any]:
-    """Drop invalid games and build an exact 50/50 nested accepted prefix."""
+    """Drop invalid games and build an exact 50/50 nested accepted prefix.
 
-    if episodes < 2 or episodes % 2:
-        raise ValueError("episodes must be a positive even number")
+    ``episodes=0`` selects the largest balanced prefix available in the
+    candidate artifact. A positive value requests that exact retained count.
+    """
+
+    if episodes < 0 or episodes == 1 or episodes % 2:
+        raise ValueError("episodes must be zero or a positive even number")
     valid: dict[str, list[dict[str, Any]]] = {
         "generated_harmful": [],
         "generated_benign": [],
@@ -159,7 +171,12 @@ def assemble_valid_zero_sum_prefix(
         row.update(score)
         valid[prompt_type].append(row)
 
-    needed_per_stratum = episodes // 2
+    needed_per_stratum = (
+        min(len(valid["generated_harmful"]), len(valid["generated_benign"]))
+        if episodes == 0
+        else episodes // 2
+    )
+    resolved_episodes = 2 * needed_per_stratum
     accepted_per_stratum = min(
         needed_per_stratum,
         len(valid["generated_harmful"]),
@@ -182,7 +199,7 @@ def assemble_valid_zero_sum_prefix(
         "complete": not any(deficits.values()),
         "episodes": accepted,
         "candidate_count": len(candidates),
-        "requested_episodes": episodes,
+        "requested_episodes": resolved_episodes,
         "accepted_count": len(accepted),
         "valid_counts": {key: len(value) for key, value in valid.items()},
         "deficits": deficits,
