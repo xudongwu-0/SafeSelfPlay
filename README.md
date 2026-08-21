@@ -91,6 +91,7 @@ evaluation. A dash means the paper did not report that supplemental column.
 | SafeSelfPlay D1, step 100 (no-reward-hacking) | Our evaluation | 0.065 | 0.019 | 0.378 | 0.280 | 0.121 | 0.896 | 0.870 | 0.908 | 0.932 | 0.469 |
 | SafeSelfPlay D2, step 100 (no-reward-hacking) | Our evaluation | 0.074 | 0.019 | 0.272 | 0.377 | 0.126 | 0.860 | 0.895 | 0.820 | 0.952 | 0.637 |
 | SafeSelfPlay D3, step 100 (no-reward-hacking) | Our evaluation | 0.024 | 0.022 | 0.135 | 0.083 | 0.087 | 0.841 | 0.870 | 0.856 | 0.988 | 0.588 |
+| SafeSelfPlay D5, step 100 (no-reward-hacking) | Our evaluation | 0.024 | 0.022 | 0.117 | 0.207 | 0.091 | 0.737 | 0.575 | 0.872 | 0.992 | 0.614 |
 | SafeSelfPlay D1, step 100(reward-hacking) | Our evaluation | 0.036 | 0.007 | 0.145 | 0.200 | 0.066 | 0.916 | 0.945 | 0.612 | 0.836 | 0.367 |
 | SafeSelfPlay D2, step 80 (reward-hacking) | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 | 0.802 | 0.670 | 0.584 | 0.984 | 0.510 |
 | SafeSelfPlay D3, step 80 (reward-hacking) | Our evaluation | 0.003 | 0.000 | 0.031 | 0.090 | 0.031 | 0.860 | 0.780 | 0.604 | 0.980 | 0.430 |
@@ -123,6 +124,14 @@ Relative to D2, D3 substantially improves four of the five harmful ASR
 benchmarks and improves WildJailbreak and XSTest benign compliance. OR-Bench
 benign compliance and the two RTA columns regress, so later generations remain
 subject to the same safety-versus-over-refusal evaluation.
+
+The current-pipeline D5 row is the 100-step defender at the end of the same
+latest-opponent chain. Its exact result manifest is
+`/output/upstream_selfredteam_role_full_eval/naive_latest_A2_to_D5_s100_20260820_D5_full_eval_20260821/comparison.json`.
+Relative to D3, D5 improves WildJailbreak harmful ASR and all three benign
+compliance columns, while DAN and HarmBench ASR and both RTA columns regress.
+The update is therefore mixed and does not establish monotonic defender
+improvement. D4 is evaluated separately and is not interpolated from D3/D5.
 
 The reward-hacking D1-D3 rows use the same rank-64 role-LoRA parameterization but
 different step budgets, opponents, and pre-fix training pipeline; they document
