@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import re
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -311,6 +315,77 @@ class ZeroSumProtocolTest(unittest.TestCase):
         self.assertIn('"generated_benign": 0.5', source)
         self.assertIn('PSRO_OUTPUT_ROOT = Path(', source)
         self.assertNotIn("source.replace(\"selfplay-redteaming\"", source)
+
+    def test_formal_psro_prunes_reproducible_storage_intermediates(self):
+        repository = Path(__file__).resolve().parents[1]
+        trainer = (
+            repository / "modal_upstream_selfredteam_role_lora_v2.py"
+        ).read_text(encoding="utf-8")
+        coordinator = (
+            repository / "modal_role_lora_zero_sum_psro.py"
+        ).read_text(encoding="utf-8")
+        launcher = (
+            repository / "run_role_lora_cold_psro5_h200x4.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "def _prune_intermediate_hf_checkpoints(",
+            trainer,
+        )
+        self.assertIn(
+            '"checkpoint_retention": "final_hf_only"',
+            coordinator,
+        )
+        self.assertIn("keep_only_final_hf_checkpoint=True", coordinator)
+        self.assertIn(
+            '_write_json_atomic(destination / "raw_manifest.json"',
+            coordinator,
+        )
+        self.assertIn("raw_source_pruned", coordinator)
+        self.assertIn("merged_checkpoint_pruned", coordinator)
+        self.assertIn(
+            'SAVE_STEPS="${SAVE_STEPS:-$STEPS_PER_ROLE}"',
+            launcher,
+        )
+
+    def test_checkpoint_pruner_keeps_only_exact_final_hf_directory(self):
+        repository = Path(__file__).resolve().parents[1]
+        trainer_path = repository / "modal_upstream_selfredteam_role_lora_v2.py"
+        tree = ast.parse(trainer_path.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_prune_intermediate_hf_checkpoints"
+        )
+        namespace = {"Path": Path, "re": re, "shutil": shutil}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[function], type_ignores=[])
+                ),
+                str(trainer_path),
+                "exec",
+            ),
+            namespace,
+        )
+        prune = namespace["_prune_intermediate_hf_checkpoints"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in (
+                "global_step10_hf",
+                "global_step90_hf",
+                "global_step100_hf",
+                "unrelated",
+            ):
+                (root / name).mkdir()
+            removed = prune(root, final_step=100)
+            self.assertEqual(
+                removed,
+                ["global_step10_hf", "global_step90_hf"],
+            )
+            self.assertTrue((root / "global_step100_hf").is_dir())
+            self.assertTrue((root / "unrelated").is_dir())
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -94,14 +95,34 @@ PROMPT_DATA_FILENAMES = (
     "vanilla_benign_dataset.jsonl",
 )
 REMOTE_PROMPT_DATA_ROOT = Path("/psro_prompt_data")
+HYDRATION_HELPER_FILENAMES = (
+    "modal_fsp_demo.py",
+    "modal_abs_benchmark.py",
+    "modal_upstream_selfredteam_fixed_seed.py",
+    "modal_upstream_selfredteam_role_lora.py",
+    "modal_upstream_selfredteam_role_full.py",
+    "modal_upstream_selfredteam_role_lora_v2.py",
+    "modal_upstream_v2_payoff.py",
+)
+
+
+def _with_hydration_helpers(image: modal.Image) -> modal.Image:
+    for helper_filename in HYDRATION_HELPER_FILENAMES:
+        image = image.add_local_file(
+            str(LOCAL_REPOSITORY / helper_filename),
+            f"/root/{helper_filename}",
+            copy=False,
+        )
+    return image
 
 psro_app = modal.App("role-lora-zero-sum-psro")
-psro_lora_image = llamafactory_lora_image.add_local_file(
-    str(LOCAL_REPOSITORY / "modal_upstream_selfredteam_role_lora_v2.py"),
-    "/root/modal_upstream_selfredteam_role_lora_v2.py",
-    copy=False,
-)
-psro_payoff_image = payoff_image
+# Functions are imported from /root while Modal hydrates the entrypoint module.
+# The base trainer image keeps these helpers under /roll for the subprocesses it
+# launches, but image mounts are not yet on sys.path during hydration.  Mirror
+# the complete top-level import chain into /root so detached controllers can be
+# imported before any function starts.
+psro_lora_image = _with_hydration_helpers(llamafactory_lora_image)
+psro_payoff_image = _with_hydration_helpers(payoff_image)
 
 
 def _safe_component(value: str, *, label: str) -> str:
@@ -339,6 +360,7 @@ def train_cold_start_iteration_one(
             exact_prompt_label_balance=True,
             label_drift_training_policy=TRAINING_LABEL_DRIFT_POLICY,
             wandb_identity=f"role_lora_zero_sum_psro__{suffix}__A1",
+            keep_only_final_hf_checkpoint=True,
         )
     state["population"]["A1"] = _adapter_identity(a1_checkpoint)
     state["stage"] = "A1_completed"
@@ -373,6 +395,7 @@ def train_cold_start_iteration_one(
             exact_prompt_label_balance=True,
             label_drift_training_policy=TRAINING_LABEL_DRIFT_POLICY,
             wandb_identity=f"role_lora_zero_sum_psro__{suffix}__D1",
+            keep_only_final_hf_checkpoint=True,
         )
     state["population"]["D1"] = _adapter_identity(d1_checkpoint)
     state.update(
@@ -513,6 +536,7 @@ def train_naive_latest_opponent_role(
         exact_prompt_label_balance=True,
         label_drift_training_policy=TRAINING_LABEL_DRIFT_POLICY,
         wandb_identity=wandb_identity,
+        keep_only_final_hf_checkpoint=True,
     )
     return _adapter_identity(checkpoint)
 
@@ -752,9 +776,9 @@ def advance_naive_latest_opponent(
     return state
 
 
-rescore_image = (
+rescore_image = _with_hydration_helpers(
     modal.Image.debian_slim()
-    .pip_install("numpy")
+    .pip_install("numpy", "typing_extensions")
     .add_local_file(
         str(LOCAL_REPOSITORY / "modal_upstream_selfredteam_role_lora_v2.py"),
         "/root/modal_upstream_selfredteam_role_lora_v2.py",
@@ -954,6 +978,7 @@ def rescore_raw_cell_zero_sum(
     if manifest_path.is_file() and _read_json(manifest_path) != manifest:
         raise RuntimeError(f"cell output already has a different contract: {destination}")
     _write_json_atomic(manifest_path, manifest)
+    _write_json_atomic(destination / "raw_manifest.json", source_manifest)
     _write_jsonl_atomic(destination / "episodes.jsonl", rows)
     _write_json_atomic(destination / "convergence.json", convergence)
 
@@ -1316,6 +1341,7 @@ def train_cold_psro_oracle(
         exact_prompt_label_balance=True,
         label_drift_training_policy=TRAINING_LABEL_DRIFT_POLICY,
         wandb_identity=wandb_identity,
+        keep_only_final_hf_checkpoint=True,
     )
     identity = _adapter_identity(checkpoint)
     output_vol.commit()
@@ -1473,6 +1499,7 @@ def advance_cold_psro(
             "mixture; base is eligible and no exploration floor is added"
         ),
         "steps_per_role": steps_per_role,
+        "checkpoint_retention": "final_hf_only",
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "attacker_learning_rate": attacker_learning_rate,
@@ -1738,6 +1765,35 @@ def advance_cold_psro(
     _persist_psro_inventory(root, state)
     _write_json_atomic(state_path, state)
     output_vol.commit()
+
+    # Raw candidate waves and merged full models are restart aids only.  Once
+    # their durable result is in state.json, retain the scientific cell/eval
+    # artifacts and remove these large, reproducible intermediates.
+    if kind == "cell":
+        raw_source = Path(str(result.get("raw_source", "")))
+        if (
+            raw_source.name.startswith(f"{suffix}__")
+            and RAW_PAYOFF_ROOT in raw_source.parents
+            and raw_source.is_dir()
+            and not raw_source.is_symlink()
+        ):
+            shutil.rmtree(raw_source)
+            state["cells"][f"{attacker}__{defender}"]["raw_source_pruned"] = True
+            _write_json_atomic(state_path, state)
+            output_vol.commit()
+    elif kind == "evaluation":
+        merged_checkpoint = Path(str(result.get("evaluated_checkpoint", "")))
+        evaluation_root = Path("/output/upstream_selfredteam_role_full_eval")
+        if (
+            merged_checkpoint.name == "merged_defender"
+            and evaluation_root in merged_checkpoint.parents
+            and merged_checkpoint.is_dir()
+            and not merged_checkpoint.is_symlink()
+        ):
+            shutil.rmtree(merged_checkpoint)
+            state["evaluations"][defender]["merged_checkpoint_pruned"] = True
+            _write_json_atomic(state_path, state)
+            output_vol.commit()
     next_call = advance_cold_psro.spawn(**_advance_kwargs(contract, suffix))
     return {
         "completed_action": action,

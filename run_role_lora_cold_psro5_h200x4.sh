@@ -16,7 +16,10 @@ DEFENDER_LR="${DEFENDER_LR:-4e-5}"
 ATTACKER_SFT_STOP_AFTER_STEP="${ATTACKER_SFT_STOP_AFTER_STEP:-30}"
 DEFENDER_SFT_STOP_AFTER_STEP="${DEFENDER_SFT_STOP_AFTER_STEP:-10}"
 SFT_BATCHES_PER_STEP="${SFT_BATCHES_PER_STEP:-1}"
-SAVE_STEPS="${SAVE_STEPS:-10}"
+# The formal workflow retains only the terminal LoRA for each role.  A custom
+# lower interval is still accepted for debugging, but completed intermediates
+# are pruned by the trainer before it returns.
+SAVE_STEPS="${SAVE_STEPS:-$STEPS_PER_ROLE}"
 ACTOR_LR_SCHEDULER="${ACTOR_LR_SCHEDULER:-constant_with_warmup}"
 LR_WARMUP_RATIO="${LR_WARMUP_RATIO:-0.05}"
 TRAINING_SEED="${TRAINING_SEED:-8888}"

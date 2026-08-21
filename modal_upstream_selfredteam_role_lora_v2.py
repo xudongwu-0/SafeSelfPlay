@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -1838,6 +1839,31 @@ def _adapter_checkpoint(path: Path) -> bool:
     )
 
 
+def _prune_intermediate_hf_checkpoints(
+    ckpt_dir: Path,
+    *,
+    final_step: int,
+) -> list[str]:
+    """Remove completed non-final HF snapshots from one exact run directory."""
+
+    final_name = f"global_step{final_step}_hf"
+    removed: list[str] = []
+    if not ckpt_dir.is_dir():
+        return removed
+    for candidate in ckpt_dir.iterdir():
+        if candidate.name == final_name:
+            continue
+        if not re.fullmatch(r"global_step[0-9]+_hf", candidate.name):
+            continue
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise RuntimeError(
+                f"refusing to prune unexpected checkpoint entry: {candidate}"
+            )
+        shutil.rmtree(candidate)
+        removed.append(candidate.name)
+    return sorted(removed)
+
+
 def _adapter_weight_sha256(path: Path) -> str:
     if not _adapter_checkpoint(path):
         raise FileNotFoundError(f"Missing PEFT adapter checkpoint: {path}")
@@ -2078,6 +2104,7 @@ def _run_role(
     exact_prompt_label_balance: bool = False,
     label_drift_training_policy: str = TRAINING_LABEL_DRIFT_POLICY,
     wandb_identity: str = "",
+    keep_only_final_hf_checkpoint: bool = False,
 ) -> Path:
     if role not in {"attacker", "defender"}:
         raise ValueError(role)
@@ -2399,6 +2426,11 @@ def _run_role(
         ),
         "wandb_run_id": run_id,
         "wandb_identity": run_name,
+        "checkpoint_retention": (
+            "final_hf_only"
+            if keep_only_final_hf_checkpoint
+            else "all_configured_hf_checkpoints"
+        ),
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     redacted = list(command)
@@ -2435,6 +2467,18 @@ def _run_role(
     checkpoint = ckpt_dir / f"global_step{steps}_hf"
     if not _adapter_checkpoint(checkpoint):
         raise RuntimeError(f"Missing LoRA v2 checkpoint: {checkpoint}")
+    if keep_only_final_hf_checkpoint:
+        removed = _prune_intermediate_hf_checkpoints(
+            ckpt_dir,
+            final_step=steps,
+        )
+        if removed:
+            print(
+                "PRUNED_INTERMEDIATE_HF_CHECKPOINTS="
+                + json.dumps(removed),
+                flush=True,
+            )
+            output_vol.commit()
     return checkpoint
 
 
