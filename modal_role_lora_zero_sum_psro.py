@@ -1208,25 +1208,36 @@ def evaluate_zero_sum_psro_cell(
         / f"{attacker_name}__{defender_name}"
     )
     destination.mkdir(parents=True, exist_ok=True)
+    generation_keys = (
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_new_tokens",
+        "max_new_tokens",
+        "prompt_max_tokens",
+        "max_model_len",
+        "generation_seed_scheme",
+        "attacker_prompt_profile",
+        "resolved_defender_prompt_protocol",
+        "max_candidate_multiplier",
+        "candidate_wave_pairs",
+        "generation_batch_size",
+        "judge_batch_size",
+    )
     cell_contract = {
-        "reward_version": ZERO_SUM_REWARD_VERSION,
         "attacker_label": attacker_name,
         "defender_label": defender_name,
-        "attacker_sha256": attacker_sha256,
-        "defender_sha256": defender_sha256,
+        "attacker_adapter_sha256": attacker_sha256,
+        "defender_adapter_sha256": defender_sha256,
         "prompt_dataset_sha256": source_manifest["prompt_dataset_sha256"],
         "seed_base": seed_base,
-        "retained_episodes": episodes,
+        "episodes": episodes,
         "retained_prompt_counts": {
             "harmful": episodes // 2,
             "benign": episodes // 2,
         },
-        "generation_hyperparameters": {
-            "max_candidate_multiplier": max_candidate_multiplier,
-            "candidate_wave_pairs": candidate_wave_pairs,
-            "generation_batch_size": generation_batch_size,
-            "judge_batch_size": judge_batch_size,
-            "max_new_tokens": max_new_tokens,
+        "generation": {
+            key: source_manifest.get(key) for key in generation_keys
         },
         "source_manifest_sha256": _sha256_file(source_manifest_path),
         "source_candidates_sha256": _sha256_file(source_candidates_path),

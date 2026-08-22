@@ -118,3 +118,14 @@ def test_modal_sources_bind_pool_and_exact_retained_contracts() -> None:
     assert "append-only generation extension" in coordinator
     assert 'final_snapshot_name = f"final_g{generations}"' in coordinator
     assert '"zero_sum_psro_v4"' in payoff
+
+    evaluator = coordinator[
+        coordinator.index("def evaluate_zero_sum_psro_cell(") :
+        coordinator.index("def train_cold_psro_oracle(")
+    ]
+    assert '"attacker_adapter_sha256": attacker_sha256' in evaluator
+    assert '"defender_adapter_sha256": defender_sha256' in evaluator
+    assert '"episodes": episodes' in evaluator
+    assert '"generation": {' in evaluator
+    assert '"attacker_sha256": attacker_sha256' not in evaluator
+    assert '"retained_episodes": episodes' not in evaluator
