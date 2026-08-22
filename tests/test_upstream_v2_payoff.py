@@ -92,6 +92,24 @@ def _episode_rows(rewards: list[float]) -> list[dict[str, object]]:
 
 
 class UpstreamV2RawRewardTest(unittest.TestCase):
+    def test_raw_cell_resume_maps_episode_specs_to_candidate_rows(self):
+        repository = Path(__file__).resolve().parents[1]
+        modal_source = (
+            repository / "modal_upstream_v2_payoff.py"
+        ).read_text(encoding="utf-8")
+        raw_cell_source = modal_source[
+            modal_source.index("def evaluate_upstream_v2_raw_payoff_cell(") :
+            modal_source.index("def evaluate_d1_paired_gate(")
+        ]
+
+        self.assertNotIn('expected["candidate_index"]', raw_cell_source)
+        self.assertGreaterEqual(
+            raw_cell_source.count(
+                '"candidate_index": expected["episode_index"]'
+            ),
+            2,
+        )
+
     def test_standalone_evaluator_patches_tokenizers_backend_before_vllm(self):
         repository = Path(__file__).resolve().parents[1]
         modal_source = (

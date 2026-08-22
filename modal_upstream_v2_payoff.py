@@ -1051,7 +1051,7 @@ def evaluate_upstream_v2_raw_payoff_cell(
                 reuse_candidate_rows, expected_reuse_specs, strict=True
             ):
                 expected_contract = {
-                    "candidate_index": expected["candidate_index"],
+                    "candidate_index": expected["episode_index"],
                     "candidate_seed": expected["episode_seed"],
                     "prompt_type": expected["prompt_type"],
                     "seed_label": expected["seed_label"],
@@ -1143,7 +1143,7 @@ def evaluate_upstream_v2_raw_payoff_cell(
                 candidate_rows, expected_specs, strict=True
             ):
                 expected_contract = {
-                    "candidate_index": expected["candidate_index"],
+                    "candidate_index": expected["episode_index"],
                     "candidate_seed": expected["episode_seed"],
                     "prompt_type": expected["prompt_type"],
                     "seed_label": expected["seed_label"],
@@ -1156,7 +1156,7 @@ def evaluate_upstream_v2_raw_payoff_cell(
                 if observed_contract != expected_contract:
                     raise RuntimeError(
                         "Persisted candidate prefix differs from the nested "
-                        f"sampling contract at index {expected['candidate_index']}"
+                        f"sampling contract at index {expected['episode_index']}"
                     )
             print(
                 f"Resuming {len(candidate_rows)} durable payoff candidates",
