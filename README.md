@@ -205,6 +205,14 @@ model = PeftModel.from_pretrained(
 )
 ```
 
+### Running without Modal
+
+`scripts/slurm/` runs the same role-LoRA phases on a Slurm node with local GPUs,
+reusing this repository's patch chain, arguments and SFT mixture. See
+[scripts/slurm/README.md](scripts/slurm/README.md) for the workspace layout, the
+per-card memory split when the judge is colocated with training, and measured
+per-step throughput (18.7s/step for 8B rank-64 on 4xH200).
+
 ## 3. Evaluate
 
 Deploy the evaluator once, then evaluate any full checkpoint or PEFT adapter
