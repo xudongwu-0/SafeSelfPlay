@@ -53,7 +53,7 @@ must sum below 1.0. Working split on 4xH200-141GB with the judge colocated:
 
 | consumer | fraction | note |
 | --- | --- | --- |
-| wildguard judge | 0.13 | floor ~0.12; 7B weights alone are 14.3G |
+| wildguard judge | 0.13 | do not lower: 0.12 leaves 0.74G KV and the judge needs 1.0G at `--max_len 8192` |
 | trainable engines | 0.28 | `--vllm_gpu_memory_utilization` |
 | frozen opponent | 0.26 | `--fixed_opponent_vllm_gpu_memory_utilization` |
 | ZeRO-3 actor | rest | needs ~40G with gradient checkpointing |
@@ -92,4 +92,7 @@ cheap memory.
   running job dies in the epilogue after training has already finished.
 - The judge's `--max_len` must stay at the upstream 8192. At 4096 a long
   transcript returns 500, the judge server shuts down, and the trainer fails
-  after 12 retries.
+  after 12 retries. Its `--gpu_memory_utilization` must stay at 0.13 for the
+  same reason: 0.12 leaves 0.74G of KV against the 1.0G one 8192-token request
+  needs, and the judge dies at startup while its parent process lives on, so the
+  phase hangs in the health-check loop rather than failing fast.
