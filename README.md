@@ -302,6 +302,95 @@ only the 13 new cells in the A6 row and D6 column; the original 36 cells and
 their 144,000 retained episodes are not regenerated. `final.json` always
 contains the latest full matrix, while `final_gN.json` files are immutable.
 
+### Current cold-PSRO handoff (2026-08-25)
+
+The current formal run suffix is
+`cold_psro5_base_n4000_s100_20260822_v3`. It was intentionally archived at
+`training_A3` on 2026-08-25 and its Modal volume was then deleted. A1, D1, A2,
+and D2 are complete; the 3x3 A0-A2 by D0-D2 payoff prefix contains nine
+retained 4,000-game cells and the latest immutable snapshot is
+`matrices/before_A3.json`. A3 has no final checkpoint and is not part of the
+archived population. This run is a completed 3x3 experiment artifact, not a
+resumable cloud job.
+
+On the current local machine, the verified paused snapshot is:
+
+```text
+/export/pgs/wuxudong/work/selfplay/checkpoints/
+  cold_psro5_base_n4000_s100_20260822_v3_pause_20260824/
+  cold_psro5_base_n4000_s100_20260822_v3
+```
+
+Its `SHA256SUMS` covers all 102 source files, including the four final adapters,
+payoff-cell artifacts, matrices, logs, `state.json`, and
+`checkpoint_inventory.json`. Including `SHA256SUMS` itself, all 103 files are
+mirrored under:
+
+```text
+https://huggingface.co/xudongwu/SafeSelfPlay-checkpoints/tree/main/
+  cold-psro/cold_psro5_base_n4000_s100_20260822_v3
+```
+
+The Hub copy was verified against the local snapshot by relative path and byte
+size (103/103 files, no missing, extra, or mismatched files). Starting another
+cold PSRO run uses `run_role_lora_cold_psro5_h200x4.sh` with a new suffix; do
+not reuse this archived suffix as though A3 were recoverable in place.
+
+Upload the entire paused run, rather than only the four LoRA files, after
+authenticating locally. This preserves reusable matrices and resume evidence
+alongside the adapters:
+
+```bash
+source /export/pgs/wuxudong/.venvs/llm-safety-eval-vllm082/activate-shared.sh
+hf auth login
+LOCAL_RUN_ROOT=/export/pgs/wuxudong/work/selfplay/checkpoints/\
+cold_psro5_base_n4000_s100_20260822_v3_pause_20260824/\
+cold_psro5_base_n4000_s100_20260822_v3 \
+./scripts/upload_cold_psro_run.sh
+```
+
+The default destination is
+`xudongwu/SafeSelfPlay-checkpoints/cold-psro/cold_psro5_base_n4000_s100_20260822_v3`.
+The helper verifies `SHA256SUMS`, every adapter identity in the checkpoint
+inventory, and the Hugging Face login before uploading. It never deletes
+remote files.
+
+To run the released defender evaluation locally, first authenticate with an
+account that can access both gated `allenai/wildguard` and
+`allenai/wildguardmix`. The helper serializes model downloads into the shared
+Hugging Face cache, resumes completed metrics, temporarily merges each PEFT
+adapter for vLLM, and removes only that reproducible merged temporary model.
+The original adapters and evaluation results are retained.
+
+```bash
+source /export/pgs/wuxudong/.venvs/llm-safety-eval-vllm082/activate-shared.sh
+hf auth login
+
+COLD_ROOT=/export/pgs/wuxudong/work/selfplay/checkpoints/\
+cold_psro5_base_n4000_s100_20260822_v3_pause_20260824/\
+cold_psro5_base_n4000_s100_20260822_v3
+D1_OUT="$COLD_ROOT/evaluations/D1/local_official"
+D2_OUT="$COLD_ROOT/evaluations/D2/local_official"
+mkdir -p "$D1_OUT" "$D2_OUT"
+
+nohup env GPU_ID=4 \
+  CHECKPOINT_PATH="$COLD_ROOT/training/D1/ckpt/global_step100_hf" \
+  OUTPUT_DIR="$D1_OUT" \
+  ./scripts/run_local_defender_eval.sh >"$D1_OUT/eval.log" 2>&1 &
+
+nohup env GPU_ID=5 \
+  CHECKPOINT_PATH="$COLD_ROOT/training/D2/ckpt/global_step100_hf" \
+  OUTPUT_DIR="$D2_OUT" \
+  ./scripts/run_local_defender_eval.sh >"$D2_OUT/eval.log" 2>&1 &
+```
+
+The output directories contain resumable `metrics.json` and
+`individual.json`. The task set matches the current released-evaluator rows:
+WildGuardTest, WJB harmful/benign, DAN, HarmBench precomputed attacks,
+OR-Bench toxic/hard-1k, and XSTest. These cold-PSRO D1/D2 results are distinct
+from the earlier latest-opponent D1/D2 rows above and should only be merged
+into the results table after both manifests are complete.
+
 To evaluate one frozen adapter pair independently with the adapter-aware raw
 payoff code:
 
