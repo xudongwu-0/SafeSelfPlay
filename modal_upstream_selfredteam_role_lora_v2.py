@@ -529,7 +529,15 @@ def _patch_colocated_fixed_opponent() -> None:
         )
         batch_vllm_engine_call(defender_vllm_engines, "wake_up", rank_0_only=False)
 """,
-        """    defender_vllm_engines = None
+        """    if vllm_engines and args.fixed_opponent_pretrain:
+        # create_vllm_engines returns before the engines finish initializing, so
+        # without this barrier both groups profile memory concurrently. vLLM sizes
+        # its KV cache as total*utilization - (init_free - current_free), so each
+        # group charges the other's in-flight allocations to its own budget and one
+        # of them can profile zero cache blocks.
+        ray.get([engine.__ray_ready__.remote() for engine in vllm_engines])
+
+    defender_vllm_engines = None
     if args.fixed_opponent_pretrain:
         # Keep the opposite role immutable on the same H200 node. Ray resource
         # fractions are scheduling declarations only.
