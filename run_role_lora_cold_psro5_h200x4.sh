@@ -3,9 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Canonical cold, base-inclusive sequential double-oracle run:
-# A0/D0 are the frozen base; every A1-A5/D1-D5 oracle is a fresh rank-64
-# adapter and optimizer; every matrix cell retains exactly 4000 games.
+# Base-inclusive sequential double-oracle run.  Like upstream ROLL, one setting
+# selects initialization: true resets every oracle to base; false inherits the
+# preceding same-role LoRA.  The default preserves the canonical cold run.
+COLD_START="${COLD_START:-true}"
+case "$COLD_START" in
+  true) START_MODE_ARGS=(--cold-start); INIT_MODE="cold" ;;
+  false) START_MODE_ARGS=(--no-cold-start); INIT_MODE="warm" ;;
+  *) echo "COLD_START must be true or false" >&2; exit 2 ;;
+esac
 GENERATIONS="${GENERATIONS:-5}"
 MATRIX_EPISODES="${MATRIX_EPISODES:-4000}"
 STEPS_PER_ROLE="${STEPS_PER_ROLE:-100}"
@@ -29,7 +35,7 @@ CANDIDATE_WAVE_PAIRS="${CANDIDATE_WAVE_PAIRS:-64}"
 GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-64}"
 JUDGE_BATCH_SIZE="${JUDGE_BATCH_SIZE:-64}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
-RUN_SUFFIX="${RUN_SUFFIX:-cold_psro${GENERATIONS}_base_n${MATRIX_EPISODES}_s${STEPS_PER_ROLE}_$(date +%Y%m%d_%H%M%S)}"
+RUN_SUFFIX="${RUN_SUFFIX:-${INIT_MODE}_psro${GENERATIONS}_base_n${MATRIX_EPISODES}_s${STEPS_PER_ROLE}_$(date +%Y%m%d_%H%M%S)}"
 export ROLE_LORA_PSRO_GPU="${ROLE_LORA_PSRO_GPU:-H200:4}"
 export ROLE_LORA_PSRO_PAYOFF_GPU="${ROLE_LORA_PSRO_PAYOFF_GPU:-H200}"
 
@@ -56,6 +62,7 @@ echo "PSRO_CHECKPOINT_INVENTORY=/output/role_lora_zero_sum_psro/$RUN_SUFFIX/chec
 exec "$MODAL_BIN" run --detach \
   modal_role_lora_zero_sum_psro.py::cold_psro_train_and_eval \
   --run-suffix "$RUN_SUFFIX" \
+  "${START_MODE_ARGS[@]}" \
   --generations "$GENERATIONS" \
   --matrix-episodes "$MATRIX_EPISODES" \
   --steps-per-role "$STEPS_PER_ROLE" \

@@ -1,4 +1,4 @@
-"""Pure scheduling helpers for the five-generation cold role-LoRA PSRO run."""
+"""Pure scheduling helpers for the role-LoRA PSRO workflow."""
 
 from __future__ import annotations
 
@@ -13,6 +13,24 @@ def population_labels(role: str, learned: int) -> list[str]:
         raise ValueError("learned population size cannot be negative")
     prefix = "A" if role == "attacker" else "D"
     return [f"{prefix}{index}" for index in range(learned + 1)]
+
+
+def oracle_start_label(*, role: str, target: str, cold_start: bool) -> str:
+    """Return the population member used to initialize a new role oracle.
+
+    Cold PSRO always initializes from that role's base strategy.  Warm PSRO
+    follows the ROLL ``cold_start=False`` meaning at the model level: the new
+    oracle inherits the immediately preceding strategy of the same role.
+    """
+
+    if role not in {"attacker", "defender"}:
+        raise ValueError(f"invalid role: {role!r}")
+    prefix = "A" if role == "attacker" else "D"
+    match = target.startswith(prefix) and target[1:].isdigit()
+    if not match or int(target[1:]) < 1:
+        raise ValueError(f"invalid {role} oracle target: {target!r}")
+    index = int(target[1:])
+    return f"{prefix}{0 if cold_start else index - 1}"
 
 
 def learned_count(population: Mapping[str, Any], role: str) -> int:

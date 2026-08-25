@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cold-start role-LoRA PSRO with a projected terminal zero-sum payoff.
+"""Role-LoRA PSRO with switchable cold/warm oracle initialization.
 
 This module owns a new run root and does not edit the sibling Self-RedTeam
 checkout.  Iteration one intentionally uses one fixed opponent per oracle; the
@@ -39,6 +39,7 @@ from modal_upstream_v2_payoff import (
 from modal_abs_benchmark import image as payoff_image
 from roll.utils.role_lora_cold_psro import (
     next_action as next_cold_psro_action,
+    oracle_start_label,
     opponent_pool as build_psro_opponent_pool,
     payoff_matrix as build_psro_payoff_matrix,
 )
@@ -1039,10 +1040,11 @@ def _base_population_identity(label: str) -> dict[str, Any]:
 
 def _persist_psro_inventory(root: Path, state: dict[str, Any]) -> None:
     population = state.get("population") or {}
+    init_mode = str((state.get("contract") or {}).get("init_mode", "cold"))
     _write_json_atomic(
         root / "checkpoint_inventory.json",
         {
-            "schema_version": "role-lora-cold-psro-checkpoints-v1",
+            "schema_version": f"role-lora-{init_mode}-psro-checkpoints-v1",
             "run_root": str(root),
             "base_model": BASE_MODEL,
             "checkpoints": population,
@@ -1297,6 +1299,10 @@ def train_cold_psro_oracle(
     run_root: str,
     target: str,
     role: str,
+    cold_start: bool,
+    role_start_label: str,
+    role_start_adapter: str | None,
+    role_start_sha256: str,
     opponent_pool: list[dict[str, object]],
     steps: int,
     lora_rank: int,
@@ -1310,7 +1316,7 @@ def train_cold_psro_oracle(
     training_seed: int,
     wandb_identity: str,
 ) -> dict[str, Any]:
-    """Train one cold-start best response against a frozen Nash mixture."""
+    """Train one best response against a frozen Nash mixture."""
 
     expected_prefix = "A" if role == "attacker" else "D"
     if not re.fullmatch(rf"{expected_prefix}[1-9][0-9]*", target):
@@ -1320,12 +1326,41 @@ def train_cold_psro_oracle(
         raise ValueError("run_root must be below the PSRO output root")
     output_vol.reload()
     normalized_pool = _normalize_fixed_opponent_pool(opponent_pool)
+    expected_start_label = oracle_start_label(
+        role=role,
+        target=target,
+        cold_start=cold_start,
+    )
+    if role_start_label != expected_start_label:
+        raise RuntimeError(
+            f"{target} start label mismatch: expected={expected_start_label!r}, "
+            f"actual={role_start_label!r}"
+        )
+    if role_start_adapter is None:
+        expected_base_sha = f"base:{BASE_MODEL}"
+        if role_start_sha256 != expected_base_sha:
+            raise RuntimeError(
+                f"{target} base start identity mismatch: "
+                f"expected={expected_base_sha!r}, actual={role_start_sha256!r}"
+            )
+    else:
+        start_identity = _adapter_identity(Path(role_start_adapter))
+        if start_identity["adapter_sha256"] != role_start_sha256:
+            raise RuntimeError(f"{target} role-start adapter changed before training")
+        if (
+            start_identity["rank"] != lora_rank
+            or start_identity["alpha"] != lora_alpha
+        ):
+            raise RuntimeError(
+                f"{target} role-start LoRA contract mismatch: "
+                f"r={start_identity['rank']}, alpha={start_identity['alpha']}"
+            )
     run_dir = root / "training" / target
     checkpoint = run_dir / "ckpt" / f"global_step{steps}_hf"
     if _adapter_checkpoint(checkpoint):
         manifest = _read_json(run_dir / "manifest.json")
         if (
-            manifest.get("role_start") != BASE_MODEL
+            manifest.get("role_start") != (role_start_adapter or BASE_MODEL)
             or manifest.get("fixed_opponent_pool") != normalized_pool
             or manifest.get("steps") != steps
         ):
@@ -1333,7 +1368,7 @@ def train_cold_psro_oracle(
         return _adapter_identity(checkpoint)
     checkpoint = _run_role(
         role=role,
-        role_start_adapter=None,
+        role_start_adapter=role_start_adapter,
         fixed_opponent=BASE_MODEL,
         fixed_opponent_adapter=None,
         fixed_opponent_pool=normalized_pool,
@@ -1362,6 +1397,7 @@ def train_cold_psro_oracle(
 def _advance_kwargs(contract: dict[str, Any], run_suffix: str) -> dict[str, Any]:
     return {
         "run_suffix": run_suffix,
+        "cold_start": contract["init_mode"] == "cold",
         "generations": contract["generations"],
         "matrix_episodes": contract["matrix_episodes_per_cell"],
         "steps_per_role": contract["steps_per_role"],
@@ -1429,6 +1465,7 @@ def _contracts_match_for_generation_extension(
 def advance_cold_psro(
     *,
     run_suffix: str,
+    cold_start: bool = True,
     generations: int = 5,
     matrix_episodes: int = 4000,
     steps_per_role: int = 100,
@@ -1486,14 +1523,20 @@ def advance_cold_psro(
     root = PSRO_OUTPUT_ROOT / suffix
     root.mkdir(parents=True, exist_ok=True)
     state_path = root / "state.json"
+    init_mode = "cold" if cold_start else "warm"
     contract = {
-        "schema_version": "role-lora-cold-zero-sum-psro-v1",
+        "schema_version": f"role-lora-{init_mode}-zero-sum-psro-v1",
         "implementation_sha256": _psro_implementation_hashes(),
         "algorithm": "sequential_double_oracle_zero_sum_psro",
-        "init_mode": "cold",
-        "cold_definition": (
+        "init_mode": init_mode,
+        f"{init_mode}_definition": (
             "every learned A_i and D_i starts from the same base with a new "
             f"rank-{lora_rank} adapter and fresh optimizer"
+            if cold_start
+            else (
+                "A_i inherits A_{i-1} and D_i inherits D_{i-1}; A1/D1 "
+                "start from base; every oracle task uses a fresh optimizer"
+            )
         ),
         "base_model": BASE_MODEL,
         "base_in_population": {"attacker": "A0", "defender": "D0"},
@@ -1643,6 +1686,16 @@ def advance_cold_psro(
     elif kind == "oracle":
         role = action["role"]
         target = action["target"]
+        start_label = oracle_start_label(
+            role=role,
+            target=target,
+            cold_start=cold_start,
+        )
+        if start_label not in population:
+            raise RuntimeError(
+                f"missing {init_mode}-start population record: {start_label}"
+            )
+        start_record = population[start_label]
         attackers, defenders, matrix = build_psro_payoff_matrix(
             population, state["cells"]
         )
@@ -1671,6 +1724,12 @@ def advance_cold_psro(
         oracle_spec = {
             "role": role,
             "target": target,
+            "initialization": {
+                "mode": init_mode,
+                "source": start_label,
+                "adapter": start_record.get("path"),
+                "sha256": start_record["adapter_sha256"],
+            },
             "matrix_attackers": attackers,
             "matrix_defenders": defenders,
             "payoff_matrix": matrix,
@@ -1688,6 +1747,10 @@ def advance_cold_psro(
             run_root=str(root),
             target=target,
             role=role,
+            cold_start=cold_start,
+            role_start_label=start_label,
+            role_start_adapter=start_record.get("path"),
+            role_start_sha256=start_record["adapter_sha256"],
             opponent_pool=pool,
             steps=steps_per_role,
             lora_rank=lora_rank,
@@ -1699,7 +1762,9 @@ def advance_cold_psro(
             actor_lr_scheduler=actor_lr_scheduler,
             lr_warmup_ratio=lr_warmup_ratio,
             training_seed=training_seed,
-            wandb_identity=f"role_lora_cold_psro__{suffix}__{target}",
+            wandb_identity=(
+                f"role_lora_{init_mode}_psro__{suffix}__{target}"
+            ),
         )
         population[target] = result
         state["stage"] = f"completed_{target}"
@@ -1714,8 +1779,8 @@ def advance_cold_psro(
         )
         result = evaluator.remote(
             trained_checkpoint=population[defender]["path"],
-            output_slug=f"cold_psro_{suffix}_{defender}",
-            trained_label=f"cold_psro_{defender}",
+            output_slug=f"{init_mode}_psro_{suffix}_{defender}",
+            trained_label=f"{init_mode}_psro_{defender}",
             evaluate_base=False,
         )
         state["evaluations"][defender] = result
@@ -1859,6 +1924,7 @@ def cold_start_train(
 @psro_app.local_entrypoint(name="cold_psro_train_and_eval")
 def cold_psro_train_and_eval(
     run_suffix: str = "",
+    cold_start: bool = True,
     generations: int = 5,
     matrix_episodes: int = 4000,
     steps_per_role: int = 100,
@@ -1880,14 +1946,16 @@ def cold_psro_train_and_eval(
     judge_batch_size: int = 64,
     max_new_tokens: int = 2048,
 ) -> None:
-    """Launch a parameterized base-inclusive cold PSRO workflow."""
+    """Launch a parameterized base-inclusive cold or warm PSRO workflow."""
 
+    init_mode = "cold" if cold_start else "warm"
     suffix = run_suffix or datetime.now().strftime(
-        f"cold_psro{generations}_base_n{matrix_episodes}_s{steps_per_role}_"
+        f"{init_mode}_psro{generations}_base_n{matrix_episodes}_s{steps_per_role}_"
         "%Y%m%d_%H%M%S"
     )
     call = advance_cold_psro.spawn(
         run_suffix=suffix,
+        cold_start=cold_start,
         generations=generations,
         matrix_episodes=matrix_episodes,
         steps_per_role=steps_per_role,

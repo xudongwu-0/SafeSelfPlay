@@ -240,6 +240,21 @@ Launch the canonical Llama role-LoRA cold PSRO run with:
 ./run_role_lora_cold_psro5_h200x4.sh
 ```
 
+The launcher follows ROLL's single-setting cold/warm convention.  The default
+is unchanged (`COLD_START=true`).  To run warm-start PSRO instead:
+
+```bash
+COLD_START=false ./run_role_lora_cold_psro5_h200x4.sh
+```
+
+Both modes use the same zero-sum matrix, Nash-mixture opponent sampling,
+reward, rollout budget, cache, and evaluation flow.  Cold mode initializes
+every oracle from base.  Warm mode initializes `A_i` from `A_{i-1}` and `D_i`
+from `D_{i-1}` (A1/D1 still start from base).  Because each role oracle is a
+separate Modal task, warm mode inherits model/LoRA weights with a fresh
+optimizer; it is not optimizer-state continuation.  Cold and warm runs must
+use distinct run suffixes, which the generated default names do automatically.
+
 The shell launcher, rather than the Python implementation, fixes this formal
 run's defaults. In particular it passes `GENERATIONS=5`,
 `MATRIX_EPISODES=4000`, `STEPS_PER_ROLE=100`, rank/alpha, both learning rates,
@@ -250,8 +265,9 @@ stored in that run's immutable state contract.
 
 This is sequential double-oracle PSRO, not latest-opponent self-play. `A0` and
 `D0` are the same frozen base model represented as role-specific strategies.
-Every learned `A1`–`A5` and `D1`–`D5` is cold-started from that base with a
-fresh rank-64 adapter and optimizer. Before training each oracle, the complete
+With the default `COLD_START=true`, every learned `A1`–`A5` and `D1`–`D5` is
+cold-started from that base with a fresh rank-64 adapter and optimizer. Before
+training each oracle, the complete
 available zero-sum matrix is solved; one opponent is sampled from the frozen
 Nash mixture per two-turn episode and kept for that episode. Zero-probability
 strategies are not forced back into the mixture, but base remains in the pool

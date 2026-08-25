@@ -7,6 +7,7 @@ import pytest
 from roll.utils.role_lora_cold_psro import (
     missing_matrix_cells,
     next_action,
+    oracle_start_label,
     opponent_pool,
     payoff_matrix,
 )
@@ -16,6 +17,23 @@ BASE = {
     "A0": {"path": None, "adapter_sha256": "base:model"},
     "D0": {"path": None, "adapter_sha256": "base:model"},
 }
+
+
+def test_cold_and_warm_oracle_initialization_labels() -> None:
+    assert oracle_start_label(
+        role="attacker", target="A1", cold_start=True
+    ) == "A0"
+    assert oracle_start_label(
+        role="attacker", target="A4", cold_start=True
+    ) == "A0"
+    assert oracle_start_label(
+        role="attacker", target="A4", cold_start=False
+    ) == "A3"
+    assert oracle_start_label(
+        role="defender", target="D4", cold_start=False
+    ) == "D3"
+    with pytest.raises(ValueError, match="invalid defender oracle target"):
+        oracle_start_label(role="defender", target="A2", cold_start=False)
 
 
 def test_sequential_double_oracle_schedule_includes_base() -> None:

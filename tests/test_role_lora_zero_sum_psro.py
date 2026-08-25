@@ -304,13 +304,17 @@ class ZeroSumProtocolTest(unittest.TestCase):
             ),
         )
 
-    def test_iteration_one_is_cold_for_both_roles_and_balanced(self):
+    def test_iteration_one_is_cold_for_both_roles_and_psro_is_switchable(self):
         repository = Path(__file__).resolve().parents[1]
         source = (
             repository / "modal_role_lora_zero_sum_psro.py"
         ).read_text(encoding="utf-8")
-        # A1/D1 cold bootstrap plus the generic A_i/D_i cold PSRO oracle.
-        self.assertEqual(source.count("role_start_adapter=None"), 3)
+        # A1/D1 bootstrap remains cold.  Generic PSRO oracles select either
+        # base or the previous same-role adapter from one cold_start setting.
+        self.assertEqual(source.count("role_start_adapter=None"), 2)
+        self.assertIn("cold_start: bool = True", source)
+        self.assertIn("role_start_adapter=start_record.get(\"path\")", source)
+        self.assertIn('"init_mode": init_mode', source)
         self.assertIn('"generated_harmful": 0.5', source)
         self.assertIn('"generated_benign": 0.5', source)
         self.assertIn('PSRO_OUTPUT_ROOT = Path(', source)
@@ -347,6 +351,9 @@ class ZeroSumProtocolTest(unittest.TestCase):
             'SAVE_STEPS="${SAVE_STEPS:-$STEPS_PER_ROLE}"',
             launcher,
         )
+        self.assertIn('COLD_START="${COLD_START:-true}"', launcher)
+        self.assertIn('START_MODE_ARGS=(--no-cold-start)', launcher)
+        self.assertIn('"${START_MODE_ARGS[@]}"', launcher)
 
     def test_checkpoint_pruner_keeps_only_exact_final_hf_directory(self):
         repository = Path(__file__).resolve().parents[1]
