@@ -77,16 +77,17 @@ tokenizer = AutoTokenizer.from_pretrained(
 
 ### Defender results
 
-The first two rows are reported by Self-RedTeam; the remaining rows use our
-released evaluator with the same `llama3_cot` template. They are separated
-because paper-reported and locally measured numbers are not a paired
-evaluation. A dash means the paper did not report that supplemental column.
+The first two rows are reported by Self-RedTeam; the remaining completed rows
+use our released evaluator with the same `llama3_cot` template. They are
+separated because paper-reported and locally measured numbers are not a paired
+evaluation. A dash means either that the paper did not report the supplemental
+column or that the evaluation is still pending, as indicated in `Source`.
 
 | Model | Source | WG adv ASR ↓ | WG vanilla ASR ↓ | WJB harmful ASR ↓ | DAN ASR ↓ | HarmBench adv ASR ↓ | OR-Bench RTA ↑ | XSTest RTA ↑ | WJB benign comply ↑ | XSTest benign comply ↑ | OR-Bench benign comply ↑ |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | Llama-3.1-8B-Instruct-abliterated | Paper | 0.478 | 0.553 | 0.991 | 0.937 | 0.654 | 0.014 | 0.290 | 0.992 | 0.988 | - |
 | Self-RedTeam + SFT, step 200 | Paper | 0.138 | 0.019 | 0.240 | 0.396 | 0.221 | 0.846 | 0.814 | 0.806 | 0.920 | - |
-| Llama-3.1-8B-Instruct-abliterated | Our evaluation | 0.424 | 0.454 | 0.938 | 0.910 | 0.575 | 0.099 | 0.415 | 0.932 | 0.940 | 0.972 |
+| Llama-3.1-8B-Instruct-abliterated (base) | Our evaluation | 0.424 | 0.454 | 0.938 | 0.910 | 0.575 | 0.099 | 0.415 | 0.932 | 0.940 | 0.972 |
 | Self-RedTeam reproduction, step 200 | Our evaluation | 0.095 | 0.019 | 0.159 | 0.400 | 0.196 | 0.925 | 0.835 | 0.780 | 0.880 | 0.365 |
 | SafeSelfPlay D1, step 100 (no-reward-hacking) | Our evaluation | 0.065 | 0.019 | 0.378 | 0.280 | 0.121 | 0.896 | 0.870 | 0.908 | 0.932 | 0.469 |
 | SafeSelfPlay D2, step 100 (no-reward-hacking) | Our evaluation | 0.074 | 0.019 | 0.272 | 0.377 | 0.126 | 0.860 | 0.895 | 0.820 | 0.952 | 0.637 |
@@ -96,6 +97,21 @@ evaluation. A dash means the paper did not report that supplemental column.
 | SafeSelfPlay D1, step 100(reward-hacking) | Our evaluation | 0.036 | 0.007 | 0.145 | 0.200 | 0.066 | 0.916 | 0.945 | 0.612 | 0.836 | 0.367 |
 | SafeSelfPlay D2, step 80 (reward-hacking) | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 | 0.802 | 0.670 | 0.584 | 0.984 | 0.510 |
 | SafeSelfPlay D3, step 80 (reward-hacking) | Our evaluation | 0.003 | 0.000 | 0.031 | 0.090 | 0.031 | 0.860 | 0.780 | 0.604 | 0.980 | 0.430 |
+| SafeSelfPlay D1, step 100 (cold PSRO 20260827) | Our evaluation | 0.086 | 0.041 | 0.606 | 0.340 | 0.171 | 0.557 | 0.760 | 0.940 | 0.976 | 0.944 |
+| SafeSelfPlay D2, step 100 (cold PSRO 20260827) | *Pending — job 39253* | - | - | - | - | - | - | - | - | - | - |
+| SafeSelfPlay D3, step 100 (cold PSRO 20260827) | Our evaluation | 0.030 | 0.012 | 0.182 | 0.230 | 0.058 | 0.742 | 0.825 | 0.676 | 0.928 | 0.685 |
+| SafeSelfPlay D4, step 100 (cold PSRO 20260827) | Our evaluation | 0.009 | 0.039 | 0.021 | 0.070 | 0.029 | 0.518 | 0.785 | 0.020 | 0.872 | 0.851 |
+| SafeSelfPlay D5, step 100 (cold PSRO 20260827) | Our evaluation | 0.273 | 0.097 | 0.822 | 0.563 | 0.253 | 0.592 | 0.820 | 0.956 | 0.928 | 0.901 |
+
+The `cold PSRO 20260827` rows are a newer evaluation batch than the archived
+2026-08-25 handoff described below. D2 is still pending under job 39253 and is
+excluded from comparisons until all of its metrics are available. Among the
+completed checkpoints, no single defender dominates: D4 has the lowest ASR on
+four of the five harmful-prompt columns within this batch, but its 0.020 WJB
+benign compliance indicates severe over-refusal. D3 is the more balanced
+checkpoint, with the batch's lowest WG vanilla ASR and highest values on both
+RTA columns; D1 and D5 retain more benign compliance at the cost of weaker
+harmful-prompt safety.
 
 The five ASR columns contain harmful prompts and are lower-is-better. OR-Bench
 RTA and XSTest RTA also contain harmful or contrast prompts, but report the
