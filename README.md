@@ -95,21 +95,11 @@ supplemental column or that an evaluation is still pending, as indicated in
 | SafeSelfPlay D3, step 100 (naive) | Our evaluation | 0.024 | 0.022 | 0.135 | 0.083 | 0.087 | 0.841 | 0.870 | 0.856 | 0.988 | 0.588 |
 | SafeSelfPlay D4, step 100 (naive) | Our evaluation | 0.033 | 0.092 | 0.186 | 0.190 | 0.141 | 0.907 | 0.790 | 0.676 | 0.984 | 0.380 |
 | SafeSelfPlay D5, step 100 (naive) | Our evaluation | 0.024 | 0.022 | 0.117 | 0.207 | 0.091 | 0.737 | 0.575 | 0.872 | 0.992 | 0.614 |
-| SafeSelfPlay D1, step 100 (cold PSRO 20260827) | Our evaluation | 0.086 | 0.041 | 0.606 | 0.340 | 0.171 | 0.557 | 0.760 | 0.940 | 0.976 | 0.944 |
-| SafeSelfPlay D2, step 100 (cold PSRO 20260827) | *Pending — job 39253* | - | - | - | - | - | - | - | - | - | - |
-| SafeSelfPlay D3, step 100 (cold PSRO 20260827) | Our evaluation | 0.030 | 0.012 | 0.182 | 0.230 | 0.058 | 0.742 | 0.825 | 0.676 | 0.928 | 0.685 |
-| SafeSelfPlay D4, step 100 (cold PSRO 20260827) | Our evaluation | 0.009 | 0.039 | 0.021 | 0.070 | 0.029 | 0.518 | 0.785 | 0.020 | 0.872 | 0.851 |
-| SafeSelfPlay D5, step 100 (cold PSRO 20260827) | Our evaluation | 0.273 | 0.097 | 0.822 | 0.563 | 0.253 | 0.592 | 0.820 | 0.956 | 0.928 | 0.901 |
-
-The `cold PSRO 20260827` rows are a newer evaluation batch than the archived
-2026-08-25 handoff described below. D2 is still pending under job 39253 and is
-excluded from comparisons until all of its metrics are available. Among the
-completed checkpoints, no single defender dominates: D4 has the lowest ASR on
-four of the five harmful-prompt columns within this batch, but its 0.020 WJB
-benign compliance indicates severe over-refusal. D3 is the more balanced
-checkpoint, with the batch's lowest WG vanilla ASR and highest values on both
-RTA columns; D1 and D5 retain more benign compliance at the cost of weaker
-harmful-prompt safety.
+| SafeSelfPlay D1, step 100 (cold PSRO) | Our evaluation | 0.086 | 0.041 | 0.606 | 0.340 | 0.171 | 0.557 | 0.760 | 0.940 | 0.976 | 0.944 |
+| SafeSelfPlay D2, step 100 (cold PSRO) | *Pending — job 39253* | - | - | - | - | - | - | - | - | - | - |
+| SafeSelfPlay D3, step 100 (cold PSRO) | Our evaluation | 0.030 | 0.012 | 0.182 | 0.230 | 0.058 | 0.742 | 0.825 | 0.676 | 0.928 | 0.685 |
+| SafeSelfPlay D4, step 100 (cold PSRO) | Our evaluation | 0.009 | 0.039 | 0.021 | 0.070 | 0.029 | 0.518 | 0.785 | 0.020 | 0.872 | 0.851 |
+| SafeSelfPlay D5, step 100 (cold PSRO) | Our evaluation | 0.273 | 0.097 | 0.822 | 0.563 | 0.253 | 0.592 | 0.820 | 0.956 | 0.928 | 0.901 |
 
 Both tables use the same metric directions. The five ASR columns contain
 harmful prompts and are lower-is-better. OR-Bench RTA and XSTest RTA also
@@ -119,13 +109,7 @@ vanilla benign, and OR-Bench hard-1k measure whether the model still complies
 with benign requests; lower values on these columns indicate more over-refusal.
 The released evaluator does not include StrongREJECT.
 
-#### Historical reward-hacking results
-
-The reward-hacking D1-D3 rows use the same rank-64 role-LoRA parameterization
-as the naive runs, but different step budgets, opponents, and pre-fix training
-pipeline. They are kept separate because they should not be read as a
-controlled inter-generation ablation against either the naive chain or the
-current cold-PSRO run.
+#### Historical results(reward-hacking)
 
 | Model | Source | WG adv ASR ↓ | WG vanilla ASR ↓ | WJB harmful ASR ↓ | DAN ASR ↓ | HarmBench adv ASR ↓ | OR-Bench RTA ↑ | XSTest RTA ↑ | WJB benign comply ↑ | XSTest benign comply ↑ | OR-Bench benign comply ↑ |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -133,42 +117,6 @@ current cold-PSRO run.
 | SafeSelfPlay D2, step 80 (reward-hacking) | Our evaluation | 0.015 | 0.024 | 0.093 | 0.423 | 0.084 | 0.802 | 0.670 | 0.584 | 0.984 | 0.510 |
 | SafeSelfPlay D3, step 80 (reward-hacking) | Our evaluation | 0.003 | 0.000 | 0.031 | 0.090 | 0.031 | 0.860 | 0.780 | 0.604 | 0.980 | 0.430 |
 
-The naive D1 row evaluates the rank-64, 100-step checkpoint from
-`cold_psro_capdrop_A100D100_r64_20260819`. Its exact result manifest is
-`/output/upstream_selfredteam_role_full_eval/cold_psro_capdrop_A100D100_r64_20260819_D1_full_eval_20260820/comparison.json`.
-The base values are the previous released-evaluator run rather than a fresh
-paired rerun. D1 substantially improves harmful-prompt safety, but the
-OR-Bench benign compliance drop from 0.972 to 0.469 indicates over-refusal.
-
-The naive D2 row is the 100-step latest-opponent continuation from
-D1. Its exact result manifest is
-`/output/upstream_selfredteam_role_full_eval/naive_latest_A2_to_D5_s100_20260820_D2_full_eval_20260820/comparison.json`.
-Relative to D1, D2 improves WildJailbreak harmful ASR, XSTest RTA, and
-OR-Bench benign compliance, while DAN ASR and WildJailbreak benign compliance
-regress; it is therefore a mixed rather than uniformly dominant update.
-
-The naive D3 row is the next 100-step latest-opponent continuation.
-Its exact result manifest is
-`/output/upstream_selfredteam_role_full_eval/naive_latest_A2_to_D5_s100_20260820_D3_full_eval_20260820/comparison.json`.
-Relative to D2, D3 substantially improves four of the five harmful ASR
-benchmarks and improves WildJailbreak and XSTest benign compliance. OR-Bench
-benign compliance and the two RTA columns regress, so later generations remain
-subject to the same safety-versus-over-refusal evaluation.
-
-The naive D4 row is the following 100-step latest-opponent defender.
-Its exact result manifest is
-`/output/upstream_selfredteam_role_full_eval/naive_latest_A2_to_D5_s100_20260820_D4_full_eval_20260821/comparison.json`.
-Relative to D3, D4 regresses on all five harmful ASR benchmarks and all three
-benign-compliance benchmarks. OR-Bench RTA improves, but XSTest RTA regresses;
-D4 therefore does not continue the overall defender improvement seen at D3.
-
-The naive D5 row is the 100-step defender at the end of the same
-latest-opponent chain. Its exact result manifest is
-`/output/upstream_selfredteam_role_full_eval/naive_latest_A2_to_D5_s100_20260820_D5_full_eval_20260821/comparison.json`.
-Relative to D3, D5 improves WildJailbreak harmful ASR and all three benign
-compliance columns, while DAN and HarmBench ASR and both RTA columns regress.
-The update is therefore mixed and does not establish monotonic defender
-improvement. D4 is evaluated separately and is not interpolated from D3/D5.
 
 ## 2. Train Role LoRAs
 
